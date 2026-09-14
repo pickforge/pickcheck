@@ -1,4 +1,9 @@
-# complexity-gate — specification v1
+# PickCheck (complexity-gate) — specification v1
+
+PickCheck is the product name; it was formerly complexity-gate. The binary,
+packages, hook commands, config files, and state paths keep the
+`complexity-gate` name, and this contract uses that name for everything that
+runs.
 
 One static binary that measures function complexity with tree-sitter and blocks
 coding agents from finishing while the functions they
@@ -462,6 +467,7 @@ crates/core/               # complexity-gate-core: parsing, metrics, config, dif
 crates/cli/                # complexity-gate: clap CLI, hooks, doctor
 config.default.json
 docs/spec.md  docs/hooks.md
+docs/assets/branding/      # PickCheck marks, README art, social card
 tests/fixtures/<language>/
 .github/workflows/{ci,release}.yml
 clippy.toml  osv-scanner.toml
