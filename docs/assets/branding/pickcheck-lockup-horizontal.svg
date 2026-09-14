@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="180" viewBox="0 0 720 180" fill="none" role="img" aria-label="PickCheck horizontal lockup">
+  <title>PickCheck horizontal lockup</title>
+  <rect width="720" height="180" rx="24" fill="#0A0A0B"/>
+  <g transform="translate(40 50) scale(0.625)">
+    <rect width="128" height="128" rx="24" fill="#0F0F11" stroke="#F2F2F3" stroke-opacity="0.08"/>
+    <g stroke="#F2F2F3" stroke-width="3" stroke-linecap="square" fill="none">
+      <path d="M30 48 V32 H46"/>
+      <path d="M82 32 H98 V48"/>
+      <path d="M30 80 V96 H46"/>
+      <path d="M82 96 H98 V80"/>
+    </g>
+    <path d="M38 50 H50 L62 64 L50 78 H38 M62 64 H82" stroke="#F2F2F3" stroke-width="3.5" stroke-linejoin="round" fill="none"/>
+    <circle cx="86" cy="64" r="6" fill="#FF7A1A"/>
+  </g>
+  <text x="160" y="106" fill="#F2F2F3" font-family="Geist, Inter, Arial, sans-serif" font-size="52" font-weight="750" letter-spacing="-0.02em">PickCheck</text>
+  <text x="164" y="140" fill="#6E6E75" font-family="Geist Mono, JetBrains Mono, monospace" font-size="14" font-weight="500" letter-spacing="0.18em">PER-FUNCTION COMPLEXITY CHECKS</text>
+</svg>

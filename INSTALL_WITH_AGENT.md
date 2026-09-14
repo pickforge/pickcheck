@@ -1,7 +1,11 @@
-# Install complexity-gate
+# Install PickCheck
 
-You are an AI coding agent. Install complexity-gate for the user. Perform the
+You are an AI coding agent. Install PickCheck for the user. Perform the
 installation and verification instead of only describing the commands.
+
+PickCheck was formerly named complexity-gate. The npm package, binary,
+installer, hook commands, config file, and state directory still use the
+`complexity-gate` name. Use the commands below exactly as written.
 
 ## Choose integrations
 
@@ -48,13 +52,13 @@ Claude Code or Cursor hooks when present so the gate does not run twice.
 
 ## Add agent instructions
 
-If the user wants complexity-gate used for every coding and review task, add
-the following text to the project or global agent instruction file they choose.
+If the user wants PickCheck used for every coding and review task, add the
+following text to the project or global agent instruction file they choose.
 Preserve the existing file. If they did not choose project or global scope, ask
 before editing it.
 
 ```md
-Use complexity-gate for every coding and code-review task. Run
+Use PickCheck (`complexity-gate`) for every coding and code-review task. Run
 `complexity-gate check --changed` before completion. Fix every `FAIL` without
 raising limits or hiding branches. Report every `UNVERIFIED` file instead of
 estimating its complexity.
