@@ -23,7 +23,7 @@
   under `/var`, or a Windows short path, now gives the same results as its
   canonical path. Before, `check --changed <path>` could find no changes,
   `ignore` globs could miss, and hook reports could show long `../` paths.
-  (#50)
+  An explicit path now follows directory links before `..` applies. (#50)
 - On Windows, `--changed` and `--base` reports now use `\` in every path
   instead of mixing it with the `/` that Git prints. (#50)
 

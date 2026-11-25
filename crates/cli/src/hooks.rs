@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use pickcheck_core::{ScanOptions, changed_files, load_config, scan};
+use pickcheck_core::{ScanOptions, changed_files, load_config, physical, scan};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -293,7 +293,13 @@ fn state_dir_from(
     Ok(home.join(".pickforge").join("pickcheck"))
 }
 
+/// The physical working directory, so the config lookup for the loop guard
+/// walks the same ancestors as the scan.
 fn working_directory(input: &HookInput) -> PathBuf {
+    physical(&requested_directory(input))
+}
+
+fn requested_directory(input: &HookInput) -> PathBuf {
     input
         .cwd
         .clone()

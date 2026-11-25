@@ -196,20 +196,33 @@ pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
-    Ok(Some(spelled_like(cwd, PathBuf::from(root.trim()))))
+    Ok(Some(physical(Path::new(root.trim()))))
 }
 
-/// Git prints the canonical root. This returns the ancestor of `cwd` that is
-/// the same directory, so paths keep the spelling `cwd` uses, such as a
-/// symlink (`/var` on macOS) or a Windows short name.
-fn spelled_like(cwd: &Path, root: PathBuf) -> PathBuf {
-    let Ok(canonical) = root.canonicalize() else {
-        return root;
-    };
-    cwd.ancestors()
-        .filter(|ancestor| ancestor.is_absolute())
-        .find(|ancestor| ancestor.canonicalize().is_ok_and(|path| path == canonical))
-        .map_or(root, Path::to_path_buf)
+/// The physical spelling of an existing path: symbolic links and Windows
+/// short names resolved, as Git prints the repository root. Config lookup,
+/// globs, the changed set, and reports all use this one spelling. A path that
+/// does not resolve is returned as given.
+pub fn physical(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .map_or_else(|_| path.to_path_buf(), plain)
+}
+
+/// On Windows `canonicalize` returns a verbatim path (`\\?\C:\repo`), which
+/// never compares equal to the `C:/repo` that Git prints.
+#[cfg(windows)]
+fn plain(path: PathBuf) -> PathBuf {
+    let plain = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .map(PathBuf::from);
+    plain.unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn plain(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// A path Git printed, which always uses `/`, with native separators. The
@@ -219,12 +232,11 @@ fn git_path(path: &str) -> PathBuf {
     PathBuf::from(path.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
-/// A relative path in the `/` form Git expects.
+/// A relative path in the `/` form Git expects. The separators change in
+/// the string, for the reason `git_path` gives.
 fn slash_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    path.to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 fn merge_base(repo_root: &Path, base: &str) -> Result<String> {
@@ -380,6 +392,26 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn git_paths_round_trip_without_losing_components() {
+        for git in ["src/sub/a.js", "a:b.js", "dir/a:b.js", "top.js"] {
+            assert_eq!(slash_path(&git_path(git)), git);
+        }
+        assert_eq!(
+            git_path("src/sub/a.js"),
+            Path::new("src").join("sub").join("a.js")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_paths_are_not_verbatim() {
+        let dir = std::env::temp_dir();
+        let text = physical(&dir).to_string_lossy().into_owned();
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert_eq!(physical(&physical(&dir)), physical(&dir));
     }
 
     #[test]

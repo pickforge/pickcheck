@@ -1271,3 +1271,86 @@ fn symlinked_paths_match_the_repository_root() {
     let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
     assert!(reason.contains("FAIL a.js  "), "stdout: {reason}");
 }
+
+/// Links resolve as the file system resolves them: config comes from the real
+/// ancestors, `..` applies after a directory link, and a link to a file keeps
+/// its own name.
+#[cfg(unix)]
+#[test]
+fn links_resolve_like_the_file_system() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(real.join("src/nested")).unwrap();
+    fs::write(real.join("src/a.js"), "function a() { return 1; }\n").unwrap();
+    fs::write(real.join("legacy.js"), complex_function()).unwrap();
+    fs::write(real.join(".gitignore"), ".pickcheck.json\n").unwrap();
+    init_repo(&real);
+    commit_all(&real, "initial");
+    fs::write(real.join("src/a.js"), complex_function()).unwrap();
+
+    // The directory that holds the link has a config; the repository does not.
+    let holder = dir.path().join("holder");
+    fs::create_dir(&holder).unwrap();
+    fs::write(holder.join(".pickcheck.json"), r#"{"ignore":["**"]}"#).unwrap();
+    let link = holder.join("link");
+    symlink(&real, &link).unwrap();
+    let linked_src = link.join("src");
+    let foreign = command_output(&real, &["check", "--changed", linked_src.to_str().unwrap()]);
+    assert_eq!(foreign.status.code(), Some(1));
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"held", "cwd":&link}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL src/a.js  "), "stdout: {reason}");
+
+    // `..` after a directory link leaves the link target, not the link.
+    symlink("src/nested", real.join("deep")).unwrap();
+    let parent = command_output(&real, &["check", "--changed", "deep/../a.js"]);
+    let parent_text = String::from_utf8_lossy(&parent.stdout);
+    assert_eq!(parent.status.code(), Some(1), "stdout: {parent_text}");
+    assert!(
+        parent_text.contains("FAIL src/a.js  "),
+        "stdout: {parent_text}"
+    );
+
+    // A new link to an unchanged file is a new file under its own name.
+    symlink("legacy.js", real.join("fresh.js")).unwrap();
+    for path in ["fresh.js", "."] {
+        let leaf = command_output(&real, &["check", "--changed", path]);
+        let leaf_text = String::from_utf8_lossy(&leaf.stdout);
+        assert!(
+            leaf_text.contains("FAIL fresh.js  "),
+            "path: {path}; stdout: {leaf_text}"
+        );
+        assert!(!leaf_text.contains("legacy.js"), "stdout: {leaf_text}");
+    }
+
+    // The loop guard reads `hook.max_blocks` from the repository of a linked cwd.
+    fs::write(real.join(".pickcheck.json"), r#"{"hook":{"max_blocks":1}}"#).unwrap();
+    let sub = dir.path().join("sub");
+    symlink(real.join("src"), &sub).unwrap();
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"sub", "cwd":&sub}).to_string();
+    assert!(!hook_output(state.path(), &stop).stdout.is_empty());
+    let released = hook_output(state.path(), &stop);
+    assert!(released.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&released.stderr).contains("UNRESOLVED"));
+}
+
+/// Outside Git, the name given on the command line selects the grammar, not
+/// the name of the file a link points to.
+#[cfg(unix)]
+#[test]
+fn a_linked_file_is_measured_under_its_own_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("impl"), complex_function()).unwrap();
+    std::os::unix::fs::symlink("impl", dir.path().join("source.js")).unwrap();
+
+    let output = command_output(dir.path(), &["check", "source.js"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
+    assert!(text.contains("FAIL source.js:1 bad"), "stdout: {text}");
+    assert!(!text.contains("UNVERIFIED"), "stdout: {text}");
+}

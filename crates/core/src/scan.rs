@@ -12,7 +12,7 @@ use crate::{
     BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric,
     base_blob,
     baseline::{self, MetricValues, Pairing, Status},
-    diff::repository_root,
+    diff::{physical, repository_root},
     load_config, parse_source,
 };
 
@@ -93,19 +93,15 @@ impl FileContext<'_> {
 }
 
 pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
-    let roots = scan_roots(options);
-    let match_base = match_base(options, &roots)?;
-    let roots = roots
-        .into_iter()
-        .map(|root| spelled_under(&match_base, root))
-        .collect::<Vec<_>>();
-    let cwd = spelled_under(&match_base, options.cwd.to_path_buf());
+    let cwd = physical(options.cwd);
     let options = &ScanOptions {
         cwd: &cwd,
         paths: options.paths,
         explicit_config: options.explicit_config,
         changed: options.changed,
     };
+    let roots = scan_roots(options);
+    let match_base = match_base(options, &roots)?;
     let files = if let Some(changed) = options.changed.filter(|changed| !changed.fallback) {
         collect_changed_files(changed, &roots, !options.paths.is_empty())?
     } else {
@@ -150,19 +146,6 @@ fn match_base(options: &ScanOptions<'_>, roots: &[PathBuf]) -> Result<PathBuf> {
     Ok(repository_root(options.cwd)?
         .or_else(|| nearest_project_root(options.cwd))
         .unwrap_or_else(|| common_scan_root(roots)))
-}
-
-/// Spells `root` under `base` when it reaches the same file through another
-/// path, such as a symlink or a Windows short name, also one inside `base`,
-/// so ignore globs, the changed set, and reports see one spelling.
-fn spelled_under(base: &Path, root: PathBuf) -> PathBuf {
-    let (Ok(canonical_base), Ok(canonical_root)) = (base.canonicalize(), root.canonicalize())
-    else {
-        return root;
-    };
-    canonical_root
-        .strip_prefix(&canonical_base)
-        .map_or(root, |inside| base.join(inside))
 }
 
 fn common_scan_root(roots: &[PathBuf]) -> PathBuf {
@@ -452,13 +435,19 @@ fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &m
     }
 }
 
+/// An explicit path as the file system resolves it: links in its directory
+/// part are followed before `..` applies. A file keeps its own last
+/// component, the name Git lists and the one that selects the grammar. A path
+/// whose directory does not exist is normalized lexically.
 fn absolute(cwd: &Path, path: &Path) -> PathBuf {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    normalize(&path)
+    let path = cwd.join(path);
+    if path.is_dir() {
+        return physical(&path);
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if parent.is_dir() => physical(parent).join(name),
+        _ => normalize(&path),
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -525,6 +514,19 @@ fn read_reason(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_under_a_missing_directory_is_normalized_lexically() {
+        let cwd = Path::new("/no-such-root/work");
+        for (given, expected) in [
+            ("gone/../a.js", "/no-such-root/work/a.js"),
+            ("./gone/./b.js", "/no-such-root/work/gone/b.js"),
+            ("../../../c.js", "/c.js"),
+        ] {
+            assert_eq!(absolute(cwd, Path::new(given)), Path::new(expected));
+        }
+        assert_eq!(normalize(Path::new("../../d.js")), Path::new("../../d.js"));
+    }
 
     #[test]
     fn violations_skip_metrics_that_do_not_apply_to_the_unit() {
