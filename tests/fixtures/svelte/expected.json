@@ -184,6 +184,46 @@
         "hand_derived": true,
         "derivation": "base 1; if block +1; the && inside the spread attribute +1",
         "cognitive_derivation": "{#if} +1; cognitive does not score spread attribute text"
+      },
+      {
+        "function": "{#snippet pick}",
+        "line": 272,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; the snippet parameters are parsed as formal parameters, so the && and ?? in their default values are operator nodes, +1 each",
+        "cognitive_derivation": "a snippet adds nothing; cognitive does not score snippet parameters"
+      },
+      {
+        "function": "{#if}",
+        "line": 273,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; if block +1; the {@const} text is parsed as a declaration, so the && in its typed initializer +1",
+        "cognitive_derivation": "{#if} +1; cognitive parses the {@const} text as an expression, where the TypeScript grammar puts the typed declaration in an ERROR node, so the && adds nothing"
+      },
+      {
+        "function": "{#each}",
+        "line": 274,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; each block +1; the binding with an index is parsed as formal parameters, so the && in the destructuring default +1",
+        "cognitive_derivation": "{#each} +1; the parameter is a binding and cognitive does not score it"
+      },
+      {
+        "function": "{#await}",
+        "line": 275,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; await block +1; the {:then} value is parsed as formal parameters, so the || in the destructuring default +1",
+        "cognitive_derivation": "{#await} +1; the {:then} value is a binding and cognitive does not score it"
+      },
+      {
+        "function": "{#snippet hint}",
+        "line": 277,
+        "complexity": 1,
+        "hand_derived": true,
+        "derivation": "base 1; the optional parameter's ? is not an operator node, and the || in the string default is not an operator node",
+        "cognitive_derivation": "a snippet adds nothing; cognitive does not score snippet parameters"
       }
     ]
   },
@@ -472,6 +512,61 @@
       "lines": 0,
       "params": 0,
       "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#snippet pick}",
+      "line": 272,
+      "complexity": 3,
+      "cognitive": 0,
+      "depth": 0,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#if}",
+      "line": 273,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#each}",
+      "line": 274,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#await}",
+      "line": 275,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#snippet hint}",
+      "line": 277,
+      "complexity": 1,
+      "cognitive": 0,
+      "depth": 0,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 0,
       "widget_depth": 0
     }
   ]

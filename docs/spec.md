@@ -324,8 +324,9 @@ Template expressions are scored from these `svelte_raw_text` nodes only: the
 `{@const}`, `{@html}`, and `{@render}` tags. Bindings are not scored: the
 `parameter` of `each_start`, `then_start` and `catch_start` bindings, and
 snippet parameters. Each scored text is wrapped as
-`function expression() { return (<text>); }`, the wrapper `bool_ops` already
-uses, parsed with the component's script grammar (TypeScript when a
+`function expression() { return (<text>); }`, the expression wrapper of
+`complexity` and `bool_ops`, whatever the text's role, parsed with the
+component's script grammar (TypeScript when a
 `<script lang="ts">` is present, otherwise JavaScript), and scored with the
 JavaScript rules at the nesting level of its enclosing block, so an `{#if}`
 condition sits at the block's own level and an expression in its body one level
@@ -456,10 +457,31 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
   Expressions are all `svelte_raw_text` nodes, bindings included: `{#each}`
   parameters and keys, `{:then}` and `{:catch}` values, and snippet
   parameters. `cognitive` scores only the subset listed under Cognitive
-  complexity. Each text is wrapped and parsed with the component's script
-  grammar, as for `cognitive`. The text of a spread attribute (`{...props}`)
-  sits under `attribute_name` and is wrapped in `[…]` instead of `(…)`,
-  because a spread parses only as an array element. Each `ternary_expression`
+  complexity. Each text is parsed with the component's script grammar inside
+  a function, in the position that its role in the Svelte tree gives it. The
+  role comes from the parent kind and field of the `svelte_raw_text` node:
+
+  | Text | Parent | Wrappers, in order |
+  |---|---|---|
+  | snippet parameters | `snippet_start` | parameters |
+  | `{:then}` and `{:catch}` values | `then_start`, `catch_start` | parameters |
+  | `{#each}` binding: pattern, index, key | `parameter` of `each_start` | parameters, expression |
+  | `{@const}` declaration | `const_tag` | declaration |
+  | spread attribute (`{...props}`) | `attribute_name` | spread |
+  | conditions, the `{#each}` list, `{#await}` and `{#key}` text, element content, attribute values, `{@html}`, `{@render}`, `{@debug}` | `if_start`, `else_if_start`, `each_start`, `await_start`, `key_start`, `expression`, `html_tag`, `render_tag`, `debug_tag` | expression |
+  | any other parent | | expression, parameters, declaration |
+
+  The wrappers are `function expression() { return (<text>); }` (expression),
+  `function expression(<text>) {}` (parameters),
+  `function expression() { const <text>; }` (declaration), and
+  `function expression() { return [<text>]; }` (spread, because a spread
+  parses only as an array element). The first wrapper whose tree has no
+  `ERROR` or `MISSING` node is scored. When none parses cleanly, the
+  expression wrapper is scored, or the spread wrapper for a spread, and nodes
+  inside an `ERROR` subtree add nothing. So an `{#each}` binding with a key,
+  such as `item, i (item.id)`, is read as an expression, and a binding with
+  both a destructuring default and a key, such as `{ x = a }, i (x)`, adds
+  nothing. Each `ternary_expression`
   and each short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`)
   adds 1, including inside a function in the expression; `bool_ops` takes its
   chains from the same tree. Nodes inside an `ERROR` subtree add nothing, and
@@ -606,7 +628,8 @@ DETAILS pickcheck check --changed --verbose <file>
   (`syntax nesting too deep to measure`). A function's subtree includes its
   nested functions. A Svelte template unit's subtree leaves out scripts,
   styles, and the units inside it, and each template expression in it counts
-  as its own tree. A Svelte script can also be left out (see Svelte). The other
+  as its own subtree, from the highest node of the parsed text, without the
+  levels its wrapper adds. A Svelte script can also be left out (see Svelte). The other
   units of the file are measured and reported as usual, so a file can be listed
   under both `FAIL` and `UNVERIFIED`. A file with both reasons lists them
   joined by `; `. The `pickcheck` binary measures on a 64 MiB stack, which

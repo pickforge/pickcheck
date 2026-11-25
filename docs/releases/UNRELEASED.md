@@ -34,7 +34,10 @@
   dropped. Template `complexity` and `bool_ops` now count operator nodes in
   every parsed template expression, bindings included, with the component's
   script grammar, so a `?` or `||` inside a regular expression, string, or
-  comment no longer adds a decision. (#49)
+  comment no longer adds a decision. Each text is parsed in the position its
+  role in the Svelte tree gives it, so operators in snippet parameter
+  defaults, `{@const}` declarations, and destructuring defaults of bindings
+  still count. (#49)
 - A function or Svelte template unit whose syntax tree is more than 3,000
   levels high, such as a generated 20,000-term expression, is now left out,
   and its file is reported `UNVERIFIED <file>  syntax nesting too deep to

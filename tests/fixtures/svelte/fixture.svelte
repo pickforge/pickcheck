@@ -268,3 +268,10 @@ function ternaryBreak(a: boolean, b: boolean, c: boolean, d: boolean, e: boolean
 {#if ready}
   <input {...inputProps(ready && value)} /> <!-- +1 && -->
 {/if}
+<!-- roles: snippet parameters, a {@const} declaration, and binding patterns are parsed in their own position -->
+{#snippet pick(x: boolean = a && b, y = c ?? d)}{x}{y}{/snippet}
+{#if ok}{@const z: boolean = a && b}{z}{/if}
+{#each rows as { x = a && b }, i}{x}{/each}
+{#await job}{:then { v = a || b }}{v}{/await}
+<!-- negative: an optional parameter and a string default add nothing -->
+{#snippet hint(x?: string, y = "a || b")}{x}{/snippet}

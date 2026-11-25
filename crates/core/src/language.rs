@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, ops::Range, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -414,26 +414,30 @@ fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
         .context("tree-sitter parser returned no tree")
 }
 
-/// Whether any node lies deeper than `MAX_SYNTAX_DEPTH`, found with a cursor
-/// so the check itself never recurses.
-pub(crate) fn exceeds_depth_limit(tree: &Tree) -> bool {
-    let mut cursor = tree.walk();
-    let mut depth = 0;
-    loop {
-        if cursor.goto_first_child() {
-            depth += 1;
-            if depth > MAX_SYNTAX_DEPTH {
-                return true;
+/// Whether the nodes inside `range` reach more than `MAX_SYNTAX_DEPTH` levels
+/// below the highest of them, so the levels a wrapper adds around a template
+/// text never count. Found with a cursor, so the check itself never recurses.
+pub(crate) fn exceeds_depth_limit(tree: &Tree, range: Range<usize>) -> bool {
+    let mut top: Option<(Node<'_>, usize)> = None;
+    let mut too_deep = false;
+    walk_tree(tree.root_node(), |step| {
+        match step {
+            Step::Enter(node, depth) => match top {
+                Some((_, top_depth)) => too_deep |= depth - top_depth > MAX_SYNTAX_DEPTH,
+                None if range.start <= node.start_byte() && node.end_byte() <= range.end => {
+                    top = Some((node, depth));
+                }
+                None => {}
+            },
+            Step::Leave(node) => {
+                if top.is_some_and(|(top, _)| top == node) {
+                    top = None;
+                }
             }
-            continue;
         }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return false;
-            }
-            depth -= 1;
-        }
-    }
+        !too_deep
+    });
+    too_deep
 }
 
 /// One step of `walk_tree`.
@@ -1574,36 +1578,94 @@ impl TemplateWalk<'_> {
     }
 }
 
+/// How a template text is parsed: inside a function, so the script grammar
+/// accepts it, in the position its role in the Svelte tree gives it.
+#[derive(Clone, Copy)]
+pub(crate) enum Wrapper {
+    /// `return (…)`: an expression.
+    Expression,
+    /// `return […]`: the text of a spread attribute (`{...props}`), which
+    /// parses only as an array element.
+    Spread,
+    /// Formal parameters: snippet parameters, and the patterns of `{#each}`,
+    /// `{:then}`, and `{:catch}` bindings.
+    Parameters,
+    /// `const …;`: the declaration of a `{@const}` tag.
+    Declaration,
+}
+
+impl Wrapper {
+    /// The wrapped source and the byte range of `text` in it.
+    pub(crate) fn wrap(self, text: &str) -> (String, Range<usize>) {
+        let (head, tail) = match self {
+            Self::Expression => ("function expression() { return (", "); }"),
+            Self::Spread => ("function expression() { return [", "]; }"),
+            Self::Parameters => ("function expression(", ") {}"),
+            Self::Declaration => ("function expression() { const ", "; }"),
+        };
+        (
+            format!("{head}{text}{tail}"),
+            head.len()..head.len() + text.len(),
+        )
+    }
+}
+
+/// The wrappers to try for a template text, in order, and the one whose
+/// error-recovered tree is scored when none parses cleanly. An `{#each}`
+/// binding can end with a key, `item (item.id)`, which parses only as a call.
+fn template_wrappers(node: Node<'_>) -> (&'static [Wrapper], Wrapper) {
+    use Wrapper::{Declaration, Expression, Parameters, Spread};
+    let Some(parent) = node.parent() else {
+        return (&[Expression, Parameters, Declaration], Expression);
+    };
+    let roles: &'static [Wrapper] = match parent.kind() {
+        "attribute_name" => return (&[Spread], Spread),
+        "snippet_start" | "then_start" | "catch_start" => &[Parameters],
+        "each_start"
+            if parent
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| parameter.id() == node.id()) =>
+        {
+            &[Parameters, Expression]
+        }
+        "const_tag" => &[Declaration],
+        "if_start" | "else_if_start" | "each_start" | "await_start" | "key_start"
+        | "expression" | "html_tag" | "render_tag" | "debug_tag" => &[Expression],
+        _ => &[Expression, Parameters, Declaration],
+    };
+    (roles, Expression)
+}
+
 /// Decisions (`complexity` without its base 1) and the widest boolean chain in
-/// one template expression, parsed with the component's script grammar inside
-/// the wrapper `cognitive` also uses. A spread attribute (`{...props}`) keeps
-/// its text under `attribute_name`, and `...props` parses only as an array
-/// element, so that text is wrapped in `[…]` instead of `(…)`. Functions in
-/// the expression count inline; nodes inside an `ERROR` subtree add nothing.
-/// `None` when the expression's tree is deeper than `MAX_SYNTAX_DEPTH`.
+/// one template text, parsed with the component's script grammar in the first
+/// of its wrappers that parses without `ERROR` or `MISSING` nodes, or else in
+/// its fallback wrapper. Functions in the text count inline; nodes inside an
+/// `ERROR` subtree add nothing. `None` when the text's own subtree is higher
+/// than `MAX_SYNTAX_DEPTH`; the wrapper's levels do not count.
 fn score_expression(node: Node<'_>, source: &str, script: Language) -> Option<Score> {
+    let text = node_text(node, source);
+    let grammar = script.grammar();
+    let (wrappers, fallback) = template_wrappers(node);
+    let parse = |wrapper: Wrapper| {
+        let (wrapped, range) = wrapper.wrap(text);
+        parse_tree(&grammar, &wrapped)
+            .ok()
+            .map(|tree| (tree, wrapped, range))
+    };
+    let (tree, wrapped, range) = wrappers
+        .iter()
+        .filter_map(|&wrapper| parse(wrapper))
+        .find(|(tree, _, _)| !tree.root_node().has_error())
+        .or_else(|| parse(fallback))?;
+    if exceeds_depth_limit(&tree, range) {
+        return None;
+    }
     let mut score = Score {
         complexity: 0,
         depth: 0,
         bool_ops: 0,
     };
-    let text = node_text(node, source);
-    let wrapped = if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "attribute_name")
-    {
-        format!("function expression() {{ return [{text}]; }}")
-    } else {
-        format!("function expression() {{ return ({text}); }}")
-    };
-    let tree = parse_tree(&script.grammar(), &wrapped).ok()?;
-    if exceeds_depth_limit(&tree) {
-        return None;
-    }
-    if let Some(function) = cognitive::first_function(tree.root_node(), script) {
-        let body = function.child_by_field_name("body").unwrap_or(function);
-        score_expression_node(body, &wrapped, script, &mut score);
-    }
+    score_expression_node(tree.root_node(), &wrapped, script, &mut score);
     Some(score)
 }
 
@@ -1712,18 +1774,29 @@ mod tests {
             "{}\nfunction g(a) {{ return a; }}",
             chain_over.replace("{ return", "{ const ok = (b) => b; return")
         );
-        let deep_expression = "a + ".repeat(MAX_SYNTAX_DEPTH);
-        let component =
-            format!("<script>{script}</script><p>{{{deep_expression}a}}</p>{{#if a}}{{/if}}");
+        // A template expression's own subtree counts, not its wrapper: a
+        // chain of `n + 1` terms is `n` levels high.
+        let expression =
+            |levels: usize| format!("<p>{{{}a}}</p>{{#if a}}{{/if}}", "a + ".repeat(levels));
+        let expression_at = expression(MAX_SYNTAX_DEPTH);
+        let expression_over = expression(MAX_SYNTAX_DEPTH + 1);
+        let component = format!("<script>{script}</script>{expression_over}");
         let cases = [
-            (Language::JavaScript, chain_at, vec!["f"]),
-            (Language::JavaScript, chain_over, vec![]),
-            (Language::JavaScript, ifs_at, vec!["f"]),
-            (Language::JavaScript, ifs_over, vec![]),
-            (Language::Svelte, elements_at, vec!["<template>"]),
-            (Language::Svelte, elements_over, vec![]),
-            (Language::JavaScript, script, vec!["ok", "g"]),
-            (Language::Svelte, component, vec!["ok", "g", "{#if}"]),
+            (Language::JavaScript, chain_at, vec!["f"], false),
+            (Language::JavaScript, chain_over, vec![], true),
+            (Language::JavaScript, ifs_at, vec!["f"], false),
+            (Language::JavaScript, ifs_over, vec![], true),
+            (Language::Svelte, elements_at, vec!["<template>"], false),
+            (Language::Svelte, elements_over, vec![], true),
+            (
+                Language::Svelte,
+                expression_at,
+                vec!["{#if}", "<template>"],
+                false,
+            ),
+            (Language::Svelte, expression_over, vec!["{#if}"], true),
+            (Language::JavaScript, script, vec!["ok", "g"], true),
+            (Language::Svelte, component, vec!["ok", "g", "{#if}"], true),
         ];
         let outcome = std::thread::Builder::new()
             .stack_size(1 << 20)
@@ -1731,14 +1804,14 @@ mod tests {
                 on_measurement_stack(move || {
                     cases
                         .into_iter()
-                        .map(|(language, source, names)| {
+                        .map(|(language, source, names, deep)| {
                             let parsed = parse_source(language, &source).unwrap();
                             let found = parsed
                                 .functions
                                 .iter()
                                 .map(|unit| unit.function.clone())
                                 .collect::<Vec<_>>();
-                            (found, parsed.reason(), names)
+                            (found, parsed.reason(), names, deep)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1747,10 +1820,9 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        for (index, (found, reason, names)) in outcome.into_iter().enumerate() {
+        for (index, (found, reason, names, deep)) in outcome.into_iter().enumerate() {
             assert_eq!(found, names, "case {index}");
-            let expected =
-                (index % 2 == 1 || index > 5).then_some("syntax nesting too deep to measure");
+            let expected = deep.then_some("syntax nesting too deep to measure");
             assert_eq!(reason.as_deref(), expected, "case {index}");
         }
     }
@@ -1913,9 +1985,6 @@ class Screen {
             template("<button on:click={() => ok && go()}>x</button>"),
             (2, 1)
         );
-        // Bindings are scored, but a default value in a destructuring pattern
-        // does not parse as an expression and adds nothing.
-        assert_eq!(template("{#each a as { x = b && c }}{/each}").0, 1);
         let block = |source: &str| {
             let functions = parse_source(Language::Svelte, source).unwrap().functions;
             assert_eq!(functions[0].function, "{#each}");
@@ -1941,6 +2010,68 @@ class Screen {
         assert_eq!(
             template(&format!("<script lang=\"ts\"></script>{conditional_type}")),
             (1, 0)
+        );
+    }
+
+    #[test]
+    fn svelte_template_texts_are_parsed_in_their_role() {
+        let unit = |script: &str, template: &str| {
+            let source = format!("<script{script}></script>\n{template}");
+            let functions = parse_source(Language::Svelte, &source).unwrap().functions;
+            let unit = functions.iter().find(|unit| unit.line == 2).unwrap();
+            (unit.function.clone(), unit.complexity, unit.bool_ops)
+        };
+        let chain = "a && b && c && d && e";
+        for (script, typed) in [(" lang=\"ts\"", ": boolean"), ("", "")] {
+            let cases = [
+                (
+                    format!("{{#snippet f(x{typed} = {chain})}}{{x}}{{/snippet}}"),
+                    "{#snippet f}",
+                    5,
+                ),
+                (
+                    format!("{{#if ok}}{{@const x{typed} = {chain}}}{{x}}{{/if}}"),
+                    "{#if}",
+                    6,
+                ),
+                (
+                    format!("{{#each a as {{ x = {chain} }}}}{{x}}{{/each}}"),
+                    "{#each}",
+                    6,
+                ),
+                (
+                    format!("{{#each a as {{ x = {chain} }}, i}}{{x}}{{/each}}"),
+                    "{#each}",
+                    6,
+                ),
+                (
+                    format!("{{#await p}}{{:then {{ x = {chain} }}}}{{x}}{{/await}}"),
+                    "{#await}",
+                    6,
+                ),
+                (
+                    format!("{{#await p}}{{:catch {{ x = {chain} }}}}{{x}}{{/await}}"),
+                    "{#await}",
+                    7,
+                ),
+            ];
+            for (template, name, decisions) in cases {
+                let (found, complexity, bool_ops) = unit(script, &template);
+                assert_eq!(found, name, "{template}");
+                assert_eq!(bool_ops, 4, "{script} {template}");
+                assert_eq!(complexity, decisions, "{script} {template}");
+            }
+        }
+        // A key after a pattern parses only as a call, so a binding with a key
+        // falls back to the expression wrapper: a plain pattern still counts,
+        // a destructuring default inside an `ERROR` adds nothing.
+        assert_eq!(
+            unit("", &format!("{{#each a as x, i ({chain})}}{{x}}{{/each}}")),
+            ("{#each}".to_owned(), 6, 4)
+        );
+        assert_eq!(
+            unit("", "{#each a as { x = b && c }, i (k)}{x}{/each}"),
+            ("{#each}".to_owned(), 2, 0)
         );
     }
 
