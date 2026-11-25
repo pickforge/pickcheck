@@ -24,6 +24,9 @@
   20,000-term expression, is now reported `UNVERIFIED <file>  syntax nesting
   too deep to measure` and the scan continues, instead of aborting the process
   with a stack overflow in `check` and in every hook. (#49)
+- `lines` now indexes each file's lines and comments once instead of
+  rescanning the file for every function, so a 100,000-line file with 20,000
+  functions is measured in about a second instead of tens of seconds. (#49)
 
 ## Validation
 

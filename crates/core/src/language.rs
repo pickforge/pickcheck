@@ -387,8 +387,16 @@ fn parse_with_offset(
     offset: Offset,
 ) -> Result<Vec<FunctionMetrics>> {
     let tree = parse_tree(&language.grammar(), source)?;
+    let lines = LineIndex::new(source, tree.root_node());
     let mut functions = Vec::new();
-    collect_functions(tree.root_node(), language, source, offset, &mut functions);
+    collect_functions(
+        tree.root_node(),
+        language,
+        source,
+        offset,
+        &lines,
+        &mut functions,
+    );
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
 }
@@ -398,14 +406,15 @@ fn collect_functions(
     language: Language,
     source: &str,
     offset: Offset,
+    lines: &LineIndex,
     output: &mut Vec<FunctionMetrics>,
 ) {
     if is_function(language, node.kind()) {
-        output.push(measure_function(node, language, source, offset));
+        output.push(measure_function(node, language, source, offset, lines));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_functions(child, language, source, offset, output);
+        collect_functions(child, language, source, offset, lines, output);
     }
 }
 
@@ -414,6 +423,7 @@ fn measure_function(
     language: Language,
     source: &str,
     offset: Offset,
+    lines: &LineIndex,
 ) -> FunctionMetrics {
     let mut score = Score {
         complexity: 1,
@@ -432,7 +442,7 @@ fn measure_function(
         complexity: score.complexity,
         cognitive: cognitive::measure_function(node, language, source),
         depth: score.depth,
-        lines: significant_lines(source, start, end, node),
+        lines: lines.significant_lines(source, start, end, node),
         params: parameter_count(node, language, source),
         bool_ops: score.bool_ops,
         widget_depth: widget_depth.unwrap_or(0),
@@ -1126,20 +1136,45 @@ fn receiver_parameter(node: Node<'_>, source: &str) -> bool {
         || text.starts_with("this:")
 }
 
-fn significant_lines(source: &str, start: usize, end: usize, node: Node<'_>) -> usize {
-    let mut comments = Vec::new();
-    collect_comments(node, &mut comments);
-    let mut offset = 0;
-    source
-        .split_inclusive('\n')
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line_start = offset;
-            offset += line.len();
-            (index + 1 >= start && index < end).then_some((line_start, line))
-        })
-        .filter(|(line_start, line)| line_has_code(*line_start, line, &comments))
-        .count()
+/// Line starts and comment ranges of one parsed source, built once so that
+/// `lines` costs each function only its own lines instead of a rescan of the
+/// whole source.
+struct LineIndex {
+    /// Byte offset of each line's first byte.
+    starts: Vec<usize>,
+    /// Every comment node, in source order and never overlapping.
+    comments: Vec<(usize, usize)>,
+}
+
+impl LineIndex {
+    fn new(source: &str, root: Node<'_>) -> Self {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+            .filter(|start| *start < source.len())
+            .collect();
+        let mut comments = Vec::new();
+        collect_comments(root, &mut comments);
+        Self { starts, comments }
+    }
+
+    /// Lines `start..=end` (1-based) of `node` that hold a non-whitespace byte
+    /// outside the comments inside `node`.
+    fn significant_lines(&self, source: &str, start: usize, end: usize, node: Node<'_>) -> usize {
+        let first = self
+            .comments
+            .partition_point(|(comment, _)| *comment < node.start_byte());
+        let last = self
+            .comments
+            .partition_point(|(_, comment)| *comment <= node.end_byte());
+        let comments = &self.comments[first..last.max(first)];
+        (start..=end.min(self.starts.len()))
+            .filter(|line| {
+                let line_start = self.starts[line - 1];
+                let line_end = self.starts.get(*line).copied().unwrap_or(source.len());
+                line_has_code(line_start, &source[line_start..line_end], comments)
+            })
+            .count()
+    }
 }
 
 fn collect_comments(node: Node<'_>, comments: &mut Vec<(usize, usize)>) {
@@ -1153,10 +1188,15 @@ fn collect_comments(node: Node<'_>, comments: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// `comments` is sorted, so only the ones that reach this line are checked.
 fn line_has_code(line_start: usize, line: &str, comments: &[(usize, usize)]) -> bool {
+    let first = comments.partition_point(|(_, end)| *end <= line_start);
+    let line_end = line_start + line.len();
+    let nearby = &comments[first..];
+    let nearby = &nearby[..nearby.partition_point(|(start, _)| *start < line_end)];
     line.bytes().enumerate().any(|(index, byte)| {
         !byte.is_ascii_whitespace()
-            && !comments
+            && !nearby
                 .iter()
                 .any(|(start, end)| *start <= line_start + index && line_start + index < *end)
     })
