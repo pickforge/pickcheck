@@ -7,7 +7,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -95,14 +95,13 @@ fn create_anchor(path: &Path, head: &str) -> Result<bool> {
 /// yet finished the line. Content that never completes is returned as read;
 /// it names no commit, so the hook falls back with a note.
 fn read_anchor(path: &Path) -> Result<String> {
-    let started = SystemTime::now();
+    let started = Instant::now();
     loop {
         let mut text = String::new();
         File::open(path)
             .and_then(|mut file| file.read_to_string(&mut text))
             .with_context(|| format!("cannot read state {}", path.display()))?;
-        let waited = started.elapsed().unwrap_or(ANCHOR_WAIT);
-        if text.ends_with('\n') || waited >= ANCHOR_WAIT {
+        if text.ends_with('\n') || started.elapsed() >= ANCHOR_WAIT {
             return Ok(text.trim().to_owned());
         }
         thread::sleep(Duration::from_millis(10));
