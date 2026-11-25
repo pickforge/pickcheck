@@ -1529,7 +1529,7 @@ impl TemplateWalk<'_> {
                 score.complexity += 1;
             }
             "svelte_raw_text" => {
-                let expression = score_expression(node_text(node, self.source), self.script)?;
+                let expression = score_expression(node, self.source, self.script)?;
                 score.complexity += expression.complexity;
                 score.bool_ops = score.bool_ops.max(expression.bool_ops);
             }
@@ -1547,16 +1547,26 @@ impl TemplateWalk<'_> {
 
 /// Decisions (`complexity` without its base 1) and the widest boolean chain in
 /// one template expression, parsed with the component's script grammar inside
-/// the wrapper `cognitive` also uses. Functions in the expression count
-/// inline; nodes inside an `ERROR` subtree add nothing. `None` when the
-/// expression's tree is deeper than `MAX_SYNTAX_DEPTH`.
-fn score_expression(text: &str, script: Language) -> Option<Score> {
+/// the wrapper `cognitive` also uses. A spread attribute (`{...props}`) keeps
+/// its text under `attribute_name`, and `...props` parses only as an array
+/// element, so that text is wrapped in `[…]` instead of `(…)`. Functions in
+/// the expression count inline; nodes inside an `ERROR` subtree add nothing.
+/// `None` when the expression's tree is deeper than `MAX_SYNTAX_DEPTH`.
+fn score_expression(node: Node<'_>, source: &str, script: Language) -> Option<Score> {
     let mut score = Score {
         complexity: 0,
         depth: 0,
         bool_ops: 0,
     };
-    let wrapped = format!("function expression() {{ return ({text}); }}");
+    let text = node_text(node, source);
+    let wrapped = if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute_name")
+    {
+        format!("function expression() {{ return [{text}]; }}")
+    } else {
+        format!("function expression() {{ return ({text}); }}")
+    };
     let tree = parse_tree(&script.grammar(), &wrapped).ok()?;
     if exceeds_depth_limit(&tree) {
         return None;

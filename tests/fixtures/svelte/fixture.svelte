@@ -264,3 +264,7 @@ function ternaryBreak(a: boolean, b: boolean, c: boolean, d: boolean, e: boolean
 {#each has && a && b && c && d && list as item}{item}{/each}
 <!-- negative: operators in a binding's string default add nothing -->
 {#each items as { x = "a && b && c && d" }}{x}{/each}
+<!-- a spread attribute is scored -->
+{#if ready}
+  <input {...inputProps(ready && value)} /> <!-- +1 && -->
+{/if}

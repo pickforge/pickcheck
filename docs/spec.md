@@ -457,10 +457,12 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
   parameters and keys, `{:then}` and `{:catch}` values, and snippet
   parameters. `cognitive` scores only the subset listed under Cognitive
   complexity. Each text is wrapped and parsed with the component's script
-  grammar, as for `cognitive`. Each `ternary_expression` and each
-  short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`) adds 1,
-  including inside a function in the expression; `bool_ops` takes its chains
-  from the same tree. Nodes inside an `ERROR` subtree add nothing, and
+  grammar, as for `cognitive`. The text of a spread attribute (`{...props}`)
+  sits under `attribute_name` and is wrapped in `[…]` instead of `(…)`,
+  because a spread parses only as an array element. Each `ternary_expression`
+  and each short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`)
+  adds 1, including inside a function in the expression; `bool_ops` takes its
+  chains from the same tree. Nodes inside an `ERROR` subtree add nothing, and
   operator characters inside a string, a regular expression, or a comment are
   not operator nodes.
   Depth follows `{#if}`/`{#each}`/`{#await}` nesting within a unit, so a block

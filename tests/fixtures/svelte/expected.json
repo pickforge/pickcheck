@@ -176,6 +176,14 @@
         "hand_derived": true,
         "derivation": "base 1; each block +1; the operators in the string default of the binding are not operator nodes",
         "cognitive_derivation": "{#each} +1; the parameter is a binding and cognitive does not score it"
+      },
+      {
+        "function": "{#if}",
+        "line": 268,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; if block +1; the && inside the spread attribute +1",
+        "cognitive_derivation": "{#if} +1; cognitive does not score spread attribute text"
       }
     ]
   },
@@ -453,6 +461,17 @@
       "lines": 0,
       "params": 0,
       "bool_ops": 0,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#if}",
+      "line": 268,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
       "widget_depth": 0
     }
   ]
