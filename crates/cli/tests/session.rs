@@ -609,6 +609,155 @@ fn many_gone_files_widen_the_names_diff_of_an_edit() {
     );
 }
 
+/// Every stderr note of a session, the unverified notes and the state
+/// failure notes, is a failed write when stderr cannot be written, and the
+/// exit code and stdout stay those of a writable stderr.
+#[cfg(unix)]
+#[test]
+fn session_notes_ignore_an_unwritable_stderr() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    fs::write(root.join("note.kt"), "fun f() = 1\n").unwrap();
+    fs::write(root.join("b.js"), violating("b", 16)).unwrap();
+    let broken = state.path().join("file");
+    fs::write(&broken, "").unwrap();
+    let bash = json!({"hook_event_name":"PostToolUse", "session_id":"full", "cwd":root,
+        "tool_name":"Bash", "tool_input":{"command":"true"}});
+    let stop = json!({"hook_event_name":"Stop", "session_id":"full", "cwd":root});
+    let note = "note: UNVERIFIED note.kt  no grammar for .kt\n";
+    let unavailable = "note: hook session state unavailable, the hook runs without a session: ";
+    let inputs = [
+        bash,
+        edit_input(root, "full", &root.join("note.kt")),
+        edit_input(root, "full", &root.join("b.js")),
+        stop,
+    ];
+    // In a session only the unverified edit writes a note; without usable
+    // state every event starts with the state note. A blocking `Stop` then
+    // fails on the loop guard's own state, which is not a session note.
+    let cases = [
+        (state.path(), &["", note, "", ""][..]),
+        (broken.as_path(), &[unavailable; 3][..]),
+    ];
+    for (home, notes) in cases {
+        for (input, expected) in inputs.iter().zip(notes) {
+            let writable = hook_at(home, "claude", input);
+            let stderr = text(&writable.stderr);
+            if expected.is_empty() {
+                assert!(stderr.is_empty(), "{input}: {stderr}");
+            } else {
+                assert!(stderr.starts_with(expected), "{input}: {stderr}");
+            }
+            let unwritable = hook_without_stderr(home, input);
+            assert_eq!(unwritable.status.code(), writable.status.code(), "{input}");
+            assert_eq!(unwritable.stdout, writable.stdout, "{input}");
+        }
+    }
+}
+
+/// A session started from a linked working directory and continued from
+/// the physical one keeps one anchor.
+#[cfg(unix)]
+#[test]
+fn a_linked_and_a_physical_cwd_share_the_session() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    let initial = head(root);
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("link");
+    std::os::unix::fs::symlink(root, &link).unwrap();
+    start(&state, &link, "linked");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    edit(&state, &link, "linked", "a.js");
+    commit_all(root, "violation");
+    let reason = block_reason(&stop(&state, root, "linked"));
+    assert!(!reason.contains("note:"), "{reason}");
+    assert!(reason.contains("FAIL a.js  1 function"), "{reason}");
+    assert!(reason.contains(&format!("--base {initial} ")), "{reason}");
+    let anchors = fs::read_dir(state.path().join("sessions"))
+        .unwrap()
+        .filter(|entry| {
+            let path = entry.as_ref().unwrap().path();
+            path.extension().is_some_and(|kind| kind == "anchor")
+        })
+        .count();
+    assert_eq!(anchors, 1);
+}
+
+/// An edit of a file that Git ignores is in no diff: it is checked as a
+/// whole file with no base, so its violations are new. An ignored file that
+/// the session did not edit is never reported.
+#[test]
+fn an_edited_ignored_file_is_checked_whole_with_no_base() {
+    let (dir, state) = repo(&[(".gitignore", "gen/\n"), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    fs::create_dir(root.join("gen")).unwrap();
+    fs::write(root.join("gen").join("old.js"), violating("old", 16)).unwrap();
+    fs::write(root.join("gen").join("new.js"), simple("fresh")).unwrap();
+    start(&state, root, "ignored");
+
+    // Not edited: neither an edit of another file nor `Stop` reports it.
+    fs::write(root.join("a.js"), touched_simple("a")).unwrap();
+    assert!(edit(&state, root, "ignored", "a.js").stdout.is_empty());
+    assert!(stop(&state, root, "ignored").stdout.is_empty());
+
+    // Edited: the whole file, every violation new.
+    let edited = format!("{}{}", simple("fresh"), violating("grown", 16));
+    fs::write(root.join("gen").join("new.js"), edited).unwrap();
+    let input = edit_input(root, "ignored", &root.join("gen").join("new.js"));
+    let (output, commands) = traced(&state, &input);
+    // Locate, names and untracked for the record, the hunks, and the ignore
+    // check; a file with no base reads none.
+    assert_eq!(commands.len(), 5, "{commands:#?}");
+    assert!(commands[4].starts_with("check-ignore"), "{commands:#?}");
+    let reason = block_reason(&output);
+    assert!(
+        reason.starts_with("FAIL 1 changed file, 1 function, 1 violation\n"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&native("FAIL gen/new.js  1 function")),
+        "{reason}"
+    );
+    assert!(!reason.contains("old.js"), "{reason}");
+    let verbose = command(
+        root,
+        &["check", "--verbose", "--base", "HEAD", "gen/new.js"],
+    );
+    assert!(
+        text(&verbose.stdout).is_empty(),
+        "ignored files are in no diff"
+    );
+}
+
+/// The hook with stderr that cannot be written: `/dev/full` where it exists,
+/// a closed descriptor elsewhere.
+#[cfg(unix)]
+fn hook_without_stderr(state: &Path, input: &Value) -> Output {
+    let full = Path::new("/dev/full");
+    let mut command = if full.exists() {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pickcheck"));
+        let stderr = fs::OpenOptions::new().write(true).open(full).unwrap();
+        command.args(["hook", "claude"]).stderr(stderr);
+        command
+    } else {
+        let mut command = Command::new("sh");
+        let script = "exec \"$0\" hook claude 2>&-";
+        command.args(["-c", script, env!("CARGO_BIN_EXE_pickcheck")]);
+        command
+    };
+    let mut child = command
+        .env("PICKCHECK_HOME", state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
 /// The Git commands that one hook event runs, from `GIT_TRACE`, after
 /// checking that none of them ran twice.
 fn traced(state: &TempDir, input: &Value) -> (Output, Vec<String>) {
