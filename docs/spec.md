@@ -579,7 +579,10 @@ DETAILS pickcheck check --changed --verbose <file>
 - `UNVERIFIED` is emitted for a file that is explicitly named on the command
   line, or that has a known source-code extension with no grammar (`.kt .java
   .c .cc .cpp .h .hpp .cs .swift .rb .php .scala .lua .zig .m .mm .ex .exs .hs
-  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8. Non-source files
+  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or whose syntax
+  tree is deeper than 3,000 levels (`syntax nesting too deep to measure`; this
+  covers each `<script>` block and template expression of a Svelte file, and a
+  base file that deep has no readable base). Non-source files
   found while walking a directory (`.md`, `.json`, `.toml`, images, …) are
   skipped silently. A file that cannot be read never aborts the scan.
 

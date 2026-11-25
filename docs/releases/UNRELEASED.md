@@ -20,6 +20,10 @@
   `complexity` and `bool_ops` now count operator nodes in the parsed
   expression, with the component's script grammar, so a `?` or `||` inside a
   regular expression, string, or comment no longer adds a decision. (#49)
+- A file whose syntax tree is deeper than 3,000 levels, such as a generated
+  20,000-term expression, is now reported `UNVERIFIED <file>  syntax nesting
+  too deep to measure` and the scan continues, instead of aborting the process
+  with a stack overflow in `check` and in every hook. (#49)
 
 ## Validation
 

@@ -609,6 +609,61 @@ fn stop_hook_reason_lists_unverified_files() {
 }
 
 #[test]
+fn too_deep_files_are_unverified_and_the_scan_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
+    fs::write(root.join("deep.js"), &deep).unwrap();
+    fs::write(root.join("bad.js"), complex_function()).unwrap();
+
+    let check = command_output(root, &["check", "."]);
+    assert_eq!(check.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        text.contains("FAIL bad.js:1 bad  cognitive 16 > 15"),
+        "{text}"
+    );
+    assert!(
+        text.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
+        "{text}"
+    );
+
+    init_repo(root);
+    commit_all(root, "initial");
+    git(root, &["checkout", "-qb", "feature"]);
+    fs::write(
+        root.join("deep.js"),
+        "function deep(a, b, c, d, e, f, g) { return a; }\n",
+    )
+    .unwrap();
+    let base = command_output(root, &["check", "--base", "main", "--verbose", "deep.js"]);
+    assert_eq!(base.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&base.stdout).contains("FAIL deep.js:1 deep  params 7 > 6  new")
+    );
+    assert!(
+        String::from_utf8_lossy(&base.stderr)
+            .contains("note: deep.js has no readable base; its functions count as new")
+    );
+
+    fs::write(root.join("deep.js"), &deep).unwrap();
+    for event in ["PostToolUse", "Stop"] {
+        let input = serde_json::json!({
+            "hook_event_name": event, "session_id": "deep", "cwd": root,
+            "tool_name": "Edit", "tool_input": {"file_path": root.join("deep.js")}
+        })
+        .to_string();
+        let hook = hook_output(state.path(), &input);
+        assert!(
+            hook.status.success(),
+            "{event}: {}",
+            String::from_utf8_lossy(&hook.stderr)
+        );
+    }
+}
+
+#[test]
 fn directory_noise_is_silent_and_invalid_utf8_is_unverified() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("README.md"), "docs\n").unwrap();

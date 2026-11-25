@@ -5,7 +5,9 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::language::{Language, has_operator, is_dart_handler, is_function, node_text};
+use crate::language::{
+    Language, exceeds_depth_limit, has_operator, is_dart_handler, is_function, node_text,
+};
 
 /// Header fields stay at the construct's own nesting level; every other part
 /// of a structural construct sits one level deeper.
@@ -396,6 +398,9 @@ impl Template<'_> {
         let Some(tree) = parser.parse(&wrapped, None) else {
             return 0;
         };
+        if exceeds_depth_limit(&tree) {
+            return 0;
+        }
         let Some(function) = first_function(tree.root_node(), self.script) else {
             return 0;
         };

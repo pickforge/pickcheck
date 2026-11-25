@@ -9,7 +9,7 @@ use ignore::WalkBuilder;
 use serde::Serialize;
 
 use crate::{
-    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric,
+    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric, TooDeep,
     base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::repository_root,
@@ -285,7 +285,17 @@ fn scan_file(
             return Ok(());
         }
     };
-    let functions = parse_source(language, &source)?;
+    let functions = match parse_source(language, &source) {
+        Ok(functions) => functions,
+        Err(error) if error.is::<TooDeep>() => {
+            result.unverified.push(Unverified {
+                file: display,
+                reason: error.to_string(),
+            });
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let context = FileContext {
         display: &display,
         matched: &matched_path,

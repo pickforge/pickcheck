@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pickcheck_core::{
     ScanOptions, Status, Violation, changed_files, changed_files_since, coverage_unknowns,
-    grammar_inventory, load_config, scan,
+    grammar_inventory, load_config, on_measurement_stack, scan,
 };
 use serde::Serialize;
 
@@ -112,7 +112,11 @@ enum Harness {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let outcome = on_measurement_stack(|| run(cli))
+        .context("cannot start the measurement thread")
+        .and_then(|outcome| outcome);
+    match outcome {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("error: {error:#}");

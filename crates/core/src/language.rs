@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -292,6 +292,88 @@ fn ignored_kind_name(kind: &str) -> bool {
         .any(|part| kind.contains(part))
 }
 
+/// The deepest syntax-tree level `parse_source` measures. Every walk over a
+/// tree recurses once per level, so this bound, together with
+/// `on_measurement_stack`, keeps any input from overflowing the stack. Ordinary
+/// code stays far below it: a 1,000-term `a + b + …` chain is about 1,000 deep.
+pub const MAX_SYNTAX_DEPTH: usize = 3_000;
+
+/// Stack for `on_measurement_stack`. On an unoptimized build, the deepest tree
+/// allowed needed at most 6.4 MiB (nested Svelte elements) and about 3 MiB for
+/// the other languages, so 64 MiB leaves a tenfold margin. Only the pages
+/// actually used are committed.
+const MEASUREMENT_STACK: usize = 64 << 20;
+
+/// `parse_source` fails with this error when a parsed tree is deeper than
+/// `MAX_SYNTAX_DEPTH`. Callers report the file as unverified.
+#[derive(Debug)]
+pub struct TooDeep;
+
+impl fmt::Display for TooDeep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("syntax nesting too deep to measure")
+    }
+}
+
+impl std::error::Error for TooDeep {}
+
+/// Runs `task` on a thread with a stack sized for `MAX_SYNTAX_DEPTH`, so
+/// measuring never depends on the caller's stack. Run a whole scan inside one
+/// call, not one call per file.
+///
+/// # Errors
+///
+/// Fails when the thread cannot be started.
+pub fn on_measurement_stack<T: Send>(task: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("pickcheck-measure".to_owned())
+            .stack_size(MEASUREMENT_STACK)
+            .spawn_scoped(scope, task)?;
+        Ok(handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    })
+}
+
+/// Parses `source` and rejects a tree deeper than `MAX_SYNTAX_DEPTH` with
+/// `TooDeep`, before any recursive walk can see it.
+fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(grammar)
+        .context("incompatible tree-sitter grammar")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parser returned no tree")?;
+    if exceeds_depth_limit(&tree) {
+        return Err(TooDeep.into());
+    }
+    Ok(tree)
+}
+
+/// Whether any node lies deeper than `MAX_SYNTAX_DEPTH`, found with a cursor
+/// so the check itself never recurses.
+pub(crate) fn exceeds_depth_limit(tree: &Tree) -> bool {
+    let mut cursor = tree.walk();
+    let mut depth = 0;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            if depth > MAX_SYNTAX_DEPTH {
+                return true;
+            }
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+}
+
 pub fn parse_source(language: Language, source: &str) -> Result<Vec<FunctionMetrics>> {
     if language == Language::Svelte {
         return parse_svelte(source);
@@ -304,13 +386,7 @@ fn parse_with_offset(
     source: &str,
     offset: Offset,
 ) -> Result<Vec<FunctionMetrics>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language.grammar())
-        .context("incompatible tree-sitter grammar")?;
-    let tree = parser
-        .parse(source, None)
-        .context("tree-sitter parser returned no tree")?;
+    let tree = parse_tree(&language.grammar(), source)?;
     let mut functions = Vec::new();
     collect_functions(tree.root_node(), language, source, offset, &mut functions);
     functions.sort_by_key(|item| (item.line, item.end_line));
@@ -1091,7 +1167,7 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
-    let tree = parse_svelte_tree(source)?;
+    let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
     let mut scripts = Vec::new();
     collect_scripts(tree.root_node(), source, &mut scripts);
     let mut functions = Vec::new();
@@ -1117,19 +1193,9 @@ fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
         tree.root_node(),
         source,
         template_language,
-    ));
+    )?);
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
-}
-
-fn parse_svelte_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
-        .context("incompatible Svelte grammar")?;
-    parser
-        .parse(source, None)
-        .context("Svelte parser returned no tree")
 }
 
 /// Every `script_element` with its grammar and its `raw_text` content. A
@@ -1194,7 +1260,11 @@ struct TemplateUnits {
     list: Vec<FunctionMetrics>,
 }
 
-fn measure_template(root: Node<'_>, source: &str, script: Language) -> Vec<FunctionMetrics> {
+fn measure_template(
+    root: Node<'_>,
+    source: &str,
+    script: Language,
+) -> Result<Vec<FunctionMetrics>> {
     let mut units = TemplateUnits {
         script,
         list: Vec::new(),
@@ -1204,13 +1274,13 @@ fn measure_template(root: Node<'_>, source: &str, script: Language) -> Vec<Funct
         depth: 0,
         bool_ops: 0,
     };
-    score_svelte_node(root, source, 0, true, &mut score, &mut units);
+    score_svelte_node(root, source, 0, true, &mut score, &mut units)?;
     let mut unit = template_metrics("<template>".to_owned(), root, &score);
     unit.line = 1;
     unit.end_line = source.lines().count().max(1);
     unit.cognitive = cognitive::measure_template_unit(root, source, script, true);
     units.list.push(unit);
-    units.list
+    Ok(units.list)
 }
 
 fn measure_svelte_node(
@@ -1220,35 +1290,36 @@ fn measure_svelte_node(
     root: bool,
     score: &mut Score,
     units: &mut TemplateUnits,
-) {
+) -> Result<()> {
     match node.kind() {
         "script_element" | "style_element" => {}
         "snippet_statement" => {
-            let unit = measure_template_unit(node, source, units);
+            let unit = measure_template_unit(node, source, units)?;
             units.list.push(unit);
         }
         kind if root && TEMPLATE_BLOCKS.contains(&kind) => {
-            let unit = measure_template_unit(node, source, units);
+            let unit = measure_template_unit(node, source, units)?;
             units.list.push(unit);
         }
-        _ => score_svelte_node(node, source, depth, root, score, units),
+        _ => score_svelte_node(node, source, depth, root, score, units)?,
     }
+    Ok(())
 }
 
 fn measure_template_unit(
     node: Node<'_>,
     source: &str,
     units: &mut TemplateUnits,
-) -> FunctionMetrics {
+) -> Result<FunctionMetrics> {
     let mut score = Score {
         complexity: 1,
         depth: 0,
         bool_ops: 0,
     };
-    score_svelte_node(node, source, 0, false, &mut score, units);
+    score_svelte_node(node, source, 0, false, &mut score, units)?;
     let mut unit = template_metrics(template_unit_name(node, source), node, &score);
     unit.cognitive = cognitive::measure_template_unit(node, source, units.script, false);
-    unit
+    Ok(unit)
 }
 
 fn template_unit_name(node: Node<'_>, source: &str) -> String {
@@ -1296,7 +1367,7 @@ fn score_svelte_node(
     root: bool,
     score: &mut Score,
     units: &mut TemplateUnits,
-) {
+) -> Result<()> {
     if matches!(
         node.kind(),
         "if_start" | "else_if_start" | "each_start" | "await_start" | "catch_start"
@@ -1304,7 +1375,7 @@ fn score_svelte_node(
         score.complexity += 1;
     }
     if node.kind() == "svelte_raw_text" && cognitive::scored_raw_text(node) {
-        let expression = score_expression(node_text(node, source), units.script);
+        let expression = score_expression(node_text(node, source), units.script)?;
         score.complexity += expression.complexity;
         score.bool_ops = score.bool_ops.max(expression.bool_ops);
     }
@@ -1312,33 +1383,29 @@ fn score_svelte_node(
     score.depth = score.depth.max(next_depth);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        measure_svelte_node(child, source, next_depth, root, score, units);
+        measure_svelte_node(child, source, next_depth, root, score, units)?;
     }
+    Ok(())
 }
 
 /// Decisions (`complexity` without its base 1) and the widest boolean chain in
 /// one template expression, parsed with the component's script grammar inside
 /// the wrapper `cognitive` also uses. Functions in the expression count
-/// inline; nodes inside an `ERROR` subtree add nothing.
-fn score_expression(text: &str, script: Language) -> Score {
+/// inline; nodes inside an `ERROR` subtree add nothing. An expression deeper
+/// than `MAX_SYNTAX_DEPTH` makes the whole file `TooDeep`.
+fn score_expression(text: &str, script: Language) -> Result<Score> {
     let mut score = Score {
         complexity: 0,
         depth: 0,
         bool_ops: 0,
     };
     let wrapped = format!("function expression() {{ return ({text}); }}");
-    let mut parser = Parser::new();
-    if parser.set_language(&script.grammar()).is_err() {
-        return score;
-    }
-    let Some(tree) = parser.parse(&wrapped, None) else {
-        return score;
-    };
+    let tree = parse_tree(&script.grammar(), &wrapped)?;
     if let Some(function) = cognitive::first_function(tree.root_node(), script) {
         let body = function.child_by_field_name("body").unwrap_or(function);
         score_expression_node(body, &wrapped, script, &mut score);
     }
-    score
+    Ok(score)
 }
 
 fn score_expression_node(node: Node<'_>, source: &str, script: Language, score: &mut Score) {
@@ -1384,6 +1451,93 @@ fn template_chain_operators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_depth(language: Language, source: &str) -> usize {
+        let grammar = if language == Language::Svelte {
+            tree_sitter_svelte_ng::LANGUAGE.into()
+        } else {
+            language.grammar()
+        };
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let (mut depth, mut deepest) = (0, 0);
+        loop {
+            if cursor.goto_first_child() {
+                depth += 1;
+                deepest = deepest.max(depth);
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return deepest;
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    /// Sources whose trees sit exactly at the depth limit and one level over
+    /// it, for a shape that adds one level per repetition.
+    fn at_and_over_limit(language: Language, shape: impl Fn(usize) -> String) -> [String; 2] {
+        let offset = tree_depth(language, &shape(10)) - 10;
+        let at = shape(MAX_SYNTAX_DEPTH - offset);
+        let over = shape(MAX_SYNTAX_DEPTH - offset + 1);
+        assert_eq!(tree_depth(language, &at), MAX_SYNTAX_DEPTH);
+        assert_eq!(tree_depth(language, &over), MAX_SYNTAX_DEPTH + 1);
+        [at, over]
+    }
+
+    #[test]
+    fn depth_limit_holds_on_a_one_mebibyte_caller_stack() {
+        let chain = |terms: usize| format!("function f(a) {{ return {}a; }}", "a + ".repeat(terms));
+        let ifs =
+            |levels: usize| format!("function f(a) {{ {}{} }}", "if (a) ".repeat(levels), "a;");
+        // Nested elements need the most stack per level of any shape measured.
+        let elements =
+            |levels: usize| format!("{}x{}", "<b>".repeat(levels), "</b>".repeat(levels));
+        let cases = [
+            (
+                Language::JavaScript,
+                at_and_over_limit(Language::JavaScript, chain),
+            ),
+            (
+                Language::JavaScript,
+                at_and_over_limit(Language::JavaScript, ifs),
+            ),
+            (
+                Language::Svelte,
+                at_and_over_limit(Language::Svelte, elements),
+            ),
+        ];
+        let template = format!("<p>{{{}a}}</p>", "a + ".repeat(MAX_SYNTAX_DEPTH));
+        let outcome = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                on_measurement_stack(move || {
+                    let mut results = cases
+                        .iter()
+                        .flat_map(|(language, sources)| {
+                            sources.iter().map(|source| parse_source(*language, source))
+                        })
+                        .collect::<Vec<_>>();
+                    results.push(parse_source(Language::Svelte, &template));
+                    results
+                })
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        for (pair, name) in outcome.chunks(2).zip(["f", "f", "<template>"]) {
+            let at = pair[0].as_ref().unwrap();
+            assert_eq!((at.len(), at[0].function.as_str()), (1, name));
+            assert!(pair[1].as_ref().unwrap_err().is::<TooDeep>());
+        }
+        let template = outcome[6].as_ref().unwrap_err();
+        assert_eq!(template.to_string(), "syntax nesting too deep to measure");
+    }
 
     #[test]
     fn current_grammars_have_no_unclassified_control_flow_candidates() {
