@@ -21,7 +21,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo run -- check crates
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --locked --fail-under-lines 94
+      - run: cargo llvm-cov --workspace --locked --fail-under-lines 95
+
+  rust-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked --all-targets
+
+  rust-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked --all-targets
 
   gitleaks:
     runs-on: ubuntu-24.04
