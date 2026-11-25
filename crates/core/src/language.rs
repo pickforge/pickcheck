@@ -1528,7 +1528,7 @@ impl TemplateWalk<'_> {
             "if_start" | "else_if_start" | "each_start" | "await_start" | "catch_start" => {
                 score.complexity += 1;
             }
-            "svelte_raw_text" if cognitive::scored_raw_text(node) => {
+            "svelte_raw_text" => {
                 let expression = score_expression(node_text(node, self.source), self.script)?;
                 score.complexity += expression.complexity;
                 score.bool_ops = score.bool_ops.max(expression.bool_ops);
@@ -1876,8 +1876,27 @@ class Screen {
             template("<button on:click={() => ok && go()}>x</button>"),
             (2, 1)
         );
-        // Bindings are not scored, so a default value adds nothing.
+        // Bindings are scored, but a default value in a destructuring pattern
+        // does not parse as an expression and adds nothing.
         assert_eq!(template("{#each a as { x = b && c }}{/each}").0, 1);
+        let block = |source: &str| {
+            let functions = parse_source(Language::Svelte, source).unwrap().functions;
+            assert_eq!(functions[0].function, "{#each}");
+            (functions[0].complexity, functions[0].bool_ops)
+        };
+        assert_eq!(
+            block("{#each foo as item (a && b && c && d && e)}{item}{/each}"),
+            (6, 4)
+        );
+        // The grammar splits `has` at `as`; the leading `&&` is an `ERROR`.
+        assert_eq!(
+            block("{#each has && a && b && c && d && list as item}{item}{/each}"),
+            (6, 4)
+        );
+        assert_eq!(
+            block("{#each items as { x = \"a && b && c && d\" }}{x}{/each}"),
+            (2, 0)
+        );
         // TypeScript reads this `?` as a conditional type, JavaScript as a
         // ternary.
         let conditional_type = "<p>{a as (T extends U ? X : Y)}</p>";

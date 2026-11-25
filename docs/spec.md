@@ -447,13 +447,16 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 - Every unit starts at complexity 1. Decision points are `{#if}`,
   `{:else if}`, `{#each}`, `{#await}`, `{:catch}`, and the boolean / ternary
   operators inside `{…}` expressions, counted in the unit that contains them.
-  Expressions are the scored `svelte_raw_text` nodes listed under Cognitive
-  complexity, wrapped and parsed with the component's script grammar in the
-  same way. Each `ternary_expression` and each short-circuit operator node
-  (`&&`, `||`, `??`, `&&=`, `||=`, `??=`) adds 1, including inside a function
-  in the expression; `bool_ops` takes its chains from the same tree. Nodes
-  inside an `ERROR` subtree add nothing, and operator characters inside a
-  string, a regular expression, or a comment are not operator nodes.
+  Expressions are all `svelte_raw_text` nodes, bindings included: `{#each}`
+  parameters and keys, `{:then}` and `{:catch}` values, and snippet
+  parameters. `cognitive` scores only the subset listed under Cognitive
+  complexity. Each text is wrapped and parsed with the component's script
+  grammar, as for `cognitive`. Each `ternary_expression` and each
+  short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`) adds 1,
+  including inside a function in the expression; `bool_ops` takes its chains
+  from the same tree. Nodes inside an `ERROR` subtree add nothing, and
+  operator characters inside a string, a regular expression, or a comment are
+  not operator nodes.
   Depth follows `{#if}`/`{#each}`/`{#await}` nesting within a unit, so a block
   unit has depth at least 1; snippets and `{#key}` add no depth. Template
   units are exempt from `lines` and `params`.

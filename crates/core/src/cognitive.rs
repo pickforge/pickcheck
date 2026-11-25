@@ -421,7 +421,7 @@ impl Template<'_> {
 
 /// Bindings (`each` parameters, `then` / `catch` values, snippet parameters)
 /// are declarations, not expressions, and are not scored.
-pub(crate) fn scored_raw_text(node: Node<'_>) -> bool {
+fn scored_raw_text(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };

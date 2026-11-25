@@ -258,3 +258,9 @@ function ternaryBreak(a: boolean, b: boolean, c: boolean, d: boolean, e: boolean
 {#if /a?b?c||d/.test(x)} <!-- +1 if; the regex adds nothing -->
   <p>{"a && b ? c : d ?? e" + label}</p> <!-- operators in a string add nothing -->
 {/if}
+
+<!-- bindings: an each parameter and its key count toward complexity and bool_ops -->
+{#each foo as item (a && b && c && d && e)}{item}{/each}
+{#each has && a && b && c && d && list as item}{item}{/each}
+<!-- negative: operators in a binding's string default add nothing -->
+{#each items as { x = "a && b && c && d" }}{x}{/each}
