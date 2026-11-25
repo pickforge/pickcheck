@@ -58,6 +58,7 @@ pickcheck check --changed --verbose src/auth.ts # details for one failing file
 pickcheck check --base origin/main              # everything since the branch forked
 pickcheck check --base origin/main --fail-on new,worsened,unmatched  # fail only on new or worse debt
 pickcheck check --format json .                 # machine-readable report
+pickcheck explain src/auth.ts:42                # where one function's cognitive score comes from
 pickcheck doctor --coverage                     # config chain, grammars, unclassified syntax
 ```
 
