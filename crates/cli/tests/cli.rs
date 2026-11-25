@@ -1315,6 +1315,15 @@ fn links_resolve_like_the_file_system() {
         "stdout: {parent_text}"
     );
 
+    // A missing directory before `..` does not stop link resolution.
+    symlink("src", real.join("side")).unwrap();
+    let missing = command_output(&real, &["check", "--changed", "missing/../side/a.js"]);
+    let missing_text = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing_text.contains("FAIL src/a.js  "),
+        "stdout: {missing_text}"
+    );
+
     // A new link to an unchanged file is a new file under its own name.
     symlink("legacy.js", real.join("fresh.js")).unwrap();
     for path in ["fresh.js", "."] {
@@ -1337,6 +1346,30 @@ fn links_resolve_like_the_file_system() {
     let released = hook_output(state.path(), &stop);
     assert!(released.stdout.is_empty());
     assert!(String::from_utf8_lossy(&released.stderr).contains("UNRESOLVED"));
+}
+
+/// A file system that ignores letter case accepts another spelling of a file
+/// name. The explicit path must still match the name Git prints.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn another_letter_case_matches_the_changed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    let file = dir.path().join("src").join("long-failing-source.js");
+    fs::write(&file, "function a() { return 1; }\n").unwrap();
+    init_repo(dir.path());
+    commit_all(dir.path(), "initial");
+    fs::write(&file, complex_function()).unwrap();
+
+    let given = Path::new("SRC").join("LONG-FAILING-SOURCE.JS");
+    assert!(dir.path().join(&given).exists(), "volume is case-sensitive");
+    let output = command_output(dir.path(), &["check", "--changed", given.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
+    assert!(
+        text.contains(&format!("FAIL {}  ", native("src/long-failing-source.js"))),
+        "stdout: {text}"
+    );
 }
 
 /// Outside Git, the name given on the command line selects the grammar, not

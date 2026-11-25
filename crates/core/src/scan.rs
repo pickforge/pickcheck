@@ -436,18 +436,30 @@ fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &m
 }
 
 /// An explicit path as the file system resolves it: links in its directory
-/// part are followed before `..` applies. A file keeps its own last
-/// component, the name Git lists and the one that selects the grammar. A path
-/// whose directory does not exist is normalized lexically.
+/// part are followed before `..` applies. A path whose directory does not
+/// exist is normalized lexically first, then resolved the same way.
 fn absolute(cwd: &Path, path: &Path) -> PathBuf {
     let path = cwd.join(path);
-    if path.is_dir() {
-        return physical(&path);
+    resolved(&path).unwrap_or_else(|| {
+        let lexical = normalize(&path);
+        resolved(&lexical).unwrap_or(lexical)
+    })
+}
+
+/// The physical spelling of `path`, or `None` when its directory does not
+/// exist. A link to a file keeps its own name, which is the name Git lists
+/// and the one that selects the grammar. Every other existing entry gets the
+/// name the file system stores, so a Windows short name or another letter
+/// case still matches the path Git prints.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let link = path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    if path.is_dir() || (!link && path.exists()) {
+        return Some(physical(path));
     }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) if parent.is_dir() => physical(parent).join(name),
-        _ => normalize(&path),
-    }
+    let parent = path.parent().filter(|parent| parent.is_dir())?;
+    Some(physical(parent).join(path.file_name()?))
 }
 
 fn normalize(path: &Path) -> PathBuf {
