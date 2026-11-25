@@ -37,6 +37,11 @@
   ],
   "languages": {},
   "hook": {
-    "max_blocks": 3
+    "max_blocks": 3,
+    "fail_on": [
+      "new",
+      "worsened",
+      "unmatched"
+    ]
   }
 }

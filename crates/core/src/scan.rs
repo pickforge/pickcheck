@@ -13,7 +13,7 @@ use crate::{
     base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
-    load_config, parse_source,
+    load_config, load_config_at, parse_source,
 };
 
 const UNVERIFIED_SOURCE_EXTENSIONS: &[&str] = &[
@@ -64,6 +64,9 @@ pub struct ScanOptions<'a> {
     pub paths: &'a [PathBuf],
     pub explicit_config: Option<&'a Path>,
     pub changed: Option<&'a ChangedFiles>,
+    /// Read the repository config of each file from this commit instead of
+    /// the working tree. Applies only with `changed`.
+    pub config_commit: Option<&'a str>,
 }
 
 struct ScanFile {
@@ -99,6 +102,7 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         paths: options.paths,
         explicit_config: options.explicit_config,
         changed: options.changed,
+        config_commit: options.config_commit,
     };
     let roots = scan_roots(options);
     let match_base = match_base(options, &roots)?;
@@ -110,9 +114,12 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
     };
     let mut result = ScanResult::default();
     if options.changed.is_some_and(config_changed) {
-        result
-            .notes
-            .push(".pickcheck.json changed in this diff".to_owned());
+        result.notes.push(match options.config_commit {
+            Some(commit) => {
+                format!(".pickcheck.json changed in this diff; the config comes from {commit}")
+            }
+            None => ".pickcheck.json changed in this diff".to_owned(),
+        });
     }
     for file in files {
         scan_file(&file, &match_base, options, &mut result)?;
@@ -134,7 +141,7 @@ fn scan_roots(options: &ScanOptions<'_>) -> Vec<PathBuf> {
         options
             .paths
             .iter()
-            .map(|path| absolute(options.cwd, path))
+            .map(|path| resolve_path(options.cwd, path))
             .collect()
     }
 }
@@ -179,7 +186,8 @@ fn nearest_project_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn config_changed(changed: &ChangedFiles) -> bool {
+/// Whether the diff adds, edits, deletes, or renames a `.pickcheck.json`.
+pub fn config_changed(changed: &ChangedFiles) -> bool {
     !changed.fallback
         && changed
             .touched
@@ -269,7 +277,7 @@ fn scan_file(
 ) -> Result<()> {
     let display = relative(options.cwd, &file.path);
     let matched_path = relative(match_base, &file.path);
-    let config = load_config(&file.path, options.explicit_config)?.config;
+    let config = file_config(&file.path, options)?;
     if Config::matcher(&config.ignore)?.is_match(&matched_path) {
         return Ok(());
     }
@@ -328,6 +336,14 @@ fn scan_file(
         compare_with_base(changed, &context, &functions, &units_of, result)?;
     }
     Ok(())
+}
+
+fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {
+    let resolution = match (options.config_commit, options.changed) {
+        (Some(commit), Some(changed)) => load_config_at(path, &changed.repo_root, commit)?,
+        _ => load_config(path, options.explicit_config)?,
+    };
+    Ok(resolution.config)
 }
 
 /// Adds baseline fields to this file's violations, the last `units_of.len()`
@@ -449,7 +465,7 @@ fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &m
 /// part are followed before `..` applies. A file keeps its own last
 /// component, the name Git lists and the one that selects the grammar. A path
 /// whose directory does not exist is normalized lexically.
-fn absolute(cwd: &Path, path: &Path) -> PathBuf {
+pub fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     let path = cwd.join(path);
     if path.is_dir() {
         return physical(&path);
@@ -532,7 +548,7 @@ mod tests {
             ("gone/../a.js", "/no-such-root/work/a.js"),
             ("./gone/./b.js", "/no-such-root/work/gone/b.js"),
         ] {
-            assert_eq!(absolute(cwd, Path::new(given)), Path::new(expected));
+            assert_eq!(resolve_path(cwd, Path::new(given)), Path::new(expected));
         }
         // `..` stops at the root, and stays when there is nothing to leave.
         for (given, expected) in [("/a/../../c.js", "/c.js"), ("../../d.js", "../../d.js")] {

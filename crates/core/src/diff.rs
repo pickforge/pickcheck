@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -43,6 +44,19 @@ pub struct ChangedFiles {
     pub base: Option<String>,
     pub fallback: bool,
 }
+
+/// A base ref that names no commit or has no merge base with `HEAD`, as
+/// opposed to a Git failure. Hooks fall back to the `HEAD` diff on it.
+#[derive(Debug)]
+pub struct UnusableBase(String);
+
+impl fmt::Display for UnusableBase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnusableBase {}
 
 /// A file's content at the merge base.
 #[derive(Debug, PartialEq, Eq)]
@@ -242,10 +256,10 @@ fn slash_path(path: &Path) -> String {
 fn merge_base(repo_root: &Path, base: &str) -> Result<String> {
     // A leading dash would reach Git as an option instead of a revision.
     if base.is_empty() {
-        bail!("--base needs a Git ref");
+        bail!(UnusableBase("--base needs a Git ref".to_owned()));
     }
     if base.starts_with('-') {
-        bail!("--base {base} is not a Git ref");
+        bail!(UnusableBase(format!("--base {base} is not a Git ref")));
     }
     let commit = git_line(
         repo_root,
@@ -256,9 +270,21 @@ fn merge_base(repo_root: &Path, base: &str) -> Result<String> {
             &format!("{base}^{{commit}}"),
         ],
     )?
-    .with_context(|| format!("--base {base} does not name a commit"))?;
-    git_line(repo_root, &["merge-base", &commit, "HEAD"])?
-        .with_context(|| format!("--base {base} has no merge base with HEAD; fetch more history"))
+    .ok_or_else(|| UnusableBase(format!("--base {base} does not name a commit")))?;
+    let base = git_line(repo_root, &["merge-base", &commit, "HEAD"])?.ok_or_else(|| {
+        UnusableBase(format!(
+            "--base {base} has no merge base with HEAD; fetch more history"
+        ))
+    })?;
+    Ok(base)
+}
+
+/// The full name of the `HEAD` commit, or `None` without one.
+pub fn head_commit(repo_root: &Path) -> Result<Option<String>> {
+    git_line(
+        repo_root,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
 }
 
 /// Trimmed stdout of a Git command, or `None` when Git exits nonzero.

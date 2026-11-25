@@ -9,11 +9,13 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-use crate::Metric;
+use crate::{BaseBlob, Metric, Status, base_blob};
 
 const DEFAULTS: &str = include_str!("../../../config.default.json");
 const LIMIT: &str = "a non-negative integer or null";
 const LIST: &str = "a list of strings";
+const STATUSES: &str = "a non-empty list of new, worsened, unmatched, improved, or unchanged";
+const REPO_CONFIG: &str = ".pickcheck.json";
 
 /// A `None` limit is `null` in config: the metric is measured but never fails.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -65,6 +67,8 @@ pub struct TestsConfig {
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
     pub max_blocks: usize,
+    /// The baseline statuses that block a hook in a session.
+    pub fail_on: Vec<Status>,
 }
 
 /// The outer `Option` is whether the key is present; the inner one is the
@@ -162,12 +166,7 @@ pub struct ConfigResolution {
 }
 
 pub fn load_config(start: &Path, explicit: Option<&Path>) -> Result<ConfigResolution> {
-    let mut value: Value = serde_json::from_str(DEFAULTS).context("invalid embedded defaults")?;
-    let mut chain = vec![PathBuf::from("<built-in>")];
-    if let Some(user) = user_config_path().filter(|path| path.is_file()) {
-        merge_file(&mut value, &user)?;
-        chain.push(user);
-    }
+    let (mut value, mut chain) = user_layers()?;
     let repo = explicit
         .map(Path::to_path_buf)
         .or_else(|| nearest_repo_config(start));
@@ -175,9 +174,73 @@ pub fn load_config(start: &Path, explicit: Option<&Path>) -> Result<ConfigResolu
         merge_file(&mut value, &path)?;
         chain.push(path);
     }
+    resolve(value, chain)
+}
+
+/// Like `load_config`, but the repository layer comes from `commit`: the
+/// nearest `.pickcheck.json` in that commit's tree from `start` up to the
+/// repository root, then the working tree above the root. A `start` outside
+/// the repository resolves as `load_config` does.
+pub fn load_config_at(start: &Path, repo_root: &Path, commit: &str) -> Result<ConfigResolution> {
+    if !start.starts_with(repo_root) {
+        return load_config(start, None);
+    }
+    let (mut value, mut chain) = user_layers()?;
+    if let Some((label, text)) = committed_repo_config(start, repo_root, commit)? {
+        merge_text(&mut value, &text, &label)?;
+        chain.push(label);
+    } else if let Some(path) = repo_root.parent().and_then(nearest_repo_config) {
+        merge_file(&mut value, &path)?;
+        chain.push(path);
+    }
+    resolve(value, chain)
+}
+
+/// The built-in defaults merged with the user config.
+fn user_layers() -> Result<(Value, Vec<PathBuf>)> {
+    let mut value: Value = serde_json::from_str(DEFAULTS).context("invalid embedded defaults")?;
+    let mut chain = vec![PathBuf::from("<built-in>")];
+    if let Some(user) = user_config_path().filter(|path| path.is_file()) {
+        merge_file(&mut value, &user)?;
+        chain.push(user);
+    }
+    Ok((value, chain))
+}
+
+fn resolve(value: Value, chain: Vec<PathBuf>) -> Result<ConfigResolution> {
     let mut config: Config = serde_json::from_value(value).context("invalid configuration")?;
     config.hook.max_blocks = config.hook.max_blocks.max(1);
     Ok(ConfigResolution { config, chain })
+}
+
+/// The nearest repository config at `commit`, labelled `<commit>:<path>`.
+fn committed_repo_config(
+    start: &Path,
+    repo_root: &Path,
+    commit: &str,
+) -> Result<Option<(PathBuf, String)>> {
+    let start = if start.is_file() {
+        start.parent().unwrap_or(start)
+    } else {
+        start
+    };
+    for directory in start.ancestors() {
+        let Ok(relative) = directory.strip_prefix(repo_root) else {
+            break;
+        };
+        let path = relative.join(REPO_CONFIG);
+        let label = PathBuf::from(format!("{commit}:{}", path.display()));
+        match base_blob(repo_root, commit, &path) {
+            BaseBlob::Missing => {}
+            BaseBlob::Unreadable => bail!("cannot read config {}", label.display()),
+            BaseBlob::Content(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .with_context(|| format!("invalid JSON in {}", label.display()))?;
+                return Ok(Some((label, text)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -195,14 +258,18 @@ fn nearest_repo_config(start: &Path) -> Option<PathBuf> {
     };
     start
         .ancestors()
-        .map(|dir| dir.join(".pickcheck.json"))
+        .map(|dir| dir.join(REPO_CONFIG))
         .find(|path| path.is_file())
 }
 
 fn merge_file(base: &mut Value, path: &Path) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
-    let patch: Value = serde_json::from_str(&text)
+    merge_text(base, &text, path)
+}
+
+fn merge_text(base: &mut Value, text: &str, path: &Path) -> Result<()> {
+    let patch: Value = serde_json::from_str(text)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
     validate_keys(&patch, path)?;
     shallow_merge(base, patch);
@@ -238,8 +305,8 @@ fn validate_keys(value: &Value, path: &Path) -> Result<()> {
     let tests = nested_keys(object, "", "tests", &["patterns", "exempt"], path)?;
     section_values::<Vec<String>>(tests, "tests", LIST, path)?;
     validate_test_exempt(object, path)?;
-    let hook = nested_keys(object, "", "hook", &["max_blocks"], path)?;
-    section_values::<usize>(hook, "hook", "a non-negative integer", path)?;
+    let hook = nested_keys(object, "", "hook", &["max_blocks", "fail_on"], path)?;
+    validate_hook(hook, path)?;
     if let Some(ignore) = object.get("ignore") {
         value_type::<Vec<String>>(ignore, "ignore", LIST, path)?;
     }
@@ -290,6 +357,21 @@ fn value_type<T: DeserializeOwned>(
 ) -> Result<()> {
     if T::deserialize(value).is_err() {
         bail!("`{key}` in {} must be {expected}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_hook(hook: Option<&Map<String, Value>>, path: &Path) -> Result<()> {
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    if let Some(value) = hook.get("max_blocks") {
+        value_type::<usize>(value, "hook.max_blocks", "a non-negative integer", path)?;
+    }
+    if let Some(value) = hook.get("fail_on")
+        && !Vec::<Status>::deserialize(value).is_ok_and(|statuses| !statuses.is_empty())
+    {
+        bail!("`hook.fail_on` in {} must be {STATUSES}", path.display());
     }
     Ok(())
 }
@@ -624,6 +706,41 @@ mod tests {
     }
 
     #[test]
+    fn hook_fail_on_defaults_to_new_worsened_and_unmatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"hook":{"fail_on":["unchanged","new"]}}"#).unwrap();
+        let config = load_config(dir.path(), Some(&path)).unwrap().config;
+        assert_eq!(config.hook.fail_on, [Status::Unchanged, Status::New]);
+        assert_eq!(config.hook.max_blocks, 3);
+        fs::write(&path, "{}").unwrap();
+        let defaults = load_config(dir.path(), Some(&path)).unwrap().config;
+        assert_eq!(
+            defaults.hook.fail_on,
+            [Status::New, Status::Worsened, Status::Unmatched]
+        );
+    }
+
+    #[test]
+    fn bad_hook_fail_on_names_key_and_config_path() {
+        for json in [
+            r#"{"hook":{"fail_on":["new","fixed"]}}"#,
+            r#"{"hook":{"fail_on":"new"}}"#,
+            r#"{"hook":{"fail_on":[]}}"#,
+        ] {
+            let (error, path) = config_error(json);
+            assert_eq!(
+                error,
+                format!(
+                    "`hook.fail_on` in {} must be a non-empty list of new, worsened, unmatched, improved, or unchanged",
+                    path.display()
+                ),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
     fn string_ignore_is_rejected_as_non_list() {
         let (error, path) = config_error(r#"{"ignore":"dist/**"}"#);
         assert_eq!(
@@ -693,6 +810,54 @@ mod tests {
         assert_eq!(
             error,
             format!("unknown config key `languages.cobol` in {}", path.display())
+        );
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn repo_config_at_a_commit_ignores_working_tree_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::physical(dir.path());
+        let package = root.join("pkg");
+        fs::create_dir(&package).unwrap();
+        fs::write(root.join(REPO_CONFIG), r#"{"limits":{"depth":2}}"#).unwrap();
+        fs::write(package.join(REPO_CONFIG), r#"{"limits":{"params":1}}"#).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "initial"]);
+        let commit = git(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join(REPO_CONFIG), r#"{"limits":{"depth":null}}"#).unwrap();
+        fs::remove_file(package.join(REPO_CONFIG)).unwrap();
+
+        let top = load_config_at(&root, &root, &commit).unwrap();
+        assert_eq!(top.config.limits.depth, Some(2));
+        assert_eq!(
+            top.chain.last().unwrap(),
+            &PathBuf::from(format!("{commit}:{REPO_CONFIG}"))
+        );
+        let nested = load_config_at(&package.join("a.js"), &root, &commit).unwrap();
+        assert_eq!(nested.config.limits.params, Some(1));
+        assert_eq!(nested.config.limits.depth, Some(4));
+        assert_eq!(load_config(&root, None).unwrap().config.limits.depth, None);
+
+        fs::write(root.join(REPO_CONFIG), "{").unwrap();
+        git(&root, &["commit", "-qam", "broken"]);
+        let broken = git(&root, &["rev-parse", "HEAD"]);
+        let error = load_config_at(&root, &root, &broken).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("invalid JSON in {broken}:{REPO_CONFIG}")
         );
     }
 
