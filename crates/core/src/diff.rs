@@ -102,10 +102,10 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
 /// textconv or filters. Only an entry that `ls-tree` does not list is
 /// missing; every Git failure makes the base unreadable.
 pub fn base_blob(repo_root: &Path, commit: &str, path: &Path) -> BaseBlob {
-    let path = path.to_string_lossy();
+    let path = slash_path(path);
     let listing = match git_command(repo_root)
         .env("GIT_LITERAL_PATHSPECS", "1")
-        .args(["ls-tree", "-z", commit, "--", path.as_ref()])
+        .args(["ls-tree", "-z", commit, "--", path.as_str()])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,
@@ -173,9 +173,9 @@ fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>)
     let mut touched = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        let path = PathBuf::from(path);
+        let path = git_path(path);
         if matches!(status.chars().next(), Some('R' | 'C'))
-            && let Some(new) = fields.next().map(PathBuf::from)
+            && let Some(new) = fields.next().map(git_path)
         {
             if status.starts_with('R') {
                 renames.insert(new.clone(), path.clone());
@@ -196,7 +196,33 @@ pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
-    Ok(Some(PathBuf::from(root.trim())))
+    Ok(Some(spelled_like(cwd, PathBuf::from(root.trim()))))
+}
+
+/// Git prints the canonical root. This returns the ancestor of `cwd` that is
+/// the same directory, so paths keep the spelling `cwd` uses, such as a
+/// symlink (`/var` on macOS) or a Windows short name.
+fn spelled_like(cwd: &Path, root: PathBuf) -> PathBuf {
+    let Ok(canonical) = root.canonicalize() else {
+        return root;
+    };
+    cwd.ancestors()
+        .filter(|ancestor| ancestor.is_absolute())
+        .find(|ancestor| ancestor.canonicalize().is_ok_and(|path| path == canonical))
+        .map_or(root, Path::to_path_buf)
+}
+
+/// A path Git printed, which always uses `/`, with native separators.
+fn git_path(path: &str) -> PathBuf {
+    path.split('/').collect()
+}
+
+/// A relative path in the `/` form Git expects.
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn merge_base(repo_root: &Path, base: &str) -> Result<String> {
@@ -270,7 +296,7 @@ fn untracked(cwd: &Path) -> Result<Vec<PathBuf>> {
         .stdout
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .map(|part| PathBuf::from(String::from_utf8_lossy(part).as_ref()))
+        .map(|part| git_path(&String::from_utf8_lossy(part)))
         .collect())
 }
 
@@ -305,7 +331,7 @@ fn diff_path(value: &str) -> Option<PathBuf> {
     }
     let value = value.split('\t').next().unwrap_or(value);
     let path = value.strip_prefix("b/")?;
-    Some(PathBuf::from(path))
+    Some(git_path(path))
 }
 
 fn post_image_range(header: &str) -> Option<LineRange> {
