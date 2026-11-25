@@ -426,7 +426,10 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 ### Svelte
 
 - `<script>` and `<script context="module">` / `<script module>` blocks are
-  parsed with the TypeScript grammar (`lang="ts"`) or JavaScript grammar. Functions
+  the `script_element` nodes of the Svelte syntax tree, so a `<script>` inside
+  an HTML comment is not measured. The `raw_text` child of each element is
+  parsed with the TypeScript grammar when its start tag has a `lang` attribute
+  of `ts` or `typescript`, otherwise with the JavaScript grammar. Functions
   inside are reported normally with their real line numbers in the `.svelte` file.
 - The template is split into synthetic units, so a report points at a block
   rather than at line 1 and scales with the block, not the file:
@@ -444,6 +447,13 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 - Every unit starts at complexity 1. Decision points are `{#if}`,
   `{:else if}`, `{#each}`, `{#await}`, `{:catch}`, and the boolean / ternary
   operators inside `{…}` expressions, counted in the unit that contains them.
+  Expressions are the scored `svelte_raw_text` nodes listed under Cognitive
+  complexity, wrapped and parsed with the component's script grammar in the
+  same way. Each `ternary_expression` and each short-circuit operator node
+  (`&&`, `||`, `??`, `&&=`, `||=`, `??=`) adds 1, including inside a function
+  in the expression; `bool_ops` takes its chains from the same tree. Nodes
+  inside an `ERROR` subtree add nothing, and operator characters inside a
+  string, a regular expression, or a comment are not operator nodes.
   Depth follows `{#if}`/`{#each}`/`{#await}` nesting within a unit, so a block
   unit has depth at least 1; snippets and `{#key}` add no depth. Template
   units are exempt from `lines` and `params`.
@@ -462,7 +472,8 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
   count; `?.` does not; cascade `..` does not.
 - Svelte: `tree-sitter-svelte-ng` 1.0.2 is compatible. It exposes template
   expression contents as `svelte_raw_text`, so block structure comes from the
-  grammar and boolean/ternary classification scans only those expression nodes.
+  grammar, and boolean/ternary classification parses only those expression
+  nodes with the script grammar and classifies the resulting node kinds.
 - JS/TS: matches ESLint `complexity` rule semantics (including `??` and logical
   assignment); `max-depth` semantics for depth; `max-lines-per-function` with
   `skipBlankLines` + `skipComments` for lines.
@@ -573,7 +584,10 @@ DETAILS pickcheck check --changed --verbose <file>
 - `UNVERIFIED` is emitted for a file that is explicitly named on the command
   line, or that has a known source-code extension with no grammar (`.kt .java
   .c .cc .cpp .h .hpp .cs .swift .rb .php .scala .lua .zig .m .mm .ex .exs .hs
-  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8. Non-source files
+  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or whose syntax
+  tree is deeper than 3,000 levels (`syntax nesting too deep to measure`; this
+  covers each `<script>` block and template expression of a Svelte file, and a
+  base file that deep has no readable base). Non-source files
   found while walking a directory (`.md`, `.json`, `.toml`, images, …) are
   skipped silently. A file that cannot be read never aborts the scan.
 

@@ -249,3 +249,12 @@ function ternaryBreak(a: boolean, b: boolean, c: boolean, d: boolean, e: boolean
 {/await}
 
 <style>.x { color: red; }</style>
+
+<!-- negative: a script inside a comment is not measured
+<script>function hidden(a, b, c, d, e, f, g) { return a && b ? c : d; }</script>
+-->
+
+<!-- negative: a regex literal and a string add no decisions -->
+{#if /a?b?c||d/.test(x)} <!-- +1 if; the regex adds nothing -->
+  <p>{"a && b ? c : d ?? e" + label}</p> <!-- operators in a string add nothing -->
+{/if}

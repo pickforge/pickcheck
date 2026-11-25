@@ -26,6 +26,18 @@
   An explicit path now follows directory links before `..` applies. (#50)
 - On Windows, `--changed` and `--base` reports now use `\` in every path
   instead of mixing it with the `/` that Git prints. (#50)
+- Svelte `<script>` blocks and their `lang` now come from the Svelte syntax
+  tree, so a `<script>` inside an HTML comment is no longer measured. Template
+  `complexity` and `bool_ops` now count operator nodes in the parsed
+  expression, with the component's script grammar, so a `?` or `||` inside a
+  regular expression, string, or comment no longer adds a decision. (#49)
+- A file whose syntax tree is deeper than 3,000 levels, such as a generated
+  20,000-term expression, is now reported `UNVERIFIED <file>  syntax nesting
+  too deep to measure` and the scan continues, instead of aborting the process
+  with a stack overflow in `check` and in every hook. (#49)
+- `lines` now indexes each file's lines and comments once instead of
+  rescanning the file for every function, so a 100,000-line file with 20,000
+  functions is measured in about a second instead of tens of seconds. (#49)
 
 ## Validation
 

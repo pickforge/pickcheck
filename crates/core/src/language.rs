@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -292,6 +292,88 @@ fn ignored_kind_name(kind: &str) -> bool {
         .any(|part| kind.contains(part))
 }
 
+/// The deepest syntax-tree level `parse_source` measures. Every walk over a
+/// tree recurses once per level, so this bound, together with
+/// `on_measurement_stack`, keeps any input from overflowing the stack. Ordinary
+/// code stays far below it: a 1,000-term `a + b + …` chain is about 1,000 deep.
+pub const MAX_SYNTAX_DEPTH: usize = 3_000;
+
+/// Stack for `on_measurement_stack`. On an unoptimized build, the deepest tree
+/// allowed needed at most 6.4 MiB (nested Svelte elements) and about 3 MiB for
+/// the other languages, so 64 MiB leaves a tenfold margin. Only the pages
+/// actually used are committed.
+const MEASUREMENT_STACK: usize = 64 << 20;
+
+/// `parse_source` fails with this error when a parsed tree is deeper than
+/// `MAX_SYNTAX_DEPTH`. Callers report the file as unverified.
+#[derive(Debug)]
+pub struct TooDeep;
+
+impl fmt::Display for TooDeep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("syntax nesting too deep to measure")
+    }
+}
+
+impl std::error::Error for TooDeep {}
+
+/// Runs `task` on a thread with a stack sized for `MAX_SYNTAX_DEPTH`, so
+/// measuring never depends on the caller's stack. Run a whole scan inside one
+/// call, not one call per file.
+///
+/// # Errors
+///
+/// Fails when the thread cannot be started.
+pub fn on_measurement_stack<T: Send>(task: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("pickcheck-measure".to_owned())
+            .stack_size(MEASUREMENT_STACK)
+            .spawn_scoped(scope, task)?;
+        Ok(handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    })
+}
+
+/// Parses `source` and rejects a tree deeper than `MAX_SYNTAX_DEPTH` with
+/// `TooDeep`, before any recursive walk can see it.
+fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(grammar)
+        .context("incompatible tree-sitter grammar")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parser returned no tree")?;
+    if exceeds_depth_limit(&tree) {
+        return Err(TooDeep.into());
+    }
+    Ok(tree)
+}
+
+/// Whether any node lies deeper than `MAX_SYNTAX_DEPTH`, found with a cursor
+/// so the check itself never recurses.
+pub(crate) fn exceeds_depth_limit(tree: &Tree) -> bool {
+    let mut cursor = tree.walk();
+    let mut depth = 0;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            if depth > MAX_SYNTAX_DEPTH {
+                return true;
+            }
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+}
+
 pub fn parse_source(language: Language, source: &str) -> Result<Vec<FunctionMetrics>> {
     if language == Language::Svelte {
         return parse_svelte(source);
@@ -304,15 +386,17 @@ fn parse_with_offset(
     source: &str,
     offset: Offset,
 ) -> Result<Vec<FunctionMetrics>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language.grammar())
-        .context("incompatible tree-sitter grammar")?;
-    let tree = parser
-        .parse(source, None)
-        .context("tree-sitter parser returned no tree")?;
+    let tree = parse_tree(&language.grammar(), source)?;
+    let lines = LineIndex::new(source, tree.root_node());
     let mut functions = Vec::new();
-    collect_functions(tree.root_node(), language, source, offset, &mut functions);
+    collect_functions(
+        tree.root_node(),
+        language,
+        source,
+        offset,
+        &lines,
+        &mut functions,
+    );
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
 }
@@ -322,14 +406,15 @@ fn collect_functions(
     language: Language,
     source: &str,
     offset: Offset,
+    lines: &LineIndex,
     output: &mut Vec<FunctionMetrics>,
 ) {
     if is_function(language, node.kind()) {
-        output.push(measure_function(node, language, source, offset));
+        output.push(measure_function(node, language, source, offset, lines));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_functions(child, language, source, offset, output);
+        collect_functions(child, language, source, offset, lines, output);
     }
 }
 
@@ -338,6 +423,7 @@ fn measure_function(
     language: Language,
     source: &str,
     offset: Offset,
+    lines: &LineIndex,
 ) -> FunctionMetrics {
     let mut score = Score {
         complexity: 1,
@@ -356,7 +442,7 @@ fn measure_function(
         complexity: score.complexity,
         cognitive: cognitive::measure_function(node, language, source),
         depth: score.depth,
-        lines: significant_lines(source, start, end, node),
+        lines: lines.significant_lines(source, start, end, node),
         params: parameter_count(node, language, source),
         bool_ops: score.bool_ops,
         widget_depth: widget_depth.unwrap_or(0),
@@ -1050,20 +1136,45 @@ fn receiver_parameter(node: Node<'_>, source: &str) -> bool {
         || text.starts_with("this:")
 }
 
-fn significant_lines(source: &str, start: usize, end: usize, node: Node<'_>) -> usize {
-    let mut comments = Vec::new();
-    collect_comments(node, &mut comments);
-    let mut offset = 0;
-    source
-        .split_inclusive('\n')
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line_start = offset;
-            offset += line.len();
-            (index + 1 >= start && index < end).then_some((line_start, line))
-        })
-        .filter(|(line_start, line)| line_has_code(*line_start, line, &comments))
-        .count()
+/// Line starts and comment ranges of one parsed source, built once so that
+/// `lines` costs each function only its own lines instead of a rescan of the
+/// whole source.
+struct LineIndex {
+    /// Byte offset of each line's first byte.
+    starts: Vec<usize>,
+    /// Every comment node, in source order and never overlapping.
+    comments: Vec<(usize, usize)>,
+}
+
+impl LineIndex {
+    fn new(source: &str, root: Node<'_>) -> Self {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+            .filter(|start| *start < source.len())
+            .collect();
+        let mut comments = Vec::new();
+        collect_comments(root, &mut comments);
+        Self { starts, comments }
+    }
+
+    /// Lines `start..=end` (1-based) of `node` that hold a non-whitespace byte
+    /// outside the comments inside `node`.
+    fn significant_lines(&self, source: &str, start: usize, end: usize, node: Node<'_>) -> usize {
+        let first = self
+            .comments
+            .partition_point(|(comment, _)| *comment < node.start_byte());
+        let last = self
+            .comments
+            .partition_point(|(_, comment)| *comment <= node.end_byte());
+        let comments = &self.comments[first..last.max(first)];
+        (start..=end.min(self.starts.len()))
+            .filter(|line| {
+                let line_start = self.starts[line - 1];
+                let line_end = self.starts.get(*line).copied().unwrap_or(source.len());
+                line_has_code(line_start, &source[line_start..line_end], comments)
+            })
+            .count()
+    }
 }
 
 fn collect_comments(node: Node<'_>, comments: &mut Vec<(usize, usize)>) {
@@ -1077,10 +1188,15 @@ fn collect_comments(node: Node<'_>, comments: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// `comments` is sorted, so only the ones that reach this line are checked.
 fn line_has_code(line_start: usize, line: &str, comments: &[(usize, usize)]) -> bool {
+    let first = comments.partition_point(|(_, end)| *end <= line_start);
+    let line_end = line_start + line.len();
+    let nearby = &comments[first..];
+    let nearby = &nearby[..nearby.partition_point(|(start, _)| *start < line_end)];
     line.bytes().enumerate().any(|(index, byte)| {
         !byte.is_ascii_whitespace()
-            && !comments
+            && !nearby
                 .iter()
                 .any(|(start, end)| *start <= line_start + index && line_start + index < *end)
     })
@@ -1091,82 +1207,88 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
-    let tree = parse_svelte_tree(source)?;
-    let blocks = svelte_blocks(source);
+    let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
+    let mut scripts = Vec::new();
+    collect_scripts(tree.root_node(), source, &mut scripts);
     let mut functions = Vec::new();
-    let mut template_language = Language::JavaScript;
-    for block in blocks.iter().filter(|block| block.kind == "script") {
-        let language =
-            if block.opening.contains("lang=\"ts\"") || block.opening.contains("lang='ts'") {
-                template_language = Language::TypeScript;
-                Language::TypeScript
-            } else {
-                Language::JavaScript
-            };
+    for (language, content) in &scripts {
         functions.extend(parse_with_offset(
-            language,
-            block.content,
+            *language,
+            node_text(*content, source),
             Offset {
-                line: block.start_line,
-                byte: block.start_byte,
+                line: content.start_position().row,
+                byte: content.start_byte(),
             },
         )?);
     }
+    let template_language = if scripts
+        .iter()
+        .any(|(language, _)| *language == Language::TypeScript)
+    {
+        Language::TypeScript
+    } else {
+        Language::JavaScript
+    };
     functions.extend(measure_template(
         tree.root_node(),
         source,
         template_language,
-    ));
+    )?);
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
 }
 
-fn parse_svelte_tree(source: &str) -> Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
-        .context("incompatible Svelte grammar")?;
-    parser
-        .parse(source, None)
-        .context("Svelte parser returned no tree")
-}
-
-struct SvelteBlock<'a> {
-    kind: &'static str,
-    opening: &'a str,
-    content: &'a str,
-    start_line: usize,
-    start_byte: usize,
-}
-
-fn svelte_blocks(source: &str) -> Vec<SvelteBlock<'_>> {
-    let mut blocks = Vec::new();
-    for kind in ["script", "style"] {
-        let mut cursor = 0;
-        while let Some(relative) = source[cursor..].find(&format!("<{kind}")) {
-            let start = cursor + relative;
-            let Some(open_end_rel) = source[start..].find('>') else {
-                break;
-            };
-            let open_end = start + open_end_rel + 1;
-            let Some(close_rel) = source[open_end..].find(&format!("</{kind}>")) else {
-                break;
-            };
-            let end = open_end + close_rel;
-            blocks.push(SvelteBlock {
-                kind,
-                opening: &source[start..open_end],
-                content: &source[open_end..end],
-                start_line: source[..open_end]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count(),
-                start_byte: open_end,
-            });
-            cursor = end + kind.len() + 3;
+/// Every `script_element` with its grammar and its `raw_text` content. A
+/// `<script>` inside an HTML comment is part of a `comment` node, not an
+/// element, so it is never collected.
+fn collect_scripts<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    output: &mut Vec<(Language, Node<'tree>)>,
+) {
+    if node.kind() == "script_element" {
+        if let Some(content) = child_of_kind(node, "raw_text") {
+            output.push((script_language(node, source), content));
         }
+        return;
     }
-    blocks
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_scripts(child, source, output);
+    }
+}
+
+fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// TypeScript when the start tag has `lang="ts"` or `lang="typescript"`,
+/// quoted or not.
+fn script_language(element: Node<'_>, source: &str) -> Language {
+    let Some(tag) = child_of_kind(element, "start_tag") else {
+        return Language::JavaScript;
+    };
+    let mut cursor = tag.walk();
+    let typescript = tag
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "attribute")
+        .any(|attribute| {
+            let name = child_of_kind(attribute, "attribute_name")
+                .is_some_and(|name| node_text(name, source).eq_ignore_ascii_case("lang"));
+            let value = child_of_kind(attribute, "attribute_value").or_else(|| {
+                child_of_kind(attribute, "quoted_attribute_value")
+                    .and_then(|quoted| child_of_kind(quoted, "attribute_value"))
+            });
+            name && value
+                .is_some_and(|value| matches!(node_text(value, source), "ts" | "typescript"))
+        });
+    if typescript {
+        Language::TypeScript
+    } else {
+        Language::JavaScript
+    }
 }
 
 const TEMPLATE_BLOCKS: [&str; 3] = ["if_statement", "each_statement", "await_statement"];
@@ -1178,7 +1300,11 @@ struct TemplateUnits {
     list: Vec<FunctionMetrics>,
 }
 
-fn measure_template(root: Node<'_>, source: &str, script: Language) -> Vec<FunctionMetrics> {
+fn measure_template(
+    root: Node<'_>,
+    source: &str,
+    script: Language,
+) -> Result<Vec<FunctionMetrics>> {
     let mut units = TemplateUnits {
         script,
         list: Vec::new(),
@@ -1188,13 +1314,13 @@ fn measure_template(root: Node<'_>, source: &str, script: Language) -> Vec<Funct
         depth: 0,
         bool_ops: 0,
     };
-    score_svelte_node(root, source, 0, true, &mut score, &mut units);
+    score_svelte_node(root, source, 0, true, &mut score, &mut units)?;
     let mut unit = template_metrics("<template>".to_owned(), root, &score);
     unit.line = 1;
     unit.end_line = source.lines().count().max(1);
     unit.cognitive = cognitive::measure_template_unit(root, source, script, true);
     units.list.push(unit);
-    units.list
+    Ok(units.list)
 }
 
 fn measure_svelte_node(
@@ -1204,35 +1330,36 @@ fn measure_svelte_node(
     root: bool,
     score: &mut Score,
     units: &mut TemplateUnits,
-) {
+) -> Result<()> {
     match node.kind() {
         "script_element" | "style_element" => {}
         "snippet_statement" => {
-            let unit = measure_template_unit(node, source, units);
+            let unit = measure_template_unit(node, source, units)?;
             units.list.push(unit);
         }
         kind if root && TEMPLATE_BLOCKS.contains(&kind) => {
-            let unit = measure_template_unit(node, source, units);
+            let unit = measure_template_unit(node, source, units)?;
             units.list.push(unit);
         }
-        _ => score_svelte_node(node, source, depth, root, score, units),
+        _ => score_svelte_node(node, source, depth, root, score, units)?,
     }
+    Ok(())
 }
 
 fn measure_template_unit(
     node: Node<'_>,
     source: &str,
     units: &mut TemplateUnits,
-) -> FunctionMetrics {
+) -> Result<FunctionMetrics> {
     let mut score = Score {
         complexity: 1,
         depth: 0,
         bool_ops: 0,
     };
-    score_svelte_node(node, source, 0, false, &mut score, units);
+    score_svelte_node(node, source, 0, false, &mut score, units)?;
     let mut unit = template_metrics(template_unit_name(node, source), node, &score);
     unit.cognitive = cognitive::measure_template_unit(node, source, units.script, false);
-    unit
+    Ok(unit)
 }
 
 fn template_unit_name(node: Node<'_>, source: &str) -> String {
@@ -1280,182 +1407,177 @@ fn score_svelte_node(
     root: bool,
     score: &mut Score,
     units: &mut TemplateUnits,
-) {
+) -> Result<()> {
     if matches!(
         node.kind(),
         "if_start" | "else_if_start" | "each_start" | "await_start" | "catch_start"
     ) {
         score.complexity += 1;
     }
-    if node.kind() == "svelte_raw_text" {
-        let expression = node_text(node, source);
-        score.complexity += expression_decisions(expression);
-        score.bool_ops = score.bool_ops.max(expression_bool_ops(expression));
+    if node.kind() == "svelte_raw_text" && cognitive::scored_raw_text(node) {
+        let expression = score_expression(node_text(node, source), units.script)?;
+        score.complexity += expression.complexity;
+        score.bool_ops = score.bool_ops.max(expression.bool_ops);
     }
     let next_depth = depth + usize::from(TEMPLATE_BLOCKS.contains(&node.kind()));
     score.depth = score.depth.max(next_depth);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        measure_svelte_node(child, source, next_depth, root, score, units);
+        measure_svelte_node(child, source, next_depth, root, score, units)?;
+    }
+    Ok(())
+}
+
+/// Decisions (`complexity` without its base 1) and the widest boolean chain in
+/// one template expression, parsed with the component's script grammar inside
+/// the wrapper `cognitive` also uses. Functions in the expression count
+/// inline; nodes inside an `ERROR` subtree add nothing. An expression deeper
+/// than `MAX_SYNTAX_DEPTH` makes the whole file `TooDeep`.
+fn score_expression(text: &str, script: Language) -> Result<Score> {
+    let mut score = Score {
+        complexity: 0,
+        depth: 0,
+        bool_ops: 0,
+    };
+    let wrapped = format!("function expression() {{ return ({text}); }}");
+    let tree = parse_tree(&script.grammar(), &wrapped)?;
+    if let Some(function) = cognitive::first_function(tree.root_node(), script) {
+        let body = function.child_by_field_name("body").unwrap_or(function);
+        score_expression_node(body, &wrapped, script, &mut score);
+    }
+    Ok(score)
+}
+
+fn score_expression_node(node: Node<'_>, source: &str, script: Language, score: &mut Score) {
+    if node.is_error() {
+        return;
+    }
+    let operator = is_boolean_operator(node, script, source);
+    score.complexity += usize::from(operator || is_conditional_expression(node.kind()));
+    if is_boolean_chain_root(node, script, source) {
+        score.bool_ops =
+            score
+                .bool_ops
+                .max(template_chain_operators(node, node.id(), script, source));
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        score_expression_node(child, source, script, score);
     }
 }
 
-fn expression_bool_ops(expression: &str) -> usize {
-    let wrapped = format!("function expression() {{ return ({expression}); }}");
-    parse_with_offset(Language::JavaScript, &wrapped, Offset::default())
-        .ok()
-        .and_then(|functions| functions.first().map(|function| function.bool_ops))
-        .unwrap_or(0)
-}
-
-fn expression_decisions(line: &str) -> usize {
-    let code = mask_quoted_text(line);
-    let bytes = code.as_bytes();
-    let pairs = bytes
-        .windows(2)
-        .filter(|pair| matches!(*pair, b"&&" | b"||" | b"??"))
-        .count();
-    let ternary = bytes
-        .iter()
-        .enumerate()
-        .filter(|(index, byte)| {
-            **byte == b'?'
-                && index
-                    .checked_sub(1)
-                    .is_none_or(|before| bytes[before] != b'?')
-                && bytes
-                    .get(index + 1)
-                    .is_none_or(|after| !matches!(*after, b'?' | b'.'))
-        })
-        .count();
-    pairs + ternary
-}
-
-enum MaskContext {
-    Code(Option<usize>),
-    Quote(u8),
-    Template,
-    LineComment(Option<usize>),
-    BlockComment(Option<usize>),
-}
-
-fn mask_quoted_text(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut result = vec![b' '; bytes.len()];
-    let mut contexts = vec![MaskContext::Code(None)];
-    let mut index = 0;
-    while index < bytes.len() {
-        let Some(context) = contexts.pop() else {
-            break;
-        };
-        index += match context {
-            MaskContext::Code(depth) => {
-                mask_code_byte(bytes, index, depth, &mut contexts, &mut result)
-            }
-            MaskContext::Quote(delimiter) => {
-                mask_quote_byte(bytes[index], delimiter, &mut contexts)
-            }
-            MaskContext::Template => mask_template_byte(bytes, index, &mut contexts),
-            MaskContext::LineComment(depth) => {
-                mask_line_comment_byte(bytes[index], depth, &mut contexts)
-            }
-            MaskContext::BlockComment(depth) => {
-                mask_block_comment_byte(bytes, index, depth, &mut contexts)
-            }
-        };
-    }
-    String::from_utf8(result).unwrap_or_default()
-}
-
-fn mask_code_byte(
-    bytes: &[u8],
-    index: usize,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-    result: &mut [u8],
+/// `boolean_operators_in_chain` for a template expression, which also skips
+/// `ERROR` subtrees.
+fn template_chain_operators(
+    node: Node<'_>,
+    root_id: usize,
+    script: Language,
+    source: &str,
 ) -> usize {
-    if bytes[index..].starts_with(b"//") {
-        contexts.push(MaskContext::LineComment(depth));
-        return 2;
+    if node.is_error()
+        || node.id() != root_id
+            && (is_function(script, node.kind()) || is_conditional_expression(node.kind()))
+    {
+        return 0;
     }
-    if bytes[index..].starts_with(b"/*") {
-        contexts.push(MaskContext::BlockComment(depth));
-        return 2;
-    }
-    match bytes[index] {
-        b'\'' | b'"' => {
-            contexts.extend([MaskContext::Code(depth), MaskContext::Quote(bytes[index])]);
-        }
-        b'`' => contexts.extend([MaskContext::Code(depth), MaskContext::Template]),
-        b'{' if depth.is_some() => contexts.push(MaskContext::Code(depth.map(|value| value + 1))),
-        b'}' if depth == Some(0) => {}
-        b'}' => contexts.push(MaskContext::Code(depth.map(|value| value - 1))),
-        byte => {
-            result[index] = byte;
-            contexts.push(MaskContext::Code(depth));
-        }
-    }
-    1
-}
-
-fn mask_line_comment_byte(
-    byte: u8,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-) -> usize {
-    if byte == b'\n' {
-        contexts.push(MaskContext::Code(depth));
-    } else {
-        contexts.push(MaskContext::LineComment(depth));
-    }
-    1
-}
-
-fn mask_block_comment_byte(
-    bytes: &[u8],
-    index: usize,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-) -> usize {
-    if bytes[index..].starts_with(b"*/") {
-        contexts.push(MaskContext::Code(depth));
-        2
-    } else {
-        contexts.push(MaskContext::BlockComment(depth));
-        1
-    }
-}
-
-fn mask_quote_byte(byte: u8, delimiter: u8, contexts: &mut Vec<MaskContext>) -> usize {
-    if byte == b'\\' {
-        contexts.push(MaskContext::Quote(delimiter));
-        2
-    } else if byte == delimiter {
-        1
-    } else {
-        contexts.push(MaskContext::Quote(delimiter));
-        1
-    }
-}
-
-fn mask_template_byte(bytes: &[u8], index: usize, contexts: &mut Vec<MaskContext>) -> usize {
-    if bytes[index] == b'\\' {
-        contexts.push(MaskContext::Template);
-        2
-    } else if bytes[index] == b'`' {
-        1
-    } else if bytes[index..].starts_with(b"${") {
-        contexts.extend([MaskContext::Template, MaskContext::Code(Some(0))]);
-        2
-    } else {
-        contexts.push(MaskContext::Template);
-        1
-    }
+    let mut cursor = node.walk();
+    usize::from(is_boolean_operator(node, script, source))
+        + node
+            .named_children(&mut cursor)
+            .map(|child| template_chain_operators(child, root_id, script, source))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_depth(language: Language, source: &str) -> usize {
+        let grammar = if language == Language::Svelte {
+            tree_sitter_svelte_ng::LANGUAGE.into()
+        } else {
+            language.grammar()
+        };
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let (mut depth, mut deepest) = (0, 0);
+        loop {
+            if cursor.goto_first_child() {
+                depth += 1;
+                deepest = deepest.max(depth);
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return deepest;
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    /// Sources whose trees sit exactly at the depth limit and one level over
+    /// it, for a shape that adds one level per repetition.
+    fn at_and_over_limit(language: Language, shape: impl Fn(usize) -> String) -> [String; 2] {
+        let offset = tree_depth(language, &shape(10)) - 10;
+        let at = shape(MAX_SYNTAX_DEPTH - offset);
+        let over = shape(MAX_SYNTAX_DEPTH - offset + 1);
+        assert_eq!(tree_depth(language, &at), MAX_SYNTAX_DEPTH);
+        assert_eq!(tree_depth(language, &over), MAX_SYNTAX_DEPTH + 1);
+        [at, over]
+    }
+
+    #[test]
+    fn depth_limit_holds_on_a_one_mebibyte_caller_stack() {
+        let chain = |terms: usize| format!("function f(a) {{ return {}a; }}", "a + ".repeat(terms));
+        let ifs =
+            |levels: usize| format!("function f(a) {{ {}{} }}", "if (a) ".repeat(levels), "a;");
+        // Nested elements need the most stack per level of any shape measured.
+        let elements =
+            |levels: usize| format!("{}x{}", "<b>".repeat(levels), "</b>".repeat(levels));
+        let cases = [
+            (
+                Language::JavaScript,
+                at_and_over_limit(Language::JavaScript, chain),
+            ),
+            (
+                Language::JavaScript,
+                at_and_over_limit(Language::JavaScript, ifs),
+            ),
+            (
+                Language::Svelte,
+                at_and_over_limit(Language::Svelte, elements),
+            ),
+        ];
+        let template = format!("<p>{{{}a}}</p>", "a + ".repeat(MAX_SYNTAX_DEPTH));
+        let outcome = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                on_measurement_stack(move || {
+                    let mut results = cases
+                        .iter()
+                        .flat_map(|(language, sources)| {
+                            sources.iter().map(|source| parse_source(*language, source))
+                        })
+                        .collect::<Vec<_>>();
+                    results.push(parse_source(Language::Svelte, &template));
+                    results
+                })
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        for (pair, name) in outcome.chunks(2).zip(["f", "f", "<template>"]) {
+            let at = pair[0].as_ref().unwrap();
+            assert_eq!((at.len(), at[0].function.as_str()), (1, name));
+            assert!(pair[1].as_ref().unwrap_err().is::<TooDeep>());
+        }
+        let template = outcome[6].as_ref().unwrap_err();
+        assert_eq!(template.to_string(), "syntax nesting too deep to measure");
+    }
 
     #[test]
     fn current_grammars_have_no_unclassified_control_flow_candidates() {
@@ -1590,9 +1712,61 @@ class Screen {
     }
 
     #[test]
-    fn svelte_expression_comments_do_not_add_decisions() {
-        assert_eq!(expression_decisions("a && b /* || */"), 1);
-        assert_eq!(expression_decisions("a || b // && ??"), 1);
+    fn svelte_expressions_are_scored_from_the_syntax_tree() {
+        let template = |source: &str| {
+            let functions = parse_source(Language::Svelte, source).unwrap();
+            let unit = functions.last().unwrap();
+            assert_eq!(unit.function, "<template>");
+            (unit.complexity, unit.bool_ops)
+        };
+        assert_eq!(template("<p>{a && b /* || */}</p>"), (2, 1));
+        assert_eq!(template("<p>{a || b // && ??\n}</p>"), (2, 1));
+        assert_eq!(template("<p>{/a?b?c||d/.test(x)}</p>"), (1, 0));
+        assert_eq!(template("<p>{x?.y ?? (a ? b : c)}</p>"), (3, 1));
+        assert_eq!(template("<p>{a && b && c} {d || e}</p>"), (4, 2));
+        assert_eq!(
+            template("<button on:click={() => ok && go()}>x</button>"),
+            (2, 1)
+        );
+        // Bindings are not scored, so a default value adds nothing.
+        assert_eq!(template("{#each a as { x = b && c }}{/each}").0, 1);
+        // TypeScript reads this `?` as a conditional type, JavaScript as a
+        // ternary.
+        let conditional_type = "<p>{a as (T extends U ? X : Y)}</p>";
+        assert_eq!(template(conditional_type), (2, 0));
+        assert_eq!(
+            template(&format!("<script lang=\"ts\"></script>{conditional_type}")),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn svelte_scripts_come_from_script_elements() {
+        let source = "<!-- <script>function hidden(a) { return a; }</script> -->\n\
+            <script context=\"module\" lang='typescript'>\nfunction first(a: number) { return a; }\n</script>\n\
+            <script module>\nfunction second(a) { return a; }\n</script>\n\
+            <script lang=ts>\nfunction third(a: number) { return a; }\n</script>\n\
+            <script>\nfunction fourth(a, b) { return a; }\n</script>\n";
+        let functions = parse_source(Language::Svelte, source).unwrap();
+        let names = functions
+            .iter()
+            .map(|item| (item.function.as_str(), item.line, item.params))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("<template>", 1, 0),
+                ("first", 3, 1),
+                ("second", 6, 1),
+                ("third", 9, 1),
+                ("fourth", 12, 2),
+            ]
+        );
+        let first = &functions[1];
+        assert_eq!(
+            &source[first.span.0..first.span.1],
+            "function first(a: number) { return a; }"
+        );
     }
 
     #[test]
