@@ -37,6 +37,44 @@ on stderr and do not reset the counter; only a clean Stop resets it. A missing
 ID uses the `unkeyed` counter. Working-directory fallbacks use each harness's
 workspace field or environment variable before the process directory.
 
+## Sessions
+
+Hooks scope the gate to the agent session, as "Hook sessions" in
+`docs/spec.md` defines. The first event of a session in a repository records
+`HEAD` as the anchor. Every event records the edited file and the files that
+are changed or untracked at that moment. `Stop` checks the diff from the merge
+base of the anchor and `HEAD` to the working tree, restricted to the recorded
+files. A post-edit event checks the functions that the session changed in the
+edited file. Commits made during the session stay in scope. Commits that a
+merge or rebase brings in count only where they touch a recorded file.
+
+Violations are compared with that base. `hook.fail_on` lists the statuses that
+block, by default `["new", "worsened", "unmatched"]`. A block reason lists the
+other violations as `WARN`; they never block alone. To block on every
+violation in scope, set:
+
+```json
+{"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}}
+```
+
+When any `.pickcheck.json` differs between the base and the working tree,
+hooks read the repository config from the base commit, and the block reason
+starts with a note that says so.
+
+The state lives in `sessions/` under the state directory: one
+`<session>.<root hash>.anchor` file and one append-only
+`<session>.<root hash>.files` log per session and repository. A hook that
+starts a session deletes the files of other sessions that are older than 30
+days.
+
+Outside Git, without `HEAD`, or without a session ID, hooks work as before
+sessions. When the anchor no longer resolves or has no merge base with `HEAD`,
+they work as before and the block reason starts with a note.
+
+A file that a shell command changes and commits before the next hook event is
+not attributed to the session. An installer can close this gap by sending
+shell tool events to the hook, because every event records the changed files.
+
 Claude Code's `stop_hook_active` input field is intentionally ignored. The
 local counter is the loop guard for every harness, regardless of whether a
 Stop event was triggered by another Stop hook continuation.

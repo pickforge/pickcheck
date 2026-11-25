@@ -531,7 +531,7 @@ pickcheck --version
   `-`, a ref that names no commit, or no merge base (for example in a shallow
   clone) exits 2 with a short error and does not scan; it never falls back to
   `HEAD`. When a criss-cross history has several merge bases, Git's choice is
-  used. Hooks always diff against `HEAD`.
+  used. Hooks diff against the session base instead (see Hook sessions).
 - `--changed` and explicit `paths` together: intersection (changed functions within
   those paths).
 - Text output for explicit paths is detailed by default, one line per violation,
@@ -596,8 +596,8 @@ DETAILS pickcheck check --changed --verbose <file>
 With `--base`, every violation is also compared with the same function at the
 merge base, so a caller can tell new or worsened debt from debt the branch only
 touched. Explicit paths combined with `--base` restrict the changed set as usual
-and still compare. Hooks, and checks without `--base`, never compare and keep
-the output above unchanged.
+and still compare. Checks without `--base` never compare and keep the output
+above unchanged. Hooks compare inside a session (see Hook sessions).
 
 Base content:
 
@@ -710,13 +710,16 @@ unchanged. An excerpt:
 Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
 
 - `PostToolUse` with `tool_name` `Edit`, `Write`, or `MultiEdit` checks
-  `<tool_input.file_path>`. On violations it prints JSON
+  `<tool_input.file_path>`: in a session, the functions of that file that the
+  session changed (see Hook sessions), otherwise the whole file. On violations
+  that block it prints JSON
   `{"decision":"block","reason":"<summary>"}` and exits 0. `<summary>` is the
   `--summary` text report, including its `UNVERIFIED` lines, under the same
   20-path cap; it returns feedback without undoing the edit. No violations
   produce no output, even when files are unverified.
-- `Stop` → `check --changed` in `cwd`. On violations print the same summary,
-  `UNVERIFIED` lines included, in
+- `Stop` → in a session, the session's changed set; otherwise
+  `check --changed` in `cwd`. On violations that block print the same
+  summary, `UNVERIFIED` lines included, in
   `{"decision":"block","reason":"<summary>Fix the listed files, then finish."}`
   and exit 0, which prevents the agent from stopping. Loop guard: consecutive
   blocks per `session_id` are counted in the state directory. The hook blocks at most `hook.max_blocks` times
@@ -724,7 +727,8 @@ Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
   prefixed with `UNRESOLVED` to stderr, exit 0. Only a clean run resets the
   counter (an `UNRESOLVED` release does not). State file names derive from a
   sanitized `session_id`, never from a toolchain-dependent hash.
-- Any other event → exit 0, no output. Missing optional fields (`session_id`,
+- Any other event → exit 0, no output. It still records the session (see
+  Hook sessions). Missing optional fields (`session_id`,
   `cwd`) never cause a non-zero exit: `cwd` defaults to the process cwd and a
   missing `session_id` uses an unkeyed counter.
 - Never exit non-zero from the hook for gate results; reserve non-zero for
@@ -756,6 +760,79 @@ Reads Grok's native camel-case hook JSON. `post_tool_use` checks edits and write
 findings to stderr for the hook annotation. `stop` checks changed functions and
 blocks with exit 2 and the report on stderr. The working directory comes from
 `workspaceRoot` or `GROK_WORKSPACE_ROOT`.
+
+### Hook sessions
+
+Every hook scopes its gate to the agent session that triggered it. A commit
+then does not hide a change from `Stop`, and old debt does not block an edit
+that leaves it as it was. `check` does not use sessions.
+
+Session state. The first hook event of a session in a repository records the
+`HEAD` commit as the session anchor. Every event, including an event that a
+hook does not check, records the file it edits and every file that Git lists
+as changed or untracked against `HEAD` at that moment. Paths are relative to
+the physical repository root. The state lives in the `sessions` directory of
+the state directory (see State). Its file names are the sanitized session id
+and the 64-bit FNV-1a hash of the physical repository root path in hex, so
+one session id in two repositories has two anchors:
+
+- `<session>.<root hash>.anchor` holds the anchor commit and a newline. A
+  hook creates it with an exclusive create (`O_CREAT | O_EXCL`, or
+  `CREATE_NEW` on Windows) and never rewrites it. When several first events
+  race, one of them writes the anchor and the others read its value. A reader
+  waits up to 2 seconds for the writer to finish the line.
+- `<session>.<root hash>.files` is an append-only log. Each record is a
+  newline, the path as a JSON string, and a newline, written by one `write`
+  call on a file opened in append mode, so concurrent hooks lose no record.
+  A hook appends only the paths that the log does not hold yet. A reader skips
+  a record that does not parse, such as a truncated last record, and ignores
+  duplicates.
+
+When a hook creates an anchor, it deletes the anchor and log of every other
+session whose newest file is older than 30 days. It never deletes the files
+of the current session, and it never deletes a file with another name.
+
+Scope. The base is the merge base of the anchor and `HEAD`, resolved as
+`--base <anchor>` resolves it. The changed set is the diff from the base to
+the working tree plus untracked files, as under `--base`, restricted to the
+files that the session recorded. A file that the diff renames stays in the
+set when the session recorded its old path. A commit that a merge, a pull, or
+a rebase brings in therefore counts only where it touches a recorded file.
+`Stop` and an edit event that names no file check the whole set.
+`PostToolUse` checks the edited file in the set.
+
+Status. Every violation in the set is compared with the base, as under
+`--base`. The config key `hook.fail_on` lists the statuses that block, by
+default `new`, `worsened`, and `unmatched`. A block reason lists the other
+violations as `WARN`, but they never block alone. A run with only warnings
+prints nothing and counts as a clean run for the loop guard. The block reason
+is the `--base` summary, and its `DETAILS` line names the base commit and the
+fail set.
+
+Config. When the diff from the base adds, edits, deletes, or renames any
+`.pickcheck.json`, hooks read the repository config from the base commit. For
+each checked file this is the nearest `.pickcheck.json` in the tree of the
+base commit, from the file's directory up to the repository root, and then
+the working tree above the root. That config gives the limits, `ignore`, the
+test patterns, `hook.max_blocks`, and `hook.fail_on`. The user config and the
+built-in defaults resolve as usual. The block reason starts with
+`note: .pickcheck.json changed in this diff; the config comes from <base>`,
+and other scan notes follow it.
+
+Fallbacks. Outside a Git repository, without `HEAD`, or without a session id,
+hooks behave as they did before sessions. An edit checks the whole edited
+file, and `Stop` checks the diff against `HEAD`, where every violation blocks
+and the repository config comes from the working tree. Without a session id
+nothing is recorded. When the anchor names no commit or has no merge base
+with `HEAD`, hooks behave the same way, and a block reason starts with
+`note: session anchor <anchor> does not resolve or has no merge base with
+HEAD; the hook checks the diff against HEAD`.
+
+Known limits. A file that a shell command changes and that is committed
+before any later hook event is not attributed to the session. An installer
+can close this by sending shell tool events to the hook, because every event
+records the changed files. A `.pickcheck.json` that Git ignores is in no
+diff, so a change to it does not make hooks read the base config.
 
 ### `init`
 
@@ -795,13 +872,15 @@ Resolution, later wins, shallow merge per top-level key:
              "**/.svelte-kit/**", "**/*.g.dart", "**/*.freezed.dart",
              "**/*.min.js", "**/generated/**"],
   "languages": {},
-  "hook": { "max_blocks": 3 }
+  "hook": { "max_blocks": 3, "fail_on": ["new", "worsened", "unmatched"] }
 }
 ```
 
 `tests.patterns` and `ignore` globs match paths relative to the Git repository
 root (or to the common scan root outside Git), never to the process cwd.
 `tests.exempt` accepts only `lines`; `hook.max_blocks` is clamped to at least 1.
+`hook.fail_on` accepts a non-empty list of `new`, `worsened`, `unmatched`,
+`improved`, and `unchanged` (see Hook sessions).
 A repo config is trusted like any repo file. Under `--changed`, when the diff
 adds, modifies, or deletes a `.pickcheck.json`, or renames a file from or to
 that name, the report starts with `note: .pickcheck.json changed in this diff`
@@ -819,7 +898,8 @@ override of `null` turns it off for that language only.
 ## State
 
 Loop-guard counters live in `~/.pickforge/pickcheck/` (override with
-`PICKCHECK_HOME`), per the Pickforge local-storage policy. Nothing is ever
+`PICKCHECK_HOME`), per the Pickforge local-storage policy. Hook session state
+lives in its `sessions` directory (see Hook sessions). Nothing is ever
 written into the checked repository except by `init`.
 
 ## Golden fixtures
