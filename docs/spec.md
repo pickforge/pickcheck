@@ -427,10 +427,16 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 
 - `<script>` and `<script context="module">` / `<script module>` blocks are
   the `script_element` nodes of the Svelte syntax tree, so a `<script>` inside
-  an HTML comment is not measured. The `raw_text` child of each element is
-  parsed with the TypeScript grammar when its start tag has a `lang` attribute
-  of `ts` or `typescript`, otherwise with the JavaScript grammar. Functions
-  inside are reported normally with their real line numbers in the `.svelte` file.
+  an HTML comment is not measured. The content of each element, from the end
+  of its start tag to the start of its end tag, is parsed with the TypeScript
+  grammar when its start tag has a `lang` attribute of `ts` or `typescript`,
+  otherwise with the JavaScript grammar. Functions inside are reported
+  normally with their real line numbers in the `.svelte` file. As in Svelte, a
+  `</script>` end tag ends the script even inside a string. A string such as
+  `"</scripts>"` can make the grammar split the content into `raw_text` and an
+  `ERROR` node, which the content range still covers, or leave the `<script>`
+  start tag outside any `script_element`. Such a script is not measured, and
+  the file is `UNVERIFIED` (`script block could not be parsed`).
 - The template is split into synthetic units, so a report points at a block
   rather than at line 1 and scales with the block, not the file:
   - each top-level `{#if}`, `{#each}`, or `{#await}` block is a unit named
@@ -590,12 +596,23 @@ DETAILS pickcheck check --changed --verbose <file>
 - `UNVERIFIED` is emitted for a file that is explicitly named on the command
   line, or that has a known source-code extension with no grammar (`.kt .java
   .c .cc .cpp .h .hpp .cs .swift .rb .php .scala .lua .zig .m .mm .ex .exs .hs
-  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or whose syntax
-  tree is deeper than 3,000 levels (`syntax nesting too deep to measure`; this
-  covers each `<script>` block and template expression of a Svelte file, and a
-  base file that deep has no readable base). Non-source files
-  found while walking a directory (`.md`, `.json`, `.toml`, images, …) are
-  skipped silently. A file that cannot be read never aborts the scan.
+  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or that has a
+  unit the scan left out. Non-source files found while walking a directory
+  (`.md`, `.json`, `.toml`, images, …) are skipped silently. A file that cannot
+  be read never aborts the scan.
+- A unit is left out when its syntax subtree is more than 3,000 levels high
+  (`syntax nesting too deep to measure`). A function's subtree includes its
+  nested functions. A Svelte template unit's subtree leaves out scripts,
+  styles, and the units inside it, and each template expression in it counts
+  as its own tree. A Svelte script can also be left out (see Svelte). The other
+  units of the file are measured and reported as usual, so a file can be listed
+  under both `FAIL` and `UNVERIFIED`. A file with both reasons lists them
+  joined by `; `. The `pickcheck` binary measures on a 64 MiB stack, which
+  holds any unit within this limit. A library caller of
+  `parse_source` or `scan` gets that guarantee only inside
+  `on_measurement_stack`. Known limit: a Svelte file with millions of nested
+  template literals still overflows the stack inside the grammar's scanner,
+  before any tree exists (#66).
 
 ### Baseline (`--base`)
 
@@ -623,6 +640,8 @@ Base content:
   path, or fails to parse has no base, and the report adds
   `note: <path> has no readable base; its functions count as new`, where
   `<path>` is the reported path.
+- A base unit that the scan leaves out, such as one too deep to measure, is
+  matched as if it did not exist. This adds no note.
 
 Matching, per file, runs over every unit of both complete files, before any
 filtering by touched spans or violations, and ownership follows the syntax tree
@@ -720,7 +739,9 @@ Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
   `{"decision":"block","reason":"<summary>"}` and exits 0. `<summary>` is the
   `--summary` text report, including its `UNVERIFIED` lines, under the same
   20-path cap; it returns feedback without undoing the edit. No violations
-  produce no output, even when files are unverified.
+  produce no stdout output. Each unverified file then gets a
+  `note: UNVERIFIED <file>  <reason>` line on stderr, at most 20, followed by
+  `note: ... <n> more files` when more are omitted.
 - `Stop` → `check --changed` in `cwd`. On violations print the same summary,
   `UNVERIFIED` lines included, in
   `{"decision":"block","reason":"<summary>Fix the listed files, then finish."}`
@@ -728,8 +749,10 @@ Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
   blocks per `session_id` are counted in the state directory. The hook blocks at most `hook.max_blocks` times
   (default 3); every later Stop with violations is allowed and prints the compact report
   prefixed with `UNRESOLVED` to stderr, exit 0. Only a clean run resets the
-  counter (an `UNRESOLVED` release does not). State file names derive from a
-  sanitized `session_id`, never from a toolchain-dependent hash.
+  counter (an `UNRESOLVED` release does not). A Stop with no violations writes
+  the same stderr notes for unverified files as `PostToolUse`. State file
+  names derive from a sanitized `session_id`, never from a toolchain-dependent
+  hash.
 - Any other event → exit 0, no output. Missing optional fields (`session_id`,
   `cwd`) never cause a non-zero exit: `cwd` defaults to the process cwd and a
   missing `session_id` uses an unkeyed counter.
@@ -752,7 +775,9 @@ still return the report as feedback.
 Reads Cursor's native hook JSON. `afterFileEdit` checks the top-level
 `file_path`; findings are written to stderr because that event is passive.
 `stop` checks changed functions when `status` is `completed` and returns a
-`followup_message` on violations. Aborted and failed stops are ignored. The
+`followup_message` on violations. Aborted and failed stops are ignored. Both
+events write the stderr notes of `hook claude` for unverified files when there
+are no violations. The
 working directory comes from the first `workspace_roots` entry or
 `CURSOR_PROJECT_DIR`.
 
@@ -760,8 +785,9 @@ working directory comes from the first `workspace_roots` entry or
 
 Reads Grok's native camel-case hook JSON. `post_tool_use` checks edits and writes
 findings to stderr for the hook annotation. `stop` checks changed functions and
-blocks with exit 2 and the report on stderr. The working directory comes from
-`workspaceRoot` or `GROK_WORKSPACE_ROOT`.
+blocks with exit 2 and the report on stderr. Both events write the stderr notes
+of `hook claude` for unverified files when there are no violations. The
+working directory comes from `workspaceRoot` or `GROK_WORKSPACE_ROOT`.
 
 ### `init`
 
