@@ -2,9 +2,17 @@
 //! panic. The mutations come from a fixed seed, so every run is the same.
 
 use std::{
+    collections::BTreeMap,
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use pickcheck_core::{Language, parse_source};
@@ -12,6 +20,11 @@ use pickcheck_core::{Language, parse_source};
 const SEED: u64 = 0x5EED_0052;
 const MUTANTS_PER_FIXTURE: usize = 200;
 const MAX_SPAN: usize = 64;
+/// Far above the few seconds a fixture takes in a debug build, so only a
+/// hang reaches it.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(300);
+
+type Parse = fn(Language, &str) -> anyhow::Result<()>;
 
 /// SplitMix64: small, fast, and good enough to spread mutations.
 struct Rng(u64);
@@ -62,11 +75,11 @@ struct Fixture {
     punctuation: Vec<char>,
 }
 
-/// Each case has its own seed, so the cases can run on several threads and
-/// still give the same mutants on every run.
+/// Each case has its own seed, so the fixtures can run on separate threads
+/// and still give the same mutants on every run.
 #[test]
 fn mutated_fixtures_parse_without_panicking() {
-    let fixtures: Vec<_> = fixture_sources()
+    let fixtures = fixture_sources()
         .into_iter()
         .map(|path| {
             let source: Vec<char> = fs::read_to_string(&path).unwrap().chars().collect();
@@ -78,29 +91,10 @@ fn mutated_fixtures_parse_without_panicking() {
             }
         })
         .collect();
-    let cases = fixtures.len() * MUTANTS_PER_FIXTURE;
-    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-    let mut failures: Vec<String> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|worker| {
-                let fixtures = &fixtures;
-                scope.spawn(move || {
-                    (worker..cases)
-                        .step_by(threads)
-                        .filter_map(|index| {
-                            let fixture = &fixtures[index / MUTANTS_PER_FIXTURE];
-                            run_case(fixture, index % MUTANTS_PER_FIXTURE)
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().unwrap())
-            .collect()
-    });
-    failures.sort();
+    let failures = run_fixtures(fixtures, FIXTURE_TIMEOUT, |language, text| {
+        parse_source(language, text).map(drop)
+    })
+    .unwrap_or_else(|timeout| panic!("{timeout}"));
     assert!(
         failures.is_empty(),
         "seed {SEED:#x} panicked on:\n{}",
@@ -108,9 +102,76 @@ fn mutated_fixtures_parse_without_panicking() {
     );
 }
 
+/// A hung parse cannot be stopped, so each fixture runs on its own detached
+/// thread. Returns the panics, or an error naming every fixture still running
+/// when `timeout` ends.
+fn run_fixtures(
+    fixtures: Vec<Fixture>,
+    timeout: Duration,
+    parse: Parse,
+) -> Result<Vec<String>, String> {
+    let (sender, receiver) = mpsc::channel();
+    let progress: Vec<_> = fixtures
+        .into_iter()
+        .map(|fixture| {
+            let current = Arc::new(AtomicUsize::new(0));
+            let name = fixture.name.clone();
+            let (sender, shared) = (sender.clone(), Arc::clone(&current));
+            thread::spawn(move || {
+                let failures: Vec<_> = (0..MUTANTS_PER_FIXTURE)
+                    .filter_map(|case| {
+                        shared.store(case, Ordering::Relaxed);
+                        run_case(&fixture, case, parse)
+                    })
+                    .collect();
+                // The receiver is gone only after a timeout already failed.
+                let _ = sender.send((fixture.name, failures));
+            });
+            (name, current)
+        })
+        .collect();
+    drop(sender);
+    let deadline = Instant::now() + timeout;
+    let mut done = BTreeMap::new();
+    while done.len() < progress.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(left) {
+            Ok((name, failures)) => {
+                done.insert(name, failures);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let hung: Vec<_> = progress
+                    .iter()
+                    .filter(|(name, _)| !done.contains_key(name))
+                    .map(|(name, current)| {
+                        let case = current.load(Ordering::Relaxed);
+                        format!(
+                            "{name} case {case} (case seed {:#x})",
+                            case_seed(name, case)
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "seed {SEED:#x} timed out after {}s on:\n{}",
+                    timeout.as_secs(),
+                    hung.join("\n")
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("a fixture thread died"),
+        }
+    }
+    let mut failures: Vec<_> = done.into_values().flatten().collect();
+    failures.sort();
+    Ok(failures)
+}
+
+fn case_seed(name: &str, case: usize) -> u64 {
+    SEED ^ fnv(name) ^ case as u64
+}
+
 /// Applies one to three mutations and returns a description on a panic.
-fn run_case(fixture: &Fixture, case: usize) -> Option<String> {
-    let mut rng = Rng(SEED ^ fnv(&fixture.name) ^ case as u64);
+fn run_case(fixture: &Fixture, case: usize, parse: Parse) -> Option<String> {
+    let mut rng = Rng(case_seed(&fixture.name, case));
     rng.next();
     let mut mutant = fixture.source.clone();
     let mutations: Vec<_> = (0..=rng.below(3))
@@ -121,7 +182,7 @@ fn run_case(fixture: &Fixture, case: usize) -> Option<String> {
         })
         .collect();
     let text: String = mutant.into_iter().collect();
-    catch_unwind(AssertUnwindSafe(|| parse_source(fixture.language, &text)))
+    catch_unwind(AssertUnwindSafe(|| parse(fixture.language, &text)))
         .is_err()
         .then(|| format!("{} case {case}: {mutations:?}", fixture.name))
 }
@@ -206,4 +267,22 @@ fn apply(source: &mut Vec<char>, mutation: &Mutation) {
             }
         }
     }
+}
+
+#[test]
+fn a_hung_fixture_fails_with_its_name_and_seed() {
+    let fixture = Fixture {
+        name: "hang.js".to_owned(),
+        language: Language::JavaScript,
+        source: "let a = 1;".chars().collect(),
+        punctuation: vec![';'],
+    };
+    let error = run_fixtures(vec![fixture], Duration::from_millis(200), |_, _| {
+        loop {
+            thread::park();
+        }
+    })
+    .unwrap_err();
+    assert!(error.contains(&format!("seed {SEED:#x}")), "{error}");
+    assert!(error.contains("hang.js case 0 (case seed "), "{error}");
 }
