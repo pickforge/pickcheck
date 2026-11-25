@@ -45,7 +45,8 @@ Hooks scope the gate to the agent session, as "Hook sessions" in
 are changed or untracked at that moment. `Stop` checks the diff from the merge
 base of the anchor and `HEAD` to the working tree, restricted to the recorded
 files. A post-edit event checks the functions that the session changed in the
-edited file. Commits made during the session stay in scope. Commits that a
+edited file. An edit of a file outside the repository checks the whole file,
+as without a session. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 
 Violations are compared with that base. `hook.fail_on` lists the statuses that
@@ -62,10 +63,16 @@ hooks read the repository config from the base commit, and the block reason
 starts with a note that says so.
 
 The state lives in `sessions/` under the state directory: one
-`<session>.<root hash>.anchor` file and one append-only
-`<session>.<root hash>.files` log per session and repository. A hook that
-starts a session deletes the files of other sessions that are older than 30
-days.
+`<session>.<key hash>.anchor` file and one append-only
+`<session>.<key hash>.files` log per session and repository. The key hash
+covers the raw session ID and the repository root. The anchor is written to a
+temporary file and published with a hard link, so a reader never sees half of
+it. A hook that starts a session deletes the state files of other sessions
+that are older than 30 days, and no other file.
+
+Session state never fails a hook. When the state directory cannot be written,
+or the anchor or log is unusable, the hook prints one `note:` line to stderr
+and works as without a session.
 
 Outside Git, without `HEAD`, or without a session ID, hooks work as before
 sessions. When the anchor no longer resolves or has no merge base with `HEAD`,

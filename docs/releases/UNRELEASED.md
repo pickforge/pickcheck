@@ -44,7 +44,10 @@
   violation the agent commits before it stops still blocks, and a commit that
   a merge or rebase brings in counts only where it touches a session file.
   Session state lives in `sessions/` under the state directory, and state
-  older than 30 days is deleted.
+  older than 30 days is deleted. A state failure, such as an unwritable state
+  directory or a corrupt anchor, is one `note:` line on stderr, and the hook
+  then works as without a session; it never changes the exit code or stdout.
+  An edit of a file outside the repository still checks the whole file.
 - Default change: hooks now compare every violation with the session base and
   block only the statuses in the new `hook.fail_on` key, by default
   `["new", "worsened", "unmatched"]`. A legacy violation that an edit leaves
