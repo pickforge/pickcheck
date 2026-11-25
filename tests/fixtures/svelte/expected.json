@@ -156,17 +156,17 @@
       {
         "function": "{#each}",
         "line": 263,
-        "complexity": 6,
+        "complexity": 5,
         "hand_derived": true,
-        "derivation": "base 1; each block +1; the key 'a && b && c && d && e' in the parameter has 4 && nodes",
+        "derivation": "base 1; each block +1; the key 'a && b && c && d' in the parameter has 3 && nodes",
         "cognitive_derivation": "{#each} +1; the parameter is a binding and cognitive does not score it"
       },
       {
         "function": "{#each}",
         "line": 264,
-        "complexity": 7,
+        "complexity": 5,
         "hand_derived": true,
-        "derivation": "base 1; each block +1; the grammar splits 'has' at 'as', so the identifier is 'h' and the parameter is '&& a && b && c && d && list as item'; this component's TypeScript grammar reads it as '<missing> && a && b && c && d && list' cast 'as item', so it has 5 && nodes (the JavaScript grammar puts the leading && in an ERROR node and finds 4)",
+        "derivation": "base 1; each block +1; the grammar splits 'has' at 'as', so the identifier is 'h' and the parameter is '&& a && b && list as item'; this component's TypeScript grammar reads it as '<missing> && a && b && list' cast 'as item', so it has 3 && nodes (the JavaScript grammar puts the leading && in an ERROR node and finds 2)",
         "cognitive_derivation": "{#each} +1; the identifier 'h' has no operators"
       },
       {
@@ -433,23 +433,23 @@
     {
       "function": "{#each}",
       "line": 263,
-      "complexity": 6,
+      "complexity": 5,
       "cognitive": 1,
       "depth": 1,
       "lines": 0,
       "params": 0,
-      "bool_ops": 4,
+      "bool_ops": 3,
       "widget_depth": 0
     },
     {
       "function": "{#each}",
       "line": 264,
-      "complexity": 7,
+      "complexity": 5,
       "cognitive": 1,
       "depth": 1,
       "lines": 0,
       "params": 0,
-      "bool_ops": 5,
+      "bool_ops": 3,
       "widget_depth": 0
     },
     {
