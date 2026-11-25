@@ -17,6 +17,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use ignore::WalkBuilder;
@@ -25,6 +26,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_DIFF_LINES: usize = 200;
+
+/// The internal test that measures the corpus in a child process.
+const CHILD_TEST: &str = "corpus_measure_child";
+
+/// Set only in the child process: the directory with the isolated config.
+const CHILD_VARIABLE: &str = "PICKCHECK_CORPUS_ISOLATION";
+
+/// Variables that make Git use another repository, index, object store,
+/// namespace or config. `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` go too.
+const GIT_REDIRECTS: [&str; 11] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+];
 
 /// Every language label; the corpus must have a function in each.
 const LANGUAGES: [&str; 8] = [
@@ -77,26 +100,30 @@ struct LanguageStats {
     violations: BTreeMap<&'static str, usize>,
 }
 
-/// One measured function. The field order is the sort order.
+/// One measured function. The field order is the sort order. `position` is
+/// the function's index in source order within its file, so two functions
+/// with the same line and name keep their own values.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Record {
     file: String,
     line: usize,
     function: String,
+    position: usize,
     values: [usize; Metric::ALL.len()],
 }
 
 impl Record {
-    fn new(file: &Path, function: &FunctionMetrics) -> Self {
+    fn new(file: &Path, position: usize, function: &FunctionMetrics) -> Self {
         Self {
             file: slash_path(file),
             line: function.line,
             function: function.function.clone(),
+            position,
             values: Metric::ALL.map(|metric| function.value(metric)),
         }
     }
 
-    /// `file<TAB>line<TAB>function<TAB>complexity=1 cognitive=0 ...`
+    /// `file<TAB>line<TAB>function<TAB>position<TAB>complexity=1 cognitive=0 ...`
     fn text(&self) -> String {
         let values = Metric::ALL
             .iter()
@@ -104,7 +131,10 @@ impl Record {
             .map(|(metric, value)| format!("{}={value}", metric.name()))
             .collect::<Vec<_>>()
             .join(" ");
-        format!("{}\t{}\t{}\t{values}", self.file, self.line, self.function)
+        format!(
+            "{}\t{}\t{}\t{}\t{values}",
+            self.file, self.line, self.function, self.position
+        )
     }
 }
 
@@ -122,9 +152,52 @@ fn digest(records: &[Record]) -> String {
     format!("{hash:016x}")
 }
 
+/// Measures in a child process, so the isolated environment never changes
+/// this process, and its temporary directory outlives the measurement.
 #[test]
 #[ignore = "needs the pinned corpus; see the module docs"]
 fn corpus_matches_snapshot() {
+    let isolation = tempfile::tempdir().unwrap();
+    let path = isolation.path();
+    for name in ["home", "xdg"] {
+        fs::create_dir(path.join(name)).unwrap();
+    }
+    fs::write(path.join("empty.json"), "{}").unwrap();
+    let gitconfig = path.join("gitconfig");
+    fs::write(&gitconfig, "").unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    command
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .args(["--test-threads", "1"])
+        .env(CHILD_VARIABLE, path)
+        .env("HOME", path.join("home"))
+        .env("XDG_CONFIG_HOME", path.join("xdg"))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .env("GIT_CONFIG_SYSTEM", &gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let output = without_git_redirects(&mut command)
+        .output()
+        .expect("cannot run the test executable again");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "corpus measurement failed:\n{stdout}{stderr}"
+    );
+}
+
+/// Built-in defaults only. The parent sets an empty home and config
+/// directory, which hide the user's pickcheck config and Git ignore file, and
+/// empty Git config files. An empty explicit config replaces any
+/// `.pickcheck.json` in or above a repository. Without the parent's variable
+/// this test does nothing.
+#[test]
+#[ignore = "internal: run by corpus_matches_snapshot in a child process"]
+fn corpus_measure_child() {
+    let Some(isolation) = env::var_os(CHILD_VARIABLE) else {
+        return;
+    };
+    let config = PathBuf::from(isolation).join("empty.json");
     let corpus = workspace_path(
         env::var_os("PICKCHECK_CORPUS_DIR")
             .expect("set PICKCHECK_CORPUS_DIR to a directory filled by scripts/fetch-corpus.sh"),
@@ -136,8 +209,6 @@ fn corpus_matches_snapshot() {
         !manifest.repositories.is_empty(),
         "tests/corpus/manifest.json lists no repository"
     );
-    let isolation = isolate_environment();
-    let config = isolation.path().join("empty.json");
     let directories: Vec<_> = manifest
         .repositories
         .iter()
@@ -199,48 +270,73 @@ fn canonical(snapshot: &Snapshot) -> String {
     serde_json::to_string_pretty(snapshot).unwrap() + "\n"
 }
 
-/// Built-in defaults only. Empty home and config directories hide the user's
-/// pickcheck config and global Git ignore file. An empty explicit config
-/// replaces any `.pickcheck.json` in or above a repository.
-fn isolate_environment() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path();
-    for name in ["home", "xdg"] {
-        fs::create_dir(path.join(name)).unwrap();
-    }
-    fs::write(path.join("empty.json"), "{}").unwrap();
-    fs::write(path.join("gitconfig"), "").unwrap();
-    // SAFETY: only `--ignored` selects this test, so it runs alone in its
-    // binary, before any other thread reads the environment.
-    unsafe {
-        env::set_var("HOME", path.join("home"));
-        env::set_var("XDG_CONFIG_HOME", path.join("xdg"));
-        env::set_var("GIT_CONFIG_GLOBAL", path.join("gitconfig"));
-        env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-    }
-    directory
+/// True when an ignore file holds at least one rule. A missing file, blank
+/// lines and comments hide nothing.
+fn has_rules(file: &Path) -> bool {
+    fs::read_to_string(file).is_ok_and(|text| {
+        text.lines()
+            .map(str::trim)
+            .any(|line| !line.is_empty() && !line.starts_with('#'))
+    })
 }
 
 /// The scan also reads `.git/info/exclude` and `.ignore` files above the
-/// repository. Neither is part of the pinned tree, so refuse to measure with
-/// either present.
+/// repository. Neither is part of the pinned tree, so refuse to measure when
+/// either has a rule. A `.gitignore` above the repository does not apply,
+/// because the walk stops reading Git ignore files at the repository root.
 fn assert_no_outside_ignores(directory: &Path) {
     let exclude = directory.join(".git/info/exclude");
-    if let Ok(text) = fs::read_to_string(&exclude) {
-        assert!(
-            text.lines()
-                .map(str::trim)
-                .all(|line| line.is_empty() || line.starts_with('#')),
-            "{} has ignore rules; run scripts/fetch-corpus.sh again",
-            exclude.display()
-        );
-    }
+    assert!(
+        !has_rules(&exclude),
+        "{} has ignore rules; run scripts/fetch-corpus.sh again",
+        exclude.display()
+    );
     for parent in directory.ancestors().skip(1) {
         let ignore = parent.join(".ignore");
         assert!(
-            !ignore.exists(),
+            !has_rules(&ignore),
             "{} would hide corpus files; move the corpus elsewhere",
             ignore.display()
+        );
+    }
+}
+
+/// Fails when the working tree differs from the pinned commit: a changed,
+/// deleted or untracked file, a file hidden from status by an index flag, or
+/// a file inside a submodule directory, which status does not look into but
+/// the scan reads.
+fn assert_pinned_tree(name: &str, directory: &Path) {
+    let flags = git(directory, &["ls-files", "-v", "-z"]);
+    if let Some(entry) = flags
+        .split('\0')
+        .find(|entry| !entry.is_empty() && !entry.starts_with("H "))
+    {
+        panic!(
+            "{name}: {} has an index flag; run scripts/fetch-corpus.sh",
+            &entry[2..]
+        );
+    }
+    let status = git(
+        directory,
+        &["status", "--porcelain", "--untracked-files=all", "-z"],
+    );
+    if let Some(entry) = status.split('\0').find(|entry| !entry.is_empty()) {
+        panic!(
+            "{name}: {} differs from the pinned commit; run scripts/fetch-corpus.sh",
+            &entry[3..]
+        );
+    }
+    let stage = git(directory, &["ls-files", "--stage", "-z"]);
+    for entry in stage
+        .split('\0')
+        .filter(|entry| entry.starts_with("160000 "))
+    {
+        let path = entry.split_once('\t').map_or(entry, |(_, path)| path);
+        let populated =
+            fs::read_dir(directory.join(path)).is_ok_and(|mut children| children.next().is_some());
+        assert!(
+            !populated,
+            "{name}: submodule directory {path} is not empty; run scripts/fetch-corpus.sh"
         );
     }
 }
@@ -264,11 +360,12 @@ fn check_checkout(corpus: &Path, entry: &Entry) -> PathBuf {
         corpus.display()
     );
     assert_eq!(
-        git_head(&directory),
+        git(&directory, &["rev-parse", "HEAD"]).trim(),
         entry.commit,
         "{} is not at its pinned commit; run scripts/fetch-corpus.sh",
         directory.display()
     );
+    assert_pinned_tree(&entry.name, &directory);
     let directory = pickcheck_core::physical(&directory);
     assert_no_outside_ignores(&directory);
     directory
@@ -299,7 +396,11 @@ fn measure(
         }
     }
     let mut records = BTreeMap::<String, Vec<Record>>::new();
+    // The scan reports each file's functions in source order.
+    let mut positions = BTreeMap::<&Path, usize>::new();
     for (file, function) in &result.functions {
+        let position = positions.entry(file).or_default();
+        *position += 1;
         let label = language_label(file);
         let stats = languages.get_mut(&label).unwrap_or_else(|| {
             panic!(
@@ -320,7 +421,7 @@ fn measure(
         records
             .entry(label)
             .or_default()
-            .push(Record::new(file, function));
+            .push(Record::new(file, *position - 1, function));
     }
     for violation in &result.violations {
         let stats = languages.get_mut(&language_label(&violation.file)).unwrap();
@@ -421,14 +522,40 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
-fn git_head(directory: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
+/// Removes every variable that would point Git at another repository or config.
+fn without_git_redirects(command: &mut Command) -> &mut Command {
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+/// Standard output of a Git command in `directory`. Fails when Git fails.
+/// The fsmonitor setting could run a command, so it is off.
+fn git(directory: &Path, args: &[&str]) -> String {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.fsmonitor=false", "-C"])
         .arg(directory)
-        .args(["rev-parse", "HEAD"])
+        .args(args);
+    let output = without_git_redirects(&mut command)
         .output()
         .unwrap_or_else(|error| panic!("cannot run git in {}: {error}", directory.display()));
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    assert!(
+        output.status.success(),
+        "git {} failed in {}: {}",
+        args.join(" "),
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 /// One line per changed leaf, such as
@@ -493,19 +620,35 @@ fn collect_leaves<'a>(prefix: String, value: &'a Value, out: &mut BTreeMap<Strin
     }
 }
 
-fn record(function: &str, line: usize, complexity: usize) -> Record {
+fn record(function: &str, line: usize, position: usize, complexity: usize) -> Record {
     Record {
         file: "src/a.js".to_owned(),
         line,
         function: function.to_owned(),
+        position,
         values: [complexity, 0, 0, 1, 0, 0, 0],
     }
 }
 
 #[test]
 fn swapping_values_between_functions_changes_digest() {
-    let before = [record("first", 1, 1), record("second", 5, 2)];
-    let swapped = [record("first", 1, 2), record("second", 5, 1)];
+    let before = [record("first", 1, 0, 1), record("second", 5, 1, 2)];
+    let swapped = [record("first", 1, 0, 2), record("second", 5, 1, 1)];
+    let reordered = [before[1].clone(), before[0].clone()];
+    assert_ne!(digest(&before), digest(&swapped));
+    assert_eq!(digest(&before), digest(&reordered));
+}
+
+#[test]
+fn swapping_values_between_callbacks_on_one_line_changes_digest() {
+    let before = [
+        record("<anonymous>", 3, 0, 1),
+        record("<anonymous>", 3, 1, 2),
+    ];
+    let swapped = [
+        record("<anonymous>", 3, 0, 2),
+        record("<anonymous>", 3, 1, 1),
+    ];
     let reordered = [before[1].clone(), before[0].clone()];
     assert_ne!(digest(&before), digest(&swapped));
     assert_eq!(digest(&before), digest(&reordered));
@@ -515,7 +658,7 @@ fn swapping_values_between_functions_changes_digest() {
 fn crlf_snapshot_matches_parsed_value() {
     let mut stats = LanguageStats::empty();
     stats.functions = 2;
-    stats.digest = digest(&[record("first", 1, 1)]);
+    stats.digest = digest(&[record("first", 1, 0, 1)]);
     let snapshot = Snapshot {
         repositories: BTreeMap::from([(
             "demo".to_owned(),
