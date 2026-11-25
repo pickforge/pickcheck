@@ -15,6 +15,11 @@
 - A config value of the wrong type, such as a string limit or a negative
   `hook.max_blocks`, is now reported with its full key and the config file it
   came from, instead of a generic type error after the files are merged. (#46)
+- Svelte `<script>` blocks and their `lang` now come from the Svelte syntax
+  tree, so a `<script>` inside an HTML comment is no longer measured. Template
+  `complexity` and `bool_ops` now count operator nodes in the parsed
+  expression, with the component's script grammar, so a `?` or `||` inside a
+  regular expression, string, or comment no longer adds a decision. (#49)
 
 ## Validation
 

@@ -144,6 +144,14 @@
         "hand_derived": true,
         "derivation": "base 1; await block +1; 'promise then result' has no operators",
         "cognitive_derivation": "{#await} +1; 'promise then result' does not parse and adds nothing"
+      },
+      {
+        "function": "{#if}",
+        "line": 258,
+        "complexity": 2,
+        "hand_derived": true,
+        "derivation": "base 1; if block +1; the ? and || inside the regex literal and the operators inside the string are not operator nodes; the script inside the HTML comment before this block is not measured",
+        "cognitive_derivation": "{#if} +1; the regex literal and the string add nothing"
       }
     ]
   },
@@ -371,6 +379,17 @@
     {
       "function": "{#await}",
       "line": 247,
+      "complexity": 2,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 0,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#if}",
+      "line": 258,
       "complexity": 2,
       "cognitive": 1,
       "depth": 1,

@@ -1092,26 +1092,27 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
     let tree = parse_svelte_tree(source)?;
-    let blocks = svelte_blocks(source);
+    let mut scripts = Vec::new();
+    collect_scripts(tree.root_node(), source, &mut scripts);
     let mut functions = Vec::new();
-    let mut template_language = Language::JavaScript;
-    for block in blocks.iter().filter(|block| block.kind == "script") {
-        let language =
-            if block.opening.contains("lang=\"ts\"") || block.opening.contains("lang='ts'") {
-                template_language = Language::TypeScript;
-                Language::TypeScript
-            } else {
-                Language::JavaScript
-            };
+    for (language, content) in &scripts {
         functions.extend(parse_with_offset(
-            language,
-            block.content,
+            *language,
+            node_text(*content, source),
             Offset {
-                line: block.start_line,
-                byte: block.start_byte,
+                line: content.start_position().row,
+                byte: content.start_byte(),
             },
         )?);
     }
+    let template_language = if scripts
+        .iter()
+        .any(|(language, _)| *language == Language::TypeScript)
+    {
+        Language::TypeScript
+    } else {
+        Language::JavaScript
+    };
     functions.extend(measure_template(
         tree.root_node(),
         source,
@@ -1131,42 +1132,57 @@ fn parse_svelte_tree(source: &str) -> Result<Tree> {
         .context("Svelte parser returned no tree")
 }
 
-struct SvelteBlock<'a> {
-    kind: &'static str,
-    opening: &'a str,
-    content: &'a str,
-    start_line: usize,
-    start_byte: usize,
+/// Every `script_element` with its grammar and its `raw_text` content. A
+/// `<script>` inside an HTML comment is part of a `comment` node, not an
+/// element, so it is never collected.
+fn collect_scripts<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    output: &mut Vec<(Language, Node<'tree>)>,
+) {
+    if node.kind() == "script_element" {
+        if let Some(content) = child_of_kind(node, "raw_text") {
+            output.push((script_language(node, source), content));
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_scripts(child, source, output);
+    }
 }
 
-fn svelte_blocks(source: &str) -> Vec<SvelteBlock<'_>> {
-    let mut blocks = Vec::new();
-    for kind in ["script", "style"] {
-        let mut cursor = 0;
-        while let Some(relative) = source[cursor..].find(&format!("<{kind}")) {
-            let start = cursor + relative;
-            let Some(open_end_rel) = source[start..].find('>') else {
-                break;
-            };
-            let open_end = start + open_end_rel + 1;
-            let Some(close_rel) = source[open_end..].find(&format!("</{kind}>")) else {
-                break;
-            };
-            let end = open_end + close_rel;
-            blocks.push(SvelteBlock {
-                kind,
-                opening: &source[start..open_end],
-                content: &source[open_end..end],
-                start_line: source[..open_end]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count(),
-                start_byte: open_end,
+fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// TypeScript when the start tag has `lang="ts"` or `lang="typescript"`,
+/// quoted or not.
+fn script_language(element: Node<'_>, source: &str) -> Language {
+    let Some(tag) = child_of_kind(element, "start_tag") else {
+        return Language::JavaScript;
+    };
+    let mut cursor = tag.walk();
+    let typescript = tag
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "attribute")
+        .any(|attribute| {
+            let name = child_of_kind(attribute, "attribute_name")
+                .is_some_and(|name| node_text(name, source).eq_ignore_ascii_case("lang"));
+            let value = child_of_kind(attribute, "attribute_value").or_else(|| {
+                child_of_kind(attribute, "quoted_attribute_value")
+                    .and_then(|quoted| child_of_kind(quoted, "attribute_value"))
             });
-            cursor = end + kind.len() + 3;
-        }
+            name && value
+                .is_some_and(|value| matches!(node_text(value, source), "ts" | "typescript"))
+        });
+    if typescript {
+        Language::TypeScript
+    } else {
+        Language::JavaScript
     }
-    blocks
 }
 
 const TEMPLATE_BLOCKS: [&str; 3] = ["if_statement", "each_statement", "await_statement"];
@@ -1287,10 +1303,10 @@ fn score_svelte_node(
     ) {
         score.complexity += 1;
     }
-    if node.kind() == "svelte_raw_text" {
-        let expression = node_text(node, source);
-        score.complexity += expression_decisions(expression);
-        score.bool_ops = score.bool_ops.max(expression_bool_ops(expression));
+    if node.kind() == "svelte_raw_text" && cognitive::scored_raw_text(node) {
+        let expression = score_expression(node_text(node, source), units.script);
+        score.complexity += expression.complexity;
+        score.bool_ops = score.bool_ops.max(expression.bool_ops);
     }
     let next_depth = depth + usize::from(TEMPLATE_BLOCKS.contains(&node.kind()));
     score.depth = score.depth.max(next_depth);
@@ -1300,157 +1316,69 @@ fn score_svelte_node(
     }
 }
 
-fn expression_bool_ops(expression: &str) -> usize {
-    let wrapped = format!("function expression() {{ return ({expression}); }}");
-    parse_with_offset(Language::JavaScript, &wrapped, Offset::default())
-        .ok()
-        .and_then(|functions| functions.first().map(|function| function.bool_ops))
-        .unwrap_or(0)
-}
-
-fn expression_decisions(line: &str) -> usize {
-    let code = mask_quoted_text(line);
-    let bytes = code.as_bytes();
-    let pairs = bytes
-        .windows(2)
-        .filter(|pair| matches!(*pair, b"&&" | b"||" | b"??"))
-        .count();
-    let ternary = bytes
-        .iter()
-        .enumerate()
-        .filter(|(index, byte)| {
-            **byte == b'?'
-                && index
-                    .checked_sub(1)
-                    .is_none_or(|before| bytes[before] != b'?')
-                && bytes
-                    .get(index + 1)
-                    .is_none_or(|after| !matches!(*after, b'?' | b'.'))
-        })
-        .count();
-    pairs + ternary
-}
-
-enum MaskContext {
-    Code(Option<usize>),
-    Quote(u8),
-    Template,
-    LineComment(Option<usize>),
-    BlockComment(Option<usize>),
-}
-
-fn mask_quoted_text(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut result = vec![b' '; bytes.len()];
-    let mut contexts = vec![MaskContext::Code(None)];
-    let mut index = 0;
-    while index < bytes.len() {
-        let Some(context) = contexts.pop() else {
-            break;
-        };
-        index += match context {
-            MaskContext::Code(depth) => {
-                mask_code_byte(bytes, index, depth, &mut contexts, &mut result)
-            }
-            MaskContext::Quote(delimiter) => {
-                mask_quote_byte(bytes[index], delimiter, &mut contexts)
-            }
-            MaskContext::Template => mask_template_byte(bytes, index, &mut contexts),
-            MaskContext::LineComment(depth) => {
-                mask_line_comment_byte(bytes[index], depth, &mut contexts)
-            }
-            MaskContext::BlockComment(depth) => {
-                mask_block_comment_byte(bytes, index, depth, &mut contexts)
-            }
-        };
+/// Decisions (`complexity` without its base 1) and the widest boolean chain in
+/// one template expression, parsed with the component's script grammar inside
+/// the wrapper `cognitive` also uses. Functions in the expression count
+/// inline; nodes inside an `ERROR` subtree add nothing.
+fn score_expression(text: &str, script: Language) -> Score {
+    let mut score = Score {
+        complexity: 0,
+        depth: 0,
+        bool_ops: 0,
+    };
+    let wrapped = format!("function expression() {{ return ({text}); }}");
+    let mut parser = Parser::new();
+    if parser.set_language(&script.grammar()).is_err() {
+        return score;
     }
-    String::from_utf8(result).unwrap_or_default()
+    let Some(tree) = parser.parse(&wrapped, None) else {
+        return score;
+    };
+    if let Some(function) = cognitive::first_function(tree.root_node(), script) {
+        let body = function.child_by_field_name("body").unwrap_or(function);
+        score_expression_node(body, &wrapped, script, &mut score);
+    }
+    score
 }
 
-fn mask_code_byte(
-    bytes: &[u8],
-    index: usize,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-    result: &mut [u8],
+fn score_expression_node(node: Node<'_>, source: &str, script: Language, score: &mut Score) {
+    if node.is_error() {
+        return;
+    }
+    let operator = is_boolean_operator(node, script, source);
+    score.complexity += usize::from(operator || is_conditional_expression(node.kind()));
+    if is_boolean_chain_root(node, script, source) {
+        score.bool_ops =
+            score
+                .bool_ops
+                .max(template_chain_operators(node, node.id(), script, source));
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        score_expression_node(child, source, script, score);
+    }
+}
+
+/// `boolean_operators_in_chain` for a template expression, which also skips
+/// `ERROR` subtrees.
+fn template_chain_operators(
+    node: Node<'_>,
+    root_id: usize,
+    script: Language,
+    source: &str,
 ) -> usize {
-    if bytes[index..].starts_with(b"//") {
-        contexts.push(MaskContext::LineComment(depth));
-        return 2;
+    if node.is_error()
+        || node.id() != root_id
+            && (is_function(script, node.kind()) || is_conditional_expression(node.kind()))
+    {
+        return 0;
     }
-    if bytes[index..].starts_with(b"/*") {
-        contexts.push(MaskContext::BlockComment(depth));
-        return 2;
-    }
-    match bytes[index] {
-        b'\'' | b'"' => {
-            contexts.extend([MaskContext::Code(depth), MaskContext::Quote(bytes[index])]);
-        }
-        b'`' => contexts.extend([MaskContext::Code(depth), MaskContext::Template]),
-        b'{' if depth.is_some() => contexts.push(MaskContext::Code(depth.map(|value| value + 1))),
-        b'}' if depth == Some(0) => {}
-        b'}' => contexts.push(MaskContext::Code(depth.map(|value| value - 1))),
-        byte => {
-            result[index] = byte;
-            contexts.push(MaskContext::Code(depth));
-        }
-    }
-    1
-}
-
-fn mask_line_comment_byte(
-    byte: u8,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-) -> usize {
-    if byte == b'\n' {
-        contexts.push(MaskContext::Code(depth));
-    } else {
-        contexts.push(MaskContext::LineComment(depth));
-    }
-    1
-}
-
-fn mask_block_comment_byte(
-    bytes: &[u8],
-    index: usize,
-    depth: Option<usize>,
-    contexts: &mut Vec<MaskContext>,
-) -> usize {
-    if bytes[index..].starts_with(b"*/") {
-        contexts.push(MaskContext::Code(depth));
-        2
-    } else {
-        contexts.push(MaskContext::BlockComment(depth));
-        1
-    }
-}
-
-fn mask_quote_byte(byte: u8, delimiter: u8, contexts: &mut Vec<MaskContext>) -> usize {
-    if byte == b'\\' {
-        contexts.push(MaskContext::Quote(delimiter));
-        2
-    } else if byte == delimiter {
-        1
-    } else {
-        contexts.push(MaskContext::Quote(delimiter));
-        1
-    }
-}
-
-fn mask_template_byte(bytes: &[u8], index: usize, contexts: &mut Vec<MaskContext>) -> usize {
-    if bytes[index] == b'\\' {
-        contexts.push(MaskContext::Template);
-        2
-    } else if bytes[index] == b'`' {
-        1
-    } else if bytes[index..].starts_with(b"${") {
-        contexts.extend([MaskContext::Template, MaskContext::Code(Some(0))]);
-        2
-    } else {
-        contexts.push(MaskContext::Template);
-        1
-    }
+    let mut cursor = node.walk();
+    usize::from(is_boolean_operator(node, script, source))
+        + node
+            .named_children(&mut cursor)
+            .map(|child| template_chain_operators(child, root_id, script, source))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
@@ -1590,9 +1518,61 @@ class Screen {
     }
 
     #[test]
-    fn svelte_expression_comments_do_not_add_decisions() {
-        assert_eq!(expression_decisions("a && b /* || */"), 1);
-        assert_eq!(expression_decisions("a || b // && ??"), 1);
+    fn svelte_expressions_are_scored_from_the_syntax_tree() {
+        let template = |source: &str| {
+            let functions = parse_source(Language::Svelte, source).unwrap();
+            let unit = functions.last().unwrap();
+            assert_eq!(unit.function, "<template>");
+            (unit.complexity, unit.bool_ops)
+        };
+        assert_eq!(template("<p>{a && b /* || */}</p>"), (2, 1));
+        assert_eq!(template("<p>{a || b // && ??\n}</p>"), (2, 1));
+        assert_eq!(template("<p>{/a?b?c||d/.test(x)}</p>"), (1, 0));
+        assert_eq!(template("<p>{x?.y ?? (a ? b : c)}</p>"), (3, 1));
+        assert_eq!(template("<p>{a && b && c} {d || e}</p>"), (4, 2));
+        assert_eq!(
+            template("<button on:click={() => ok && go()}>x</button>"),
+            (2, 1)
+        );
+        // Bindings are not scored, so a default value adds nothing.
+        assert_eq!(template("{#each a as { x = b && c }}{/each}").0, 1);
+        // TypeScript reads this `?` as a conditional type, JavaScript as a
+        // ternary.
+        let conditional_type = "<p>{a as (T extends U ? X : Y)}</p>";
+        assert_eq!(template(conditional_type), (2, 0));
+        assert_eq!(
+            template(&format!("<script lang=\"ts\"></script>{conditional_type}")),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn svelte_scripts_come_from_script_elements() {
+        let source = "<!-- <script>function hidden(a) { return a; }</script> -->\n\
+            <script context=\"module\" lang='typescript'>\nfunction first(a: number) { return a; }\n</script>\n\
+            <script module>\nfunction second(a) { return a; }\n</script>\n\
+            <script lang=ts>\nfunction third(a: number) { return a; }\n</script>\n\
+            <script>\nfunction fourth(a, b) { return a; }\n</script>\n";
+        let functions = parse_source(Language::Svelte, source).unwrap();
+        let names = functions
+            .iter()
+            .map(|item| (item.function.as_str(), item.line, item.params))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("<template>", 1, 0),
+                ("first", 3, 1),
+                ("second", 6, 1),
+                ("third", 9, 1),
+                ("fourth", 12, 2),
+            ]
+        );
+        let first = &functions[1];
+        assert_eq!(
+            &source[first.span.0..first.span.1],
+            "function first(a: number) { return a; }"
+        );
     }
 
     #[test]

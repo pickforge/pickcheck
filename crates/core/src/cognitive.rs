@@ -416,7 +416,7 @@ impl Template<'_> {
 
 /// Bindings (`each` parameters, `then` / `catch` values, snippet parameters)
 /// are declarations, not expressions, and are not scored.
-fn scored_raw_text(node: Node<'_>) -> bool {
+pub(crate) fn scored_raw_text(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -438,7 +438,7 @@ fn field_of(parent: Node<'_>, child: Node<'_>) -> Option<&'static str> {
         .and_then(|index| parent.field_name_for_child(index as u32))
 }
 
-fn first_function(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+pub(crate) fn first_function(node: Node<'_>, language: Language) -> Option<Node<'_>> {
     if is_function(language, node.kind()) {
         return Some(node);
     }
