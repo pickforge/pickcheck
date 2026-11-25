@@ -763,6 +763,51 @@ fn closures_keep_an_owner_that_was_left_out() {
     );
 }
 
+/// A note that cannot be written to stderr changes neither the exit code nor
+/// stdout of a hook that does not block.
+#[cfg(unix)]
+#[test]
+fn hook_notes_ignore_an_unwritable_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("note.kt"), "fun f() {}\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "full", "cwd": dir.path(),
+        "tool_name": "Edit", "tool_input": {"file_path": dir.path().join("note.kt")}
+    })
+    .to_string();
+    let writable = hook_output(state.path(), &input);
+    assert_eq!(
+        String::from_utf8_lossy(&writable.stderr),
+        "note: UNVERIFIED note.kt  no grammar for .kt\n"
+    );
+    let full = Path::new("/dev/full");
+    let mut command = if full.exists() {
+        let mut command = binary();
+        let stderr = fs::OpenOptions::new().write(true).open(full).unwrap();
+        command.args(["hook", "claude"]).stderr(stderr);
+        command
+    } else {
+        let mut command = Command::new("sh");
+        let script = "exec \"$0\" hook claude 2>&-";
+        command.args(["-c", script, env!("CARGO_BIN_EXE_pickcheck")]);
+        command
+    };
+    let mut child = command
+        .env("PICKCHECK_HOME", state.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    let unwritable = child.wait_with_output().unwrap();
+    assert_eq!(unwritable.status.code(), writable.status.code());
+    assert_eq!(unwritable.status.code(), Some(0));
+    assert_eq!(unwritable.stdout, writable.stdout);
+}
+
 #[test]
 fn hooks_that_do_not_block_note_unverified_files() {
     let dir = tempfile::tempdir().unwrap();
