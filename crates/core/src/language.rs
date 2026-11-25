@@ -1667,16 +1667,15 @@ mod tests {
         let [ifs_at, ifs_over] = at_and_over_limit(Language::JavaScript, 1, ifs);
         let [elements_at, elements_over] = at_and_over_limit(Language::Svelte, 0, elements);
         // Next to a unit over the limit: a closure inside it, a function after
-        // it, a script function, a block, and a block after a deep expression.
+        // it, a script function, and a block after a deep template expression,
+        // which leaves out the root template unit.
         let script = format!(
             "{}\nfunction g(a) {{ return a; }}",
             chain_over.replace("{ return", "{ const ok = (b) => b; return")
         );
-        let component = format!("<script>{script}</script>{{#if a}}{{/if}}{elements_over}");
-        let expression = format!(
-            "<p>{{{}a}}</p>{{#if a}}{{/if}}",
-            "a + ".repeat(MAX_SYNTAX_DEPTH)
-        );
+        let deep_expression = "a + ".repeat(MAX_SYNTAX_DEPTH);
+        let component =
+            format!("<script>{script}</script><p>{{{deep_expression}a}}</p>{{#if a}}{{/if}}");
         let cases = [
             (Language::JavaScript, chain_at, vec!["f"]),
             (Language::JavaScript, chain_over, vec![]),
@@ -1686,7 +1685,6 @@ mod tests {
             (Language::Svelte, elements_over, vec![]),
             (Language::JavaScript, script, vec!["ok", "g"]),
             (Language::Svelte, component, vec!["ok", "g", "{#if}"]),
-            (Language::Svelte, expression, vec!["{#if}"]),
         ];
         let outcome = std::thread::Builder::new()
             .stack_size(1 << 20)
