@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::{
     BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
-    Metric, TooDeep, base_blob,
+    Metric, ParsedSource, base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
     load_config, load_config_at, parse_source,
@@ -95,6 +95,14 @@ impl FileContext<'_> {
     }
 }
 
+/// Scans the files that `options` selects.
+///
+/// The depth guarantee of `parse_source` holds only inside
+/// `on_measurement_stack`, so a caller on a small stack must run this there.
+///
+/// # Errors
+///
+/// Fails on a bad config, an unreadable path, or a Git failure.
 pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
     let cwd = physical(options.cwd);
     let options = &ScanOptions {
@@ -301,17 +309,14 @@ fn scan_file(
             return Ok(());
         }
     };
-    let functions = match parse_source(language, &source) {
-        Ok(functions) => functions,
-        Err(error) if error.is::<TooDeep>() => {
-            result.unverified.push(Unverified {
-                file: display,
-                reason: error.to_string(),
-            });
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
+    let parsed = parse_source(language, &source)?;
+    if let Some(reason) = parsed.reason() {
+        result.unverified.push(Unverified {
+            file: display.clone(),
+            reason,
+        });
+    }
+    let functions = &parsed.functions;
     let context = FileContext {
         display: &display,
         matched: &matched_path,
@@ -334,7 +339,7 @@ fn scan_file(
     if let Some(changed) = options.changed.filter(|changed| changed.base.is_some())
         && !units_of.is_empty()
     {
-        compare_with_base(changed, &context, &functions, &units_of, result)?;
+        compare_with_base(changed, &context, &parsed, &units_of, result)?;
     }
     Ok(())
 }
@@ -348,23 +353,25 @@ fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {
 }
 
 /// Adds baseline fields to this file's violations, the last `units_of.len()`
-/// in `result`, where `units_of[i]` indexes the violating unit in `functions`.
+/// in `result`, where `units_of[i]` indexes the violating unit in
+/// `parsed.functions`.
 fn compare_with_base(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
-    functions: &[FunctionMetrics],
+    parsed: &ParsedSource,
     units_of: &[usize],
     result: &mut ScanResult,
 ) -> Result<()> {
+    let functions = &parsed.functions;
     let base = base_units(changed, file, result)?;
-    let pairing = base.as_deref().map_or_else(
+    let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| baseline::pair_units(functions, base),
+        |base| baseline::pair_units(parsed, base),
     );
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
         let base_unit = match pairing[index] {
-            Pairing::Paired(base_index) => base.as_deref().map(|units| &units[base_index]),
+            Pairing::Paired(base_index) => base.as_ref().map(|units| &units.functions[base_index]),
             Pairing::New | Pairing::Unmatched => None,
         };
         violation.baseline = Some(Baseline {
@@ -386,7 +393,7 @@ fn base_units(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
     result: &mut ScanResult,
-) -> Result<Option<Vec<FunctionMetrics>>> {
+) -> Result<Option<ParsedSource>> {
     let Some(commit) = changed.base.as_deref() else {
         return Ok(None);
     };

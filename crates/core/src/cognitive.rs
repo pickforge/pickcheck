@@ -6,7 +6,7 @@
 use tree_sitter::{Node, Parser};
 
 use crate::language::{
-    Language, exceeds_depth_limit, has_operator, is_dart_handler, is_function, node_text,
+    Language, Wrapper, exceeds_depth_limit, has_operator, is_dart_handler, is_function, node_text,
 };
 
 /// Header fields stay at the construct's own nesting level; every other part
@@ -390,7 +390,7 @@ impl Template<'_> {
     }
 
     fn expression(&self, text: &str, level: usize) -> usize {
-        let wrapped = format!("function expression() {{ return ({text}); }}");
+        let (wrapped, range) = Wrapper::Expression.wrap(text);
         let mut parser = Parser::new();
         if parser.set_language(&self.script.grammar()).is_err() {
             return 0;
@@ -398,7 +398,7 @@ impl Template<'_> {
         let Some(tree) = parser.parse(&wrapped, None) else {
             return 0;
         };
-        if exceeds_depth_limit(&tree) {
+        if exceeds_depth_limit(&tree, range) {
             return 0;
         }
         let Some(function) = first_function(tree.root_node(), self.script) else {
@@ -421,7 +421,7 @@ impl Template<'_> {
 
 /// Bindings (`each` parameters, `then` / `catch` values, snippet parameters)
 /// are declarations, not expressions, and are not scored.
-pub(crate) fn scored_raw_text(node: Node<'_>) -> bool {
+fn scored_raw_text(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };

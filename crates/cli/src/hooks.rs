@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -339,7 +339,10 @@ fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathB
     let result = gate.scan(cwd, &[path])?;
     match gate.feedback(cwd, &result)? {
         Some(report) => emit_feedback(harness, &report, false),
-        None => Ok(0),
+        None => {
+            note_unverified(&result);
+            Ok(0)
+        }
     }
 }
 
@@ -354,6 +357,7 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
     };
     let result = gate.scan(cwd, &[])?;
     let Some(report) = gate.feedback(cwd, &result)? else {
+        note_unverified(&result);
         return pass(input, stop);
     };
     if !stop {
@@ -544,7 +548,20 @@ fn open_session_or_note(
 }
 
 fn note_without_session(error: &anyhow::Error) {
-    eprintln!("note: hook session state unavailable, the hook runs without a session: {error:#}");
+    note(&format!(
+        "note: hook session state unavailable, the hook runs without a session: {error:#}\n"
+    ));
+}
+
+/// Notes the unverified files of a run that does not block on stderr.
+fn note_unverified(result: &ScanResult) {
+    note(&report::unverified_notes(result));
+}
+
+/// Writes `text` to stderr. A failed write is ignored, so it never changes
+/// the hook's result.
+fn note(text: &str) {
+    let _ = io::stderr().write_all(text.as_bytes());
 }
 
 fn emit_feedback(harness: Harness, reason: &str, stop: bool) -> Result<u8> {

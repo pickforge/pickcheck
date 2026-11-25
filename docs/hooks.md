@@ -29,6 +29,12 @@ Every automatic finding uses the compact report: totals, at most 20 failing or
 unverified paths, an omitted count, and a scoped command for detailed output.
 Passing functions are never printed.
 
+A run with no violations never blocks and prints nothing to stdout. When it has
+unverified files, such as a changed file too deep to measure, it writes one
+`note: UNVERIFIED <file>  <reason>` line per file to stderr, at most 20, and a
+`note: ... <n> more files` line for the rest. This holds for every harness, on
+both the edit and the completion event.
+
 The stop loop guard is shared across harnesses. Counters are keyed by the
 sanitized, length-capped session or conversation ID under `~/.pickforge/pickcheck/`, or
 `PICKCHECK_HOME` when set. The hook blocks the first `hook.max_blocks`
