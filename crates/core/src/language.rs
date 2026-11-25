@@ -325,11 +325,25 @@ impl fmt::Display for Unmeasured {
     }
 }
 
+/// A unit `parse_source` left out. Baseline matching still needs its name
+/// and span: it keeps the unit's place among units of the same name, and it
+/// still owns the closures inside it that were measured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeftOut {
+    pub function: String,
+    /// Byte range in the file, as `FunctionMetrics::span`.
+    pub span: (usize, usize),
+    /// A Svelte template unit.
+    pub template: bool,
+}
+
 /// The units `parse_source` measured in one file, and why it left others out.
 #[derive(Debug, Default)]
 pub struct ParsedSource {
     /// Measured units, in source order.
     pub functions: Vec<FunctionMetrics>,
+    /// Units left out, in source order.
+    pub left_out: Vec<LeftOut>,
     /// Sorted and without repeats; empty when every unit was measured.
     pub unmeasured: Vec<Unmeasured>,
 }
@@ -348,12 +362,23 @@ impl ParsedSource {
 
     fn extend(&mut self, other: Self) {
         self.functions.extend(other.functions);
+        self.left_out.extend(other.left_out);
         self.unmeasured.extend(other.unmeasured);
+    }
+
+    fn leave_out(&mut self, function: String, node: Node<'_>, offset: usize, template: bool) {
+        self.left_out.push(LeftOut {
+            function,
+            span: (node.start_byte() + offset, node.end_byte() + offset),
+            template,
+        });
+        self.unmeasured.push(Unmeasured::TooDeep);
     }
 
     fn finish(mut self) -> Self {
         self.functions
             .sort_by_key(|item| (item.line, item.end_line));
+        self.left_out.sort_by_key(|item| item.span);
         self.unmeasured.sort();
         self.unmeasured.dedup();
         self
@@ -519,7 +544,8 @@ fn parse_with_offset(language: Language, source: &str, offset: Offset) -> Result
     let mut parsed = ParsedSource::default();
     for (node, height) in function_units(tree.root_node(), language) {
         if height > MAX_SYNTAX_DEPTH {
-            parsed.unmeasured.push(Unmeasured::TooDeep);
+            let name = function_name(node, language, source);
+            parsed.leave_out(name, node, offset.byte, false);
         } else {
             parsed
                 .functions
@@ -1089,20 +1115,23 @@ fn annotation_kind(kind: &str) -> bool {
     kind == "metadata" || kind.contains("annotation")
 }
 
+/// The first `field` child in source order outside bodies and annotations,
+/// found without recursion because a unit left out as too deep is named too.
 fn descendant_field<'a>(node: Node<'a>, field: &str) -> Option<Node<'a>> {
-    if let Some(found) = node.child_by_field_name(field) {
-        return Some(found);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind().contains("body") || annotation_kind(child.kind()) {
-            continue;
+    let mut found = None;
+    walk_tree(node, |step| {
+        let Step::Enter(item, depth) = step else {
+            return false;
+        };
+        let skipped = depth > 0
+            && (!item.is_named() || item.kind().contains("body") || annotation_kind(item.kind()));
+        if found.is_some() || skipped {
+            return false;
         }
-        if let Some(found) = descendant_field(child, field) {
-            return Some(found);
-        }
-    }
-    None
+        found = item.child_by_field_name(field);
+        found.is_none()
+    });
+    found
 }
 
 fn qualify_method(node: Node<'_>, language: Language, name: &str, source: &str) -> String {
@@ -1340,7 +1369,7 @@ fn parse_svelte(source: &str) -> Result<ParsedSource> {
             .flatten();
         match measured {
             Some(unit) => parsed.functions.push(unit),
-            None => parsed.unmeasured.push(Unmeasured::TooDeep),
+            None => parsed.leave_out(template_unit_name(unit, source), unit, 0, true),
         }
     }
     Ok(parsed.finish())

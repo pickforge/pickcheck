@@ -712,6 +712,58 @@ fn base_units_that_were_too_deep_count_as_missing() {
 }
 
 #[test]
+fn closures_keep_an_owner_that_was_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let closure = "[1].map((a, b, c, d, e, f, g) => a);";
+    let file_level = format!("function deep(a) {{ return a; }}\n{closure}\n");
+    fs::write(root.join("deep.js"), file_level).unwrap();
+    commit_all(root, "initial");
+    git(root, &["checkout", "-qb", "feature"]);
+    let inside = format!(
+        "function deep(a) {{ {closure} return {}a; }}\n",
+        "a+".repeat(3_100)
+    );
+    fs::write(root.join("deep.js"), &inside).unwrap();
+    let fail_on = ["--fail-on", "new,worsened,unmatched"];
+    let args = [
+        &["check", "--verbose", "--base", "main"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let moved = command_output(root, &args);
+    assert_eq!(moved.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&moved.stdout),
+        "FAIL deep.js:1 <anonymous>  params 7 > 6  unmatched\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+
+    // The same closure under the same left-out owner at both revisions pairs.
+    commit_all(root, "inside");
+    fs::write(
+        root.join("deep.js"),
+        inside.replace("return a+", "return b+"),
+    )
+    .unwrap();
+    let args = [
+        &["check", "--verbose", "--base", "HEAD"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let kept = command_output(root, &args);
+    assert_eq!(kept.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&kept.stdout),
+        "WARN deep.js:1 <anonymous>  params 7 > 6  unchanged\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+}
+
+#[test]
 fn hooks_that_do_not_block_note_unverified_files() {
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

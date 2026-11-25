@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::{
     BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric,
-    base_blob,
+    ParsedSource, base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
     load_config, parse_source,
@@ -307,7 +307,7 @@ fn scan_file(
             reason,
         });
     }
-    let functions = parsed.functions;
+    let functions = &parsed.functions;
     let context = FileContext {
         display: &display,
         matched: &matched_path,
@@ -330,29 +330,31 @@ fn scan_file(
     if let Some(changed) = options.changed.filter(|changed| changed.base.is_some())
         && !units_of.is_empty()
     {
-        compare_with_base(changed, &context, &functions, &units_of, result)?;
+        compare_with_base(changed, &context, &parsed, &units_of, result)?;
     }
     Ok(())
 }
 
 /// Adds baseline fields to this file's violations, the last `units_of.len()`
-/// in `result`, where `units_of[i]` indexes the violating unit in `functions`.
+/// in `result`, where `units_of[i]` indexes the violating unit in
+/// `parsed.functions`.
 fn compare_with_base(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
-    functions: &[FunctionMetrics],
+    parsed: &ParsedSource,
     units_of: &[usize],
     result: &mut ScanResult,
 ) -> Result<()> {
+    let functions = &parsed.functions;
     let base = base_units(changed, file, result)?;
-    let pairing = base.as_deref().map_or_else(
+    let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| baseline::pair_units(functions, base),
+        |base| baseline::pair_units(parsed, base),
     );
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
         let base_unit = match pairing[index] {
-            Pairing::Paired(base_index) => base.as_deref().map(|units| &units[base_index]),
+            Pairing::Paired(base_index) => base.as_ref().map(|units| &units.functions[base_index]),
             Pairing::New | Pairing::Unmatched => None,
         };
         violation.baseline = Some(Baseline {
@@ -374,7 +376,7 @@ fn base_units(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
     result: &mut ScanResult,
-) -> Result<Option<Vec<FunctionMetrics>>> {
+) -> Result<Option<ParsedSource>> {
     let Some(commit) = changed.base.as_deref() else {
         return Ok(None);
     };
@@ -391,9 +393,7 @@ fn base_units(
         BaseBlob::Content(bytes) => String::from_utf8(bytes).ok(),
     };
     let units = content.and_then(|source| {
-        Language::from_path(path)
-            .and_then(|language| parse_source(language, &source).ok())
-            .map(|parsed| parsed.functions)
+        Language::from_path(path).and_then(|language| parse_source(language, &source).ok())
     });
     if units.is_none() {
         result.notes.push(format!(

@@ -642,8 +642,11 @@ Base content:
   path, or fails to parse has no base, and the report adds
   `note: <path> has no readable base; its functions count as new`, where
   `<path>` is the reported path.
-- A base unit that the scan leaves out, such as one too deep to measure, is
-  matched as if it did not exist. This adds no note.
+- A unit that the scan leaves out, such as one too deep to measure, still
+  takes part in matching at either revision, with its name and span. It keeps
+  its place among units of the same name and still owns the anonymous units
+  inside it. A unit paired with a base unit that was left out counts as
+  unpaired. This adds no note.
 
 Matching, per file, runs over every unit of both complete files, before any
 filtering by touched spans or violations, and ownership follows the syntax tree
@@ -655,6 +658,8 @@ rather than line spans:
   extras stay unpaired. A renamed function does not match its old name.
 - An `<anonymous>` unit belongs to its innermost enclosing named unit, at any
   depth through other anonymous units, or to the file when none encloses it.
+  A named unit that was left out still owns its anonymous units, so a closure
+  inside it never pairs with a closure of another owner.
   The file owner is paired whenever the file has a base. Anonymous units pair
   in source order when their owner is paired and has the same number of
   anonymous units at both revisions.
