@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use crate::cognitive;
+use crate::cognitive::{self, Increment};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
@@ -40,6 +40,51 @@ pub struct FunctionMetrics {
     /// A Dart `build` method, the only unit `widget_depth` applies to.
     #[serde(skip)]
     pub widget: bool,
+}
+
+/// The cognitive increments of one unit, which `explain` pairs with the
+/// unit's `span` and `function`.
+pub(crate) struct TracedUnit {
+    pub(crate) span: (usize, usize),
+    pub(crate) function: String,
+    pub(crate) increments: Vec<Increment>,
+}
+
+/// Units measured so far and, when the caller asks for them, the cognitive
+/// increments of each.
+struct Units<'t> {
+    list: Vec<FunctionMetrics>,
+    trace: Option<&'t mut Vec<TracedUnit>>,
+}
+
+impl<'t> Units<'t> {
+    fn new(trace: Option<&'t mut Vec<TracedUnit>>) -> Self {
+        Self {
+            list: Vec::new(),
+            trace,
+        }
+    }
+
+    /// Sets the unit's `cognitive` with `measure`, which pushes its
+    /// increments into the sink it gets when the caller traces.
+    fn push(
+        &mut self,
+        mut unit: FunctionMetrics,
+        measure: impl FnOnce(Option<&mut Vec<Increment>>) -> usize,
+    ) {
+        if let Some(trace) = self.trace.as_deref_mut() {
+            let mut increments = Vec::new();
+            unit.cognitive = measure(Some(&mut increments));
+            trace.push(TracedUnit {
+                span: unit.span,
+                function: unit.function.clone(),
+                increments,
+            });
+        } else {
+            unit.cognitive = measure(None);
+        }
+        self.list.push(unit);
+    }
 }
 
 /// Where a parsed fragment starts in its file.
@@ -375,28 +420,40 @@ pub(crate) fn exceeds_depth_limit(tree: &Tree) -> bool {
 }
 
 pub fn parse_source(language: Language, source: &str) -> Result<Vec<FunctionMetrics>> {
+    parse_units(language, source, None)
+}
+
+/// `parse_source`, plus the cognitive increments of every unit pushed into
+/// `trace` when it is given.
+pub(crate) fn parse_units(
+    language: Language,
+    source: &str,
+    trace: Option<&mut Vec<TracedUnit>>,
+) -> Result<Vec<FunctionMetrics>> {
     if language == Language::Svelte {
-        return parse_svelte(source);
+        return parse_svelte(source, trace);
     }
-    parse_with_offset(language, source, Offset::default())
+    parse_with_offset(language, source, Offset::default(), trace)
 }
 
 fn parse_with_offset(
     language: Language,
     source: &str,
     offset: Offset,
+    trace: Option<&mut Vec<TracedUnit>>,
 ) -> Result<Vec<FunctionMetrics>> {
     let tree = parse_tree(&language.grammar(), source)?;
     let lines = LineIndex::new(source, tree.root_node());
-    let mut functions = Vec::new();
+    let mut units = Units::new(trace);
     collect_functions(
         tree.root_node(),
         language,
         source,
         offset,
         &lines,
-        &mut functions,
+        &mut units,
     );
+    let mut functions = units.list;
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
 }
@@ -407,10 +464,13 @@ fn collect_functions(
     source: &str,
     offset: Offset,
     lines: &LineIndex,
-    output: &mut Vec<FunctionMetrics>,
+    output: &mut Units<'_>,
 ) {
     if is_function(language, node.kind()) {
-        output.push(measure_function(node, language, source, offset, lines));
+        output.push(
+            measure_function(node, language, source, offset, lines),
+            |trace| cognitive::measure_function(node, language, source, offset.line, trace),
+        );
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -418,6 +478,7 @@ fn collect_functions(
     }
 }
 
+/// Every metric of one function but `cognitive`, which `Units::push` sets.
 fn measure_function(
     node: Node<'_>,
     language: Language,
@@ -440,7 +501,7 @@ fn measure_function(
         line: start + offset.line,
         end_line: end + offset.line,
         complexity: score.complexity,
-        cognitive: cognitive::measure_function(node, language, source),
+        cognitive: 0,
         depth: score.depth,
         lines: lines.significant_lines(source, start, end, node),
         params: parameter_count(node, language, source),
@@ -1206,7 +1267,10 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
 
-fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
+fn parse_svelte(
+    source: &str,
+    mut trace: Option<&mut Vec<TracedUnit>>,
+) -> Result<Vec<FunctionMetrics>> {
     let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
     let mut scripts = Vec::new();
     collect_scripts(tree.root_node(), source, &mut scripts);
@@ -1219,6 +1283,7 @@ fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
                 line: content.start_position().row,
                 byte: content.start_byte(),
             },
+            trace.as_deref_mut(),
         )?);
     }
     let template_language = if scripts
@@ -1233,6 +1298,7 @@ fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
         tree.root_node(),
         source,
         template_language,
+        trace,
     )?);
     functions.sort_by_key(|item| (item.line, item.end_line));
     Ok(functions)
@@ -1295,19 +1361,20 @@ const TEMPLATE_BLOCKS: [&str; 3] = ["if_statement", "each_statement", "await_sta
 
 /// Template units collected so far, plus the grammar of the component's
 /// `<script>`, which `cognitive` also uses to parse template expressions.
-struct TemplateUnits {
+struct TemplateUnits<'t> {
     script: Language,
-    list: Vec<FunctionMetrics>,
+    units: Units<'t>,
 }
 
 fn measure_template(
     root: Node<'_>,
     source: &str,
     script: Language,
+    trace: Option<&mut Vec<TracedUnit>>,
 ) -> Result<Vec<FunctionMetrics>> {
     let mut units = TemplateUnits {
         script,
-        list: Vec::new(),
+        units: Units::new(trace),
     };
     let mut score = Score {
         complexity: 1,
@@ -1318,9 +1385,10 @@ fn measure_template(
     let mut unit = template_metrics("<template>".to_owned(), root, &score);
     unit.line = 1;
     unit.end_line = source.lines().count().max(1);
-    unit.cognitive = cognitive::measure_template_unit(root, source, script, true);
-    units.list.push(unit);
-    Ok(units.list)
+    units.units.push(unit, |trace| {
+        cognitive::measure_template_unit(root, source, script, true, trace)
+    });
+    Ok(units.units.list)
 }
 
 fn measure_svelte_node(
@@ -1329,17 +1397,13 @@ fn measure_svelte_node(
     depth: usize,
     root: bool,
     score: &mut Score,
-    units: &mut TemplateUnits,
+    units: &mut TemplateUnits<'_>,
 ) -> Result<()> {
     match node.kind() {
         "script_element" | "style_element" => {}
-        "snippet_statement" => {
-            let unit = measure_template_unit(node, source, units)?;
-            units.list.push(unit);
-        }
+        "snippet_statement" => measure_template_unit(node, source, units)?,
         kind if root && TEMPLATE_BLOCKS.contains(&kind) => {
-            let unit = measure_template_unit(node, source, units)?;
-            units.list.push(unit);
+            measure_template_unit(node, source, units)?;
         }
         _ => score_svelte_node(node, source, depth, root, score, units)?,
     }
@@ -1349,17 +1413,20 @@ fn measure_svelte_node(
 fn measure_template_unit(
     node: Node<'_>,
     source: &str,
-    units: &mut TemplateUnits,
-) -> Result<FunctionMetrics> {
+    units: &mut TemplateUnits<'_>,
+) -> Result<()> {
     let mut score = Score {
         complexity: 1,
         depth: 0,
         bool_ops: 0,
     };
     score_svelte_node(node, source, 0, false, &mut score, units)?;
-    let mut unit = template_metrics(template_unit_name(node, source), node, &score);
-    unit.cognitive = cognitive::measure_template_unit(node, source, units.script, false);
-    Ok(unit)
+    let unit = template_metrics(template_unit_name(node, source), node, &score);
+    let script = units.script;
+    units.units.push(unit, |trace| {
+        cognitive::measure_template_unit(node, source, script, false, trace)
+    });
+    Ok(())
 }
 
 fn template_unit_name(node: Node<'_>, source: &str) -> String {
@@ -1406,7 +1473,7 @@ fn score_svelte_node(
     depth: usize,
     root: bool,
     score: &mut Score,
-    units: &mut TemplateUnits,
+    units: &mut TemplateUnits<'_>,
 ) -> Result<()> {
     if matches!(
         node.kind(),
@@ -1439,7 +1506,7 @@ fn score_expression(text: &str, script: Language) -> Result<Score> {
         depth: 0,
         bool_ops: 0,
     };
-    let wrapped = format!("function expression() {{ return ({text}); }}");
+    let wrapped = cognitive::wrap_expression(text);
     let tree = parse_tree(&script.grammar(), &wrapped)?;
     if let Some(function) = cognitive::first_function(tree.root_node(), script) {
         let body = function.child_by_field_name("body").unwrap_or(function);
