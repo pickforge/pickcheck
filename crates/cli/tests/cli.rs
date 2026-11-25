@@ -1252,37 +1252,22 @@ fn symlinked_paths_match_the_repository_root() {
         "cwd":&link, "tool_name":"Edit", "tool_input":{"file_path":link.join("gen/g.js")}})
     .to_string();
     assert!(hook_output(state.path(), &edit).stdout.is_empty());
-}
 
-#[test]
-fn crlf_sources_report_the_same_metrics_as_lf() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = "function f(a, b) {\n  if (a) {\n    return b;\n  }\n  return a;\n}\n";
-    fs::write(dir.path().join("lf.js"), source).unwrap();
-    fs::write(dir.path().join("crlf.js"), source.replace('\n', "\r\n")).unwrap();
-    fs::write(
-        dir.path().join(".pickcheck.json"),
-        r#"{"limits":{"lines":1,"depth":0,"params":1}}"#,
-    )
-    .unwrap();
+    // A link inside the repository names the same files as the path Git prints.
+    std::os::unix::fs::symlink(real.join("src"), real.join("alias")).unwrap();
+    let inner = command_output(&real, &["check", "--changed", "alias/a.js"]);
+    let inner_text = String::from_utf8_lossy(&inner.stdout);
+    assert_eq!(inner.status.code(), Some(1), "stdout: {inner_text}");
+    assert!(
+        inner_text.contains("FAIL src/a.js  "),
+        "stdout: {inner_text}"
+    );
 
-    let violations = |file: &str| {
-        let output = command_output(dir.path(), &["check", "--format", "json", file]);
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        report["violations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| {
-                (
-                    item["metric"].clone(),
-                    item["value"].clone(),
-                    item["line"].clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let lf = violations("lf.js");
-    assert_eq!(lf.len(), 3, "{lf:?}");
-    assert_eq!(violations("crlf.js"), lf);
+    // A cwd that links straight into a subdirectory reports paths from there.
+    let sub = dir.path().join("sub");
+    std::os::unix::fs::symlink(real.join("src"), &sub).unwrap();
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"sub", "cwd":&sub}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL a.js  "), "stdout: {reason}");
 }

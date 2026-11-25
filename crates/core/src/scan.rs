@@ -99,6 +99,13 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         .into_iter()
         .map(|root| spelled_under(&match_base, root))
         .collect::<Vec<_>>();
+    let cwd = spelled_under(&match_base, options.cwd.to_path_buf());
+    let options = &ScanOptions {
+        cwd: &cwd,
+        paths: options.paths,
+        explicit_config: options.explicit_config,
+        changed: options.changed,
+    };
     let files = if let Some(changed) = options.changed.filter(|changed| !changed.fallback) {
         collect_changed_files(changed, &roots, !options.paths.is_empty())?
     } else {
@@ -146,12 +153,9 @@ fn match_base(options: &ScanOptions<'_>, roots: &[PathBuf]) -> Result<PathBuf> {
 }
 
 /// Spells `root` under `base` when it reaches the same file through another
-/// path, such as a symlink, so ignore globs, the changed set, and reports
-/// see one spelling.
+/// path, such as a symlink or a Windows short name, also one inside `base`,
+/// so ignore globs, the changed set, and reports see one spelling.
 fn spelled_under(base: &Path, root: PathBuf) -> PathBuf {
-    if root.starts_with(base) {
-        return root;
-    }
     let (Ok(canonical_base), Ok(canonical_root)) = (base.canonicalize(), root.canonicalize())
     else {
         return root;

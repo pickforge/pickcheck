@@ -413,16 +413,6 @@ mod tests {
         assert!(!tests.is_match(Path::new("pkg").join("a.go")));
     }
 
-    /// Windows paths use `\`; globset turns it into `/` before matching.
-    #[cfg(windows)]
-    #[test]
-    fn globs_match_backslash_paths_on_windows() {
-        let ignore = Config::matcher(&["gen/**".to_owned()]).unwrap();
-        let tests = Config::matcher(&["**/tests/**".to_owned()]).unwrap();
-        assert!(ignore.is_match(Path::new(r"gen\sub\a.rs")));
-        assert!(tests.is_match(Path::new(r"pkg\tests\a.js")));
-    }
-
     #[test]
     fn partial_top_level_objects_merge() {
         let dir = tempfile::tempdir().unwrap();

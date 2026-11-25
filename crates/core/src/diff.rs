@@ -212,9 +212,11 @@ fn spelled_like(cwd: &Path, root: PathBuf) -> PathBuf {
         .map_or(root, Path::to_path_buf)
 }
 
-/// A path Git printed, which always uses `/`, with native separators.
+/// A path Git printed, which always uses `/`, with native separators. The
+/// separators change in the string, because pushing a component such as
+/// `a:b.js` would replace the path on Windows.
 fn git_path(path: &str) -> PathBuf {
-    path.split('/').collect()
+    PathBuf::from(path.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
 /// A relative path in the `/` form Git expects.
