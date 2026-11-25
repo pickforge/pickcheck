@@ -521,11 +521,13 @@ mod tests {
         for (given, expected) in [
             ("gone/../a.js", "/no-such-root/work/a.js"),
             ("./gone/./b.js", "/no-such-root/work/gone/b.js"),
-            ("../../../c.js", "/c.js"),
         ] {
             assert_eq!(absolute(cwd, Path::new(given)), Path::new(expected));
         }
-        assert_eq!(normalize(Path::new("../../d.js")), Path::new("../../d.js"));
+        // `..` stops at the root, and stays when there is nothing to leave.
+        for (given, expected) in [("/a/../../c.js", "/c.js"), ("../../d.js", "../../d.js")] {
+            assert_eq!(normalize(Path::new(given)), Path::new(expected));
+        }
     }
 
     #[test]
