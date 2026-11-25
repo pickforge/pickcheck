@@ -9,8 +9,8 @@ use ignore::WalkBuilder;
 use serde::Serialize;
 
 use crate::{
-    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric, TooDeep,
-    base_blob,
+    BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
+    Metric, TooDeep, base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
     load_config, load_config_at, parse_source,
@@ -65,8 +65,8 @@ pub struct ScanOptions<'a> {
     pub explicit_config: Option<&'a Path>,
     pub changed: Option<&'a ChangedFiles>,
     /// Read the repository config of each file from this commit instead of
-    /// the working tree. Applies only with `changed`.
-    pub config_commit: Option<&'a str>,
+    /// the working tree.
+    pub commit_configs: Option<&'a CommitConfigs>,
 }
 
 struct ScanFile {
@@ -102,7 +102,7 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         paths: options.paths,
         explicit_config: options.explicit_config,
         changed: options.changed,
-        config_commit: options.config_commit,
+        commit_configs: options.commit_configs,
     };
     let roots = scan_roots(options);
     let match_base = match_base(options, &roots)?;
@@ -114,10 +114,11 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
     };
     let mut result = ScanResult::default();
     if options.changed.is_some_and(config_changed) {
-        result.notes.push(match options.config_commit {
-            Some(commit) => {
-                format!(".pickcheck.json changed in this diff; the config comes from {commit}")
-            }
+        result.notes.push(match options.commit_configs {
+            Some(configs) => format!(
+                ".pickcheck.json changed in this diff; the config comes from {}",
+                configs.commit()
+            ),
             None => ".pickcheck.json changed in this diff".to_owned(),
         });
     }
@@ -339,9 +340,9 @@ fn scan_file(
 }
 
 fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {
-    let resolution = match (options.config_commit, options.changed) {
-        (Some(commit), Some(changed)) => load_config_at(path, &changed.repo_root, commit)?,
-        _ => load_config(path, options.explicit_config)?,
+    let resolution = match options.commit_configs {
+        Some(configs) => load_config_at(path, configs)?,
+        None => load_config(path, options.explicit_config)?,
     };
     Ok(resolution.config)
 }

@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
@@ -9,7 +10,10 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-use crate::{BaseBlob, Metric, Status, base_blob};
+use crate::{
+    Metric, Status,
+    diff::{named_entries, read_blob},
+};
 
 const DEFAULTS: &str = include_str!("../../../config.default.json");
 const LIMIT: &str = "a non-negative integer or null";
@@ -177,19 +181,85 @@ pub fn load_config(start: &Path, explicit: Option<&Path>) -> Result<ConfigResolu
     resolve(value, chain)
 }
 
-/// Like `load_config`, but the repository layer comes from `commit`: the
+/// The repository configs of one commit: listed once, each read on first
+/// use.
+pub struct CommitConfigs {
+    repo_root: PathBuf,
+    commit: String,
+    /// By directory relative to the root.
+    entries: BTreeMap<PathBuf, CommitConfig>,
+}
+
+struct CommitConfig {
+    /// `None` for an entry that is not a file.
+    object: Option<String>,
+    content: OnceCell<Option<Vec<u8>>>,
+}
+
+impl CommitConfigs {
+    pub fn read(repo_root: &Path, commit: &str) -> Result<Self> {
+        let entries = named_entries(repo_root, commit, REPO_CONFIG)?
+            .into_iter()
+            .map(|(directory, object)| {
+                let content = OnceCell::new();
+                (directory, CommitConfig { object, content })
+            })
+            .collect();
+        Ok(Self {
+            repo_root: repo_root.to_path_buf(),
+            commit: commit.to_owned(),
+            entries,
+        })
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    /// The nearest config from `start` up to the root, labelled
+    /// `<commit>:<path>`.
+    fn nearest(&self, start: &Path) -> Result<Option<(PathBuf, String)>> {
+        let start = if start.is_file() {
+            start.parent().unwrap_or(start)
+        } else {
+            start
+        };
+        for directory in start.ancestors() {
+            let Ok(relative) = directory.strip_prefix(&self.repo_root) else {
+                break;
+            };
+            let Some(entry) = self.entries.get(relative) else {
+                continue;
+            };
+            let label = format!("{}:{}", self.commit, relative.join(REPO_CONFIG).display());
+            let content = entry.content.get_or_init(|| {
+                let object = entry.object.as_deref()?;
+                read_blob(&self.repo_root, object)
+            });
+            let Some(bytes) = content else {
+                bail!("cannot read config {label}");
+            };
+            let text = String::from_utf8(bytes.clone())
+                .with_context(|| format!("invalid JSON in {label}"))?;
+            return Ok(Some((PathBuf::from(label), text)));
+        }
+        Ok(None)
+    }
+}
+
+/// Like `load_config`, but the repository layer comes from `configs`: the
 /// nearest `.pickcheck.json` in that commit's tree from `start` up to the
 /// repository root, then the working tree above the root. A `start` outside
 /// the repository resolves as `load_config` does.
-pub fn load_config_at(start: &Path, repo_root: &Path, commit: &str) -> Result<ConfigResolution> {
-    if !start.starts_with(repo_root) {
+pub fn load_config_at(start: &Path, configs: &CommitConfigs) -> Result<ConfigResolution> {
+    if !start.starts_with(&configs.repo_root) {
         return load_config(start, None);
     }
     let (mut value, mut chain) = user_layers()?;
-    if let Some((label, text)) = committed_repo_config(start, repo_root, commit)? {
+    if let Some((label, text)) = configs.nearest(start)? {
         merge_text(&mut value, &text, &label)?;
         chain.push(label);
-    } else if let Some(path) = repo_root.parent().and_then(nearest_repo_config) {
+    } else if let Some(path) = configs.repo_root.parent().and_then(nearest_repo_config) {
         merge_file(&mut value, &path)?;
         chain.push(path);
     }
@@ -211,36 +281,6 @@ fn resolve(value: Value, chain: Vec<PathBuf>) -> Result<ConfigResolution> {
     let mut config: Config = serde_json::from_value(value).context("invalid configuration")?;
     config.hook.max_blocks = config.hook.max_blocks.max(1);
     Ok(ConfigResolution { config, chain })
-}
-
-/// The nearest repository config at `commit`, labelled `<commit>:<path>`.
-fn committed_repo_config(
-    start: &Path,
-    repo_root: &Path,
-    commit: &str,
-) -> Result<Option<(PathBuf, String)>> {
-    let start = if start.is_file() {
-        start.parent().unwrap_or(start)
-    } else {
-        start
-    };
-    for directory in start.ancestors() {
-        let Ok(relative) = directory.strip_prefix(repo_root) else {
-            break;
-        };
-        let path = relative.join(REPO_CONFIG);
-        let label = PathBuf::from(format!("{commit}:{}", path.display()));
-        match base_blob(repo_root, commit, &path) {
-            BaseBlob::Missing => {}
-            BaseBlob::Unreadable => bail!("cannot read config {}", label.display()),
-            BaseBlob::Content(bytes) => {
-                let text = String::from_utf8(bytes)
-                    .with_context(|| format!("invalid JSON in {}", label.display()))?;
-                return Ok(Some((label, text)));
-            }
-        }
-    }
-    Ok(None)
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -840,13 +880,14 @@ mod tests {
         fs::write(root.join(REPO_CONFIG), r#"{"limits":{"depth":null}}"#).unwrap();
         fs::remove_file(package.join(REPO_CONFIG)).unwrap();
 
-        let top = load_config_at(&root, &root, &commit).unwrap();
+        let configs = CommitConfigs::read(&root, &commit).unwrap();
+        let top = load_config_at(&root, &configs).unwrap();
         assert_eq!(top.config.limits.depth, Some(2));
         assert_eq!(
             top.chain.last().unwrap(),
             &PathBuf::from(format!("{commit}:{REPO_CONFIG}"))
         );
-        let nested = load_config_at(&package.join("a.js"), &root, &commit).unwrap();
+        let nested = load_config_at(&package.join("a.js"), &configs).unwrap();
         assert_eq!(nested.config.limits.params, Some(1));
         assert_eq!(nested.config.limits.depth, Some(4));
         assert_eq!(load_config(&root, None).unwrap().config.limits.depth, None);
@@ -854,7 +895,8 @@ mod tests {
         fs::write(root.join(REPO_CONFIG), "{").unwrap();
         git(&root, &["commit", "-qam", "broken"]);
         let broken = git(&root, &["rev-parse", "HEAD"]);
-        let error = load_config_at(&root, &root, &broken).unwrap_err();
+        let configs = CommitConfigs::read(&root, &broken).unwrap();
+        let error = load_config_at(&root, &configs).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!("invalid JSON in {broken}:{REPO_CONFIG}")

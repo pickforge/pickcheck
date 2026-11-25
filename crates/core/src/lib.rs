@@ -9,10 +9,13 @@ mod metric;
 pub mod scan;
 
 pub use baseline::{MetricValues, Pairing, Status, pair_units};
-pub use config::{Config, ConfigResolution, HookConfig, Limits, load_config, load_config_at};
+pub use config::{
+    CommitConfigs, Config, ConfigResolution, HookConfig, Limits, load_config, load_config_at,
+};
 pub use diff::{
-    BaseBlob, ChangedFiles, LineRange, UnusableBase, base_blob, changed_files, changed_files_since,
-    head_commit, parse_diff_hunks, physical,
+    BaseBlob, ChangedFiles, DiffStatus, LineRange, Pathspec, Repository, base_blob, changed_files,
+    changed_files_since, diff_spans, diff_status, merge_base_with_head, parse_diff_hunks, physical,
+    repository, untracked_files,
 };
 pub use language::{
     FunctionMetrics, Language, MAX_SYNTAX_DEPTH, TooDeep, coverage_unknowns, grammar_inventory,

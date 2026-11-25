@@ -187,7 +187,7 @@ fn run_check(
         paths,
         explicit_config: config,
         changed: changes.as_ref(),
-        config_commit: None,
+        commit_configs: None,
     })?;
     match format {
         Format::Text => {
