@@ -108,11 +108,13 @@ fn json_carries_metrics_limits_and_increments() {
     );
     assert_eq!(
         unit["increments"][2],
-        serde_json::json!({"line": 3, "add": 1, "construct": "sequence &&", "nesting": null})
+        serde_json::json!({"line": 3, "column": 9, "add": 1, "construct": "sequence &&",
+                           "nesting": null})
     );
     assert_eq!(
         unit["increments"][5],
-        serde_json::json!({"line": 7, "add": 4, "construct": "ternary", "nesting": 3})
+        serde_json::json!({"line": 7, "column": 13, "add": 4, "construct": "ternary",
+                           "nesting": 3})
     );
     assert_eq!(unit["increments"].as_array().unwrap().len(), 6);
 }
@@ -170,7 +172,12 @@ fn errors_exit_2_with_one_line() {
     fs::write(dir.path().join("Main.kt"), "fun main() {}\n").unwrap();
     let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
     fs::write(dir.path().join("deep.js"), deep).unwrap();
-    let cases: [(&[&str], &str); 8] = [
+    fs::write(
+        dir.path().join("case.svelte"),
+        "<script>const text = \"</scripture>\"; function bad(a) { return a; }</script>\n",
+    )
+    .unwrap();
+    let cases: [(&[&str], &str); 9] = [
         (&["missing.js"], "cannot read missing.js"),
         (&["Main.kt"], "no grammar for Main.kt"),
         (&["visit.js:40"], "no unit in visit.js contains line 40"),
@@ -184,6 +191,10 @@ fn errors_exit_2_with_one_line() {
         (
             &["deep.js"],
             "cannot explain deep.js: syntax nesting too deep to measure",
+        ),
+        (
+            &["case.svelte"],
+            "cannot explain case.svelte: script block could not be parsed",
         ),
     ];
     for (args, message) in cases {

@@ -1,11 +1,11 @@
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use pickcheck_core::{ScanOptions, changed_files, load_config, scan};
+use pickcheck_core::{ScanOptions, ScanResult, changed_files, load_config, physical, scan};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -168,6 +168,13 @@ fn file_path(input: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Notes the unverified files of a run that does not block on stderr. A
+/// failed write is ignored, so it never changes the hook's result.
+fn note_unverified(result: &ScanResult) {
+    let notes = report::unverified_notes(result);
+    let _ = io::stderr().write_all(notes.as_bytes());
+}
+
 fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> Result<u8> {
     let cwd = working_directory(input);
     let result = scan(&ScanOptions {
@@ -177,6 +184,7 @@ fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> R
         changed: None,
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         return Ok(0);
     }
     emit_feedback(
@@ -198,6 +206,7 @@ fn report_post_changed(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         return Ok(0);
     }
     emit_feedback(
@@ -220,6 +229,7 @@ fn report_stop(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         reset_counter(&input.session_id)?;
         return Ok(0);
     }
@@ -279,18 +289,27 @@ fn emit_feedback(harness: Harness, reason: &str, stop: bool) -> Result<u8> {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("PICKCHECK_HOME") {
+    state_dir_from(env::var_os("PICKCHECK_HOME"), dirs::home_dir())
+}
+
+fn state_dir_from(
+    pickcheck_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = pickcheck_home {
         return Ok(PathBuf::from(path));
     }
-    let home = dirs_home().context("cannot determine home directory")?;
-    Ok(home.join(".pickforge/pickcheck"))
+    let home = home.context("cannot determine home directory")?;
+    Ok(home.join(".pickforge").join("pickcheck"))
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
-}
-
+/// The physical working directory, so the config lookup for the loop guard
+/// walks the same ancestors as the scan.
 fn working_directory(input: &HookInput) -> PathBuf {
+    physical(&requested_directory(input))
+}
+
+fn requested_directory(input: &HookInput) -> PathBuf {
     input
         .cwd
         .clone()
@@ -437,6 +456,21 @@ mod tests {
         assert!(parsed.session_id.is_empty());
         assert!(parsed.cwd.is_none());
         assert!(matches!(classify(Harness::Claude, &parsed), Event::Ignore));
+    }
+
+    #[test]
+    fn state_dir_prefers_pickcheck_home_then_platform_home() {
+        let home = PathBuf::from("home");
+        assert_eq!(
+            state_dir_from(Some("override".into()), Some(home.clone())).unwrap(),
+            Path::new("override")
+        );
+        assert_eq!(
+            state_dir_from(None, Some(home)).unwrap(),
+            Path::new("home").join(".pickforge").join("pickcheck")
+        );
+        let error = state_dir_from(None, None).unwrap_err();
+        assert_eq!(error.to_string(), "cannot determine home directory");
     }
 
     #[test]

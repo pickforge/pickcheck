@@ -6,17 +6,55 @@
 use serde::Serialize;
 use tree_sitter::{Node, Parser};
 
-use crate::language::{Language, exceeds_depth_limit, is_dart_handler, is_function, node_text};
+use crate::language::{
+    Language, Wrapper, exceeds_depth_limit, is_dart_handler, is_function, node_text,
+};
 
-/// One cognitive increment: where it sits in the file, how much it adds, the
-/// construct that adds it, and the nesting level it paid for (`None` for flat
-/// increments).
+/// One cognitive increment: where it sits in the file (1-based line, and
+/// 1-based column in bytes), how much it adds, the construct that adds it, and
+/// the nesting level it paid for (`None` for flat increments).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Increment {
     pub line: usize,
+    pub column: usize,
     pub add: usize,
     pub construct: &'static str,
     pub nesting: Option<usize>,
+}
+
+/// Where the text a walk parses starts in the file, so that every increment
+/// gets its file position. `skip` is the length of the wrapper prefix that a
+/// template text is parsed behind. The prefix holds no line break, so it
+/// shifts only the columns of the text's first row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Origin {
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) skip: usize,
+}
+
+impl Origin {
+    fn increment(
+        self,
+        node: Node<'_>,
+        add: usize,
+        construct: &'static str,
+        nesting: Option<usize>,
+    ) -> Increment {
+        let point = node.start_position();
+        let column = if point.row == 0 {
+            self.column + point.column.saturating_sub(self.skip)
+        } else {
+            point.column
+        };
+        Increment {
+            line: self.row + point.row + 1,
+            column: column + 1,
+            add,
+            construct,
+            nesting,
+        }
+    }
 }
 
 /// Header fields stay at the construct's own nesting level; every other part
@@ -48,14 +86,14 @@ enum Kind {
     Sequence(&'static str),
 }
 
-/// Scores one function. `row_base` is the file row where `source` starts (a
+/// Scores one function. `origin` is where `source` starts in the file (a
 /// Svelte `<script>` block is parsed on its own). With `trace`, every
-/// increment is also pushed there, with its file line.
+/// increment is also pushed there, with its file position.
 pub(crate) fn measure_function(
     node: Node<'_>,
     language: Language,
     source: &str,
-    row_base: usize,
+    origin: Origin,
     trace: Option<&mut Vec<Increment>>,
 ) -> usize {
     let mut walk = Walk {
@@ -65,7 +103,7 @@ pub(crate) fn measure_function(
         template: false,
         score: 0,
         trace,
-        row_base,
+        origin,
     };
     walk.visit(node.child_by_field_name("body").unwrap_or(node), 0);
     walk.score
@@ -81,8 +119,8 @@ struct Walk<'s, 't> {
     score: usize,
     /// Present only when the caller asks for the increments.
     trace: Option<&'t mut Vec<Increment>>,
-    /// The file row where `source` starts, added to every recorded row.
-    row_base: usize,
+    /// Where `source` starts in the file.
+    origin: Origin,
 }
 
 impl Walk<'_, '_> {
@@ -91,12 +129,7 @@ impl Walk<'_, '_> {
     fn add(&mut self, node: Node<'_>, add: usize, construct: &'static str, nesting: Option<usize>) {
         self.score += add;
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.push(Increment {
-                line: self.row_base + node.start_position().row + 1,
-                add,
-                construct,
-                nesting,
-            });
+            trace.push(self.origin.increment(node, add, construct, nesting));
         }
     }
 
@@ -418,7 +451,7 @@ fn has_named_child(node: Node<'_>, kind: &str) -> bool {
 /// leaves out every block and snippet that forms its own unit. `script` is the
 /// grammar the component's `<script>` uses, which also parses template
 /// expressions. With `trace`, every increment is also pushed there, with its
-/// file line.
+/// file position.
 pub(crate) fn measure_template_unit(
     unit: Node<'_>,
     source: &str,
@@ -453,12 +486,7 @@ impl Template<'_, '_> {
     fn add(&mut self, node: Node<'_>, add: usize, construct: &'static str, nesting: Option<usize>) {
         self.score += add;
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.push(Increment {
-                line: node.start_position().row + 1,
-                add,
-                construct,
-                nesting,
-            });
+            trace.push(Origin::default().increment(node, add, construct, nesting));
         }
     }
 
@@ -475,8 +503,7 @@ impl Template<'_, '_> {
                 }
             }
             "svelte_raw_text" if scored_raw_text(node) => {
-                let text = node_text(node, self.source);
-                self.score += self.expression(text, node.start_position().row, level);
+                self.score += self.expression(node, level);
             }
             _ => self.visit_children(node, level),
         }
@@ -509,11 +536,16 @@ impl Template<'_, '_> {
         }
     }
 
-    /// Scores one template expression whose raw text starts on file row `row`.
-    /// The wrapper prefix holds no line break, so a node on row `r` of the
-    /// wrapped text sits on file row `row + r`.
-    fn expression(&mut self, text: &str, row: usize, level: usize) -> usize {
-        let wrapped = wrap_expression(text);
+    /// Scores the text of one `svelte_raw_text` node, parsed behind the
+    /// expression wrapper.
+    fn expression(&mut self, node: Node<'_>, level: usize) -> usize {
+        let (wrapped, range) = Wrapper::Expression.wrap(node_text(node, self.source));
+        let start = node.start_position();
+        let origin = Origin {
+            row: start.row,
+            column: start.column,
+            skip: range.start,
+        };
         let mut parser = Parser::new();
         if parser.set_language(&self.script.grammar()).is_err() {
             return 0;
@@ -521,7 +553,7 @@ impl Template<'_, '_> {
         let Some(tree) = parser.parse(&wrapped, None) else {
             return 0;
         };
-        if exceeds_depth_limit(&tree) {
+        if exceeds_depth_limit(&tree, range) {
             return 0;
         }
         let Some(function) = first_function(tree.root_node(), self.script) else {
@@ -534,7 +566,7 @@ impl Template<'_, '_> {
             template: true,
             score: 0,
             trace: self.trace.as_deref_mut(),
-            row_base: row,
+            origin,
         };
         walk.visit(
             function.child_by_field_name("body").unwrap_or(function),
@@ -542,16 +574,6 @@ impl Template<'_, '_> {
         );
         walk.score
     }
-}
-
-/// Template expressions are parsed as the return value of this function, so
-/// the script grammar sees an expression. It is one line long: see
-/// `Template::expression`.
-const EXPRESSION_PREFIX: &str = "function expression() { return (";
-const EXPRESSION_SUFFIX: &str = "); }";
-
-pub(crate) fn wrap_expression(text: &str) -> String {
-    [EXPRESSION_PREFIX, text, EXPRESSION_SUFFIX].concat()
 }
 
 fn block_label(kind: &str) -> &'static str {
@@ -564,7 +586,7 @@ fn block_label(kind: &str) -> &'static str {
 
 /// Bindings (`each` parameters, `then` / `catch` values, snippet parameters)
 /// are declarations, not expressions, and are not scored.
-pub(crate) fn scored_raw_text(node: Node<'_>) -> bool {
+fn scored_raw_text(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };

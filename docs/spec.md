@@ -324,8 +324,9 @@ Template expressions are scored from these `svelte_raw_text` nodes only: the
 `{@const}`, `{@html}`, and `{@render}` tags. Bindings are not scored: the
 `parameter` of `each_start`, `then_start` and `catch_start` bindings, and
 snippet parameters. Each scored text is wrapped as
-`function expression() { return (<text>); }`, the wrapper `bool_ops` already
-uses, parsed with the component's script grammar (TypeScript when a
+`function expression() { return (<text>); }`, the expression wrapper of
+`complexity` and `bool_ops`, whatever the text's role, parsed with the
+component's script grammar (TypeScript when a
 `<script lang="ts">` is present, otherwise JavaScript), and scored with the
 JavaScript rules at the nesting level of its enclosing block, so an `{#if}`
 condition sits at the block's own level and an expression in its body one level
@@ -427,10 +428,16 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 
 - `<script>` and `<script context="module">` / `<script module>` blocks are
   the `script_element` nodes of the Svelte syntax tree, so a `<script>` inside
-  an HTML comment is not measured. The `raw_text` child of each element is
-  parsed with the TypeScript grammar when its start tag has a `lang` attribute
-  of `ts` or `typescript`, otherwise with the JavaScript grammar. Functions
-  inside are reported normally with their real line numbers in the `.svelte` file.
+  an HTML comment is not measured. The content of each element, from the end
+  of its start tag to the start of its end tag, is parsed with the TypeScript
+  grammar when its start tag has a `lang` attribute of `ts` or `typescript`,
+  otherwise with the JavaScript grammar. Functions inside are reported
+  normally with their real line numbers in the `.svelte` file. As in Svelte, a
+  `</script>` end tag ends the script even inside a string. A string such as
+  `"</scripts>"` can make the grammar split the content into `raw_text` and an
+  `ERROR` node, which the content range still covers, or leave the `<script>`
+  start tag outside any `script_element`. Such a script is not measured, and
+  the file is `UNVERIFIED` (`script block could not be parsed`).
 - The template is split into synthetic units, so a report points at a block
   rather than at line 1 and scales with the block, not the file:
   - each top-level `{#if}`, `{#each}`, or `{#await}` block is a unit named
@@ -447,13 +454,39 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
 - Every unit starts at complexity 1. Decision points are `{#if}`,
   `{:else if}`, `{#each}`, `{#await}`, `{:catch}`, and the boolean / ternary
   operators inside `{…}` expressions, counted in the unit that contains them.
-  Expressions are the scored `svelte_raw_text` nodes listed under Cognitive
-  complexity, wrapped and parsed with the component's script grammar in the
-  same way. Each `ternary_expression` and each short-circuit operator node
-  (`&&`, `||`, `??`, `&&=`, `||=`, `??=`) adds 1, including inside a function
-  in the expression; `bool_ops` takes its chains from the same tree. Nodes
-  inside an `ERROR` subtree add nothing, and operator characters inside a
-  string, a regular expression, or a comment are not operator nodes.
+  Expressions are all `svelte_raw_text` nodes, bindings included: `{#each}`
+  parameters and keys, `{:then}` and `{:catch}` values, and snippet
+  parameters. `cognitive` scores only the subset listed under Cognitive
+  complexity. Each text is parsed with the component's script grammar inside
+  a function, in the position that its role in the Svelte tree gives it. The
+  role comes from the parent kind and field of the `svelte_raw_text` node:
+
+  | Text | Parent | Wrappers, in order |
+  |---|---|---|
+  | snippet parameters | `snippet_start` | parameters |
+  | `{:then}` and `{:catch}` values | `then_start`, `catch_start` | parameters |
+  | `{#each}` binding: pattern, index, key | `parameter` of `each_start` | parameters, expression |
+  | `{@const}` declaration | `const_tag` | declaration |
+  | spread attribute (`{...props}`) | `attribute_name` | spread |
+  | conditions, the `{#each}` list, `{#await}` and `{#key}` text, element content, attribute values, `{@html}`, `{@render}`, `{@debug}` | `if_start`, `else_if_start`, `each_start`, `await_start`, `key_start`, `expression`, `html_tag`, `render_tag`, `debug_tag` | expression |
+  | any other parent | | expression, parameters, declaration |
+
+  The wrappers are `function expression() { return (<text>); }` (expression),
+  `function expression(<text>) {}` (parameters),
+  `function expression() { const <text>; }` (declaration), and
+  `function expression() { return [<text>]; }` (spread, because a spread
+  parses only as an array element). The first wrapper whose tree has no
+  `ERROR` or `MISSING` node is scored. When none parses cleanly, the
+  expression wrapper is scored, or the spread wrapper for a spread, and nodes
+  inside an `ERROR` subtree add nothing. So an `{#each}` binding with a key,
+  such as `item, i (item.id)`, is read as an expression, and a binding with
+  both a destructuring default and a key, such as `{ x = a }, i (x)`, adds
+  nothing. Each `ternary_expression`
+  and each short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`)
+  adds 1, including inside a function in the expression; `bool_ops` takes its
+  chains from the same tree. Nodes inside an `ERROR` subtree add nothing, and
+  operator characters inside a string, a regular expression, or a comment are
+  not operator nodes.
   Depth follows `{#if}`/`{#each}`/`{#await}` nesting within a unit, so a block
   unit has depth at least 1; snippets and `{#key}` add no depth. Template
   units are exempt from `lines` and `params`.
@@ -511,7 +544,15 @@ pickcheck --version
   (which already include tracked files that a later `.gitignore` rule covers)
   plus untracked files from `git ls-files --others --exclude-standard`; config
   `ignore` applies before any language lookup, so ignored paths never appear as
-  `UNVERIFIED`. Explicit paths are normalized (`.`/`..`) before intersecting.
+  `UNVERIFIED`. Explicit paths are resolved as the file system resolves them
+  before intersecting: symbolic links in the directory part are followed, then
+  `.` and `..` apply. A link to a file keeps its own name, which is the path
+  Git lists and the one that selects the language. Every other existing path
+  gets the name the file system stores, so a Windows short name or another
+  letter case matches. A path whose directory does not exist is normalized
+  lexically first. The working directory and
+  the repository root are resolved the same way, so config lookup, `ignore`
+  globs, and report paths follow the real directories.
   Non-UTF-8 diff output is decoded lossily; hunk headers are ASCII. Git is invoked with
   `--no-ext-diff --no-textconv --find-renames`, external diff, textconv, fsmonitor, and hooks
   disabled, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_EXTERNAL_DIFF`/`GIT_CONFIG_*`
@@ -585,12 +626,24 @@ DETAILS pickcheck check --changed --verbose <file>
 - `UNVERIFIED` is emitted for a file that is explicitly named on the command
   line, or that has a known source-code extension with no grammar (`.kt .java
   .c .cc .cpp .h .hpp .cs .swift .rb .php .scala .lua .zig .m .mm .ex .exs .hs
-  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or whose syntax
-  tree is deeper than 3,000 levels (`syntax nesting too deep to measure`; this
-  covers each `<script>` block and template expression of a Svelte file, and a
-  base file that deep has no readable base). Non-source files
-  found while walking a directory (`.md`, `.json`, `.toml`, images, …) are
-  skipped silently. A file that cannot be read never aborts the scan.
+  .clj .sh .bash .pl .r`), or that cannot be decoded as UTF-8, or that has a
+  unit the scan left out. Non-source files found while walking a directory
+  (`.md`, `.json`, `.toml`, images, …) are skipped silently. A file that cannot
+  be read never aborts the scan.
+- A unit is left out when its syntax subtree is more than 3,000 levels high
+  (`syntax nesting too deep to measure`). A function's subtree includes its
+  nested functions. A Svelte template unit's subtree leaves out scripts,
+  styles, and the units inside it, and each template expression in it counts
+  as its own subtree, from the highest node of the parsed text, without the
+  levels its wrapper adds. A Svelte script can also be left out (see Svelte). The other
+  units of the file are measured and reported as usual, so a file can be listed
+  under both `FAIL` and `UNVERIFIED`. A file with both reasons lists them
+  joined by `; `. The `pickcheck` binary measures on a 64 MiB stack, which
+  holds any unit within this limit. A library caller of
+  `parse_source` or `scan` gets that guarantee only inside
+  `on_measurement_stack`. Known limit: a Svelte file with millions of nested
+  template literals still overflows the stack inside the grammar's scanner,
+  before any tree exists (#66).
 
 ### Baseline (`--base`)
 
@@ -618,6 +671,11 @@ Base content:
   path, or fails to parse has no base, and the report adds
   `note: <path> has no readable base; its functions count as new`, where
   `<path>` is the reported path.
+- A unit that the scan leaves out, such as one too deep to measure, still
+  takes part in matching at either revision, with its name and span. It keeps
+  its place among units of the same name and still owns the anonymous units
+  inside it. A unit paired with a base unit that was left out counts as
+  unpaired. This adds no note.
 
 Matching, per file, runs over every unit of both complete files, before any
 filtering by touched spans or violations, and ownership follows the syntax tree
@@ -629,6 +687,8 @@ rather than line spans:
   extras stay unpaired. A renamed function does not match its old name.
 - An `<anonymous>` unit belongs to its innermost enclosing named unit, at any
   depth through other anonymous units, or to the file when none encloses it.
+  A named unit that was left out still owns its anonymous units, so a closure
+  inside it never pairs with a closure of another owner.
   The file owner is paired whenever the file has a base. Anonymous units pair
   in source order when their owner is paired and has the same number of
   anonymous units at both revisions.
@@ -760,7 +820,9 @@ a Python `except`, is `catch`; every conditional expression is `ternary`; a
 Dart collection `if` / `for` is `if` / `for`.
 
 Output `json`; `metrics` and `limits` use the same shapes as `base_metrics`
-and `limits` under `--base`, and `nesting` is `null` for flat increments:
+and `limits` under `--base`. Each increment adds `column`, the 1-based byte
+column where its node starts in the file, also in Svelte `<script>` blocks and
+template expressions. `nesting` is `null` for flat increments:
 
 ```json
 {
@@ -773,8 +835,9 @@ and `limits` under `--base`, and `nesting` is `null` for flat increments:
      "limits": {"complexity": null, "cognitive": 15, "depth": 4, "lines": 100,
                 "params": 6, "bool_ops": 3, "widget_depth": null},
      "increments": [
-       {"line": 43, "add": 1, "construct": "for", "nesting": 0},
-       {"line": 44, "add": 1, "construct": "sequence &&", "nesting": null}
+       {"line": 43, "column": 3, "add": 1, "construct": "for", "nesting": 0},
+       {"line": 44, "column": 9, "add": 1, "construct": "sequence &&",
+        "nesting": null}
      ]}
   ]
 }
@@ -784,7 +847,10 @@ Exit codes: `0` whenever it explains, whatever the scores. `2` with a one-line
 `error:` for a missing or unreadable file, a file with no grammar, a line or
 name that matches no unit, a malformed `<file>:<line>` (an empty, non-numeric,
 or zero line after an existing file), both a line and `--function`, and a
-file whose syntax tree is deeper than 3,000 levels.
+file that `check` reports `UNVERIFIED` because it left units out: a unit
+deeper than 3,000 levels, or a Svelte script block that could not be parsed.
+A unit that is not measured has no increments, so `explain` does not explain
+the rest of such a file either; the error gives the `UNVERIFIED` reason.
 
 ### `hook claude`
 
@@ -795,7 +861,9 @@ Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
   `{"decision":"block","reason":"<summary>"}` and exits 0. `<summary>` is the
   `--summary` text report, including its `UNVERIFIED` lines, under the same
   20-path cap; it returns feedback without undoing the edit. No violations
-  produce no output, even when files are unverified.
+  produce no stdout output. Each unverified file then gets a
+  `note: UNVERIFIED <file>  <reason>` line on stderr, at most 20, followed by
+  `note: ... <n> more files` when more are omitted.
 - `Stop` → `check --changed` in `cwd`. On violations print the same summary,
   `UNVERIFIED` lines included, in
   `{"decision":"block","reason":"<summary>Fix the listed files, then finish."}`
@@ -803,8 +871,10 @@ Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
   blocks per `session_id` are counted in the state directory. The hook blocks at most `hook.max_blocks` times
   (default 3); every later Stop with violations is allowed and prints the compact report
   prefixed with `UNRESOLVED` to stderr, exit 0. Only a clean run resets the
-  counter (an `UNRESOLVED` release does not). State file names derive from a
-  sanitized `session_id`, never from a toolchain-dependent hash.
+  counter (an `UNRESOLVED` release does not). A Stop with no violations writes
+  the same stderr notes for unverified files as `PostToolUse`. State file
+  names derive from a sanitized `session_id`, never from a toolchain-dependent
+  hash.
 - Any other event → exit 0, no output. Missing optional fields (`session_id`,
   `cwd`) never cause a non-zero exit: `cwd` defaults to the process cwd and a
   missing `session_id` uses an unkeyed counter.
@@ -827,7 +897,9 @@ still return the report as feedback.
 Reads Cursor's native hook JSON. `afterFileEdit` checks the top-level
 `file_path`; findings are written to stderr because that event is passive.
 `stop` checks changed functions when `status` is `completed` and returns a
-`followup_message` on violations. Aborted and failed stops are ignored. The
+`followup_message` on violations. Aborted and failed stops are ignored. Both
+events write the stderr notes of `hook claude` for unverified files when there
+are no violations. The
 working directory comes from the first `workspace_roots` entry or
 `CURSOR_PROJECT_DIR`.
 
@@ -835,8 +907,9 @@ working directory comes from the first `workspace_roots` entry or
 
 Reads Grok's native camel-case hook JSON. `post_tool_use` checks edits and writes
 findings to stderr for the hook annotation. `stop` checks changed functions and
-blocks with exit 2 and the report on stderr. The working directory comes from
-`workspaceRoot` or `GROK_WORKSPACE_ROOT`.
+blocks with exit 2 and the report on stderr. Both events write the stderr notes
+of `hook claude` for unverified files when there are no violations. The
+working directory comes from `workspaceRoot` or `GROK_WORKSPACE_ROOT`.
 
 ### `init`
 

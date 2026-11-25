@@ -2,7 +2,7 @@
 //! same walk that produces the score, which pushes them into a sink that
 //! `trace_source` passes down.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     FunctionMetrics, Language,
@@ -19,10 +19,20 @@ pub struct UnitTrace {
 }
 
 /// Every unit of `source`, as `parse_source` reports it, with its increments.
+///
+/// # Errors
+///
+/// Fails as `parse_source` does, and when `parse_source` leaves a unit out
+/// (the reason `check` gives for an `UNVERIFIED` file), because a unit that
+/// is not measured has no increments.
 pub fn trace_source(language: Language, source: &str) -> Result<Vec<UnitTrace>> {
     let mut traced = Vec::new();
-    let units = parse_units(language, source, Some(&mut traced))?;
-    units
+    let parsed = parse_units(language, source, Some(&mut traced))?;
+    if let Some(reason) = parsed.reason() {
+        bail!(reason);
+    }
+    parsed
+        .functions
         .into_iter()
         .map(|metrics| {
             let index = traced
@@ -35,7 +45,7 @@ pub fn trace_source(language: Language, source: &str) -> Result<Vec<UnitTrace>> 
                     )
                 })?;
             let TracedUnit { mut increments, .. } = traced.swap_remove(index);
-            increments.sort_by_key(|increment| increment.line);
+            increments.sort_by_key(|increment| (increment.line, increment.column));
             Ok(UnitTrace {
                 metrics,
                 increments,
@@ -131,11 +141,9 @@ function visit(items) {
     }
 
     #[test]
-    fn svelte_expression_lines_follow_the_raw_text() {
+    fn svelte_positions_are_file_lines_and_columns() {
         let source = "\
-<script>
-  let ready = true;
-</script>
+<script lang=\"ts\">function f(a: boolean, b: boolean) { return a && b; }</script>
 {#if ready}
   <p>{a
     ? b
@@ -146,32 +154,35 @@ function visit(items) {
 {/if}
 ";
         let units = trace_source(Language::Svelte, source).unwrap();
-        let unit = units
-            .iter()
-            .find(|unit| unit.metrics.function == "{#if}")
-            .unwrap();
-        let increments = unit
-            .increments
-            .iter()
-            .map(|item| (item.line, item.construct))
-            .collect::<Vec<_>>();
+        let positions = |name: &str| {
+            let unit = units
+                .iter()
+                .find(|unit| unit.metrics.function == name)
+                .unwrap();
+            let sum = unit.increments.iter().map(|item| item.add).sum::<usize>();
+            assert_eq!(sum, unit.metrics.cognitive, "{name}");
+            unit.increments
+                .iter()
+                .map(|item| (item.line, item.column, item.construct))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions("f"), [(1, 63, "sequence &&")]);
         assert_eq!(
-            increments,
+            positions("{#if}"),
             [
-                (4, "{#if}"),
-                (5, "ternary"),
-                (7, "sequence &&"),
-                (8, "sequence ||"),
-                (8, "ternary"),
-                (10, "sequence ??"),
+                (2, 1, "{#if}"),
+                (3, 7, "ternary"),
+                (5, 7, "sequence &&"),
+                (6, 7, "sequence ||"),
+                (6, 16, "ternary"),
+                (8, 5, "sequence ??"),
             ]
         );
-        let sum = unit.increments.iter().map(|item| item.add).sum::<usize>();
-        assert_eq!(sum, unit.metrics.cognitive);
     }
 
     #[test]
     fn the_expression_wrapper_prefix_is_one_line() {
-        assert!(!crate::cognitive::wrap_expression("").contains('\n'));
+        let (wrapped, range) = crate::language::Wrapper::Expression.wrap("");
+        assert!(!wrapped[..range.start].contains('\n'));
     }
 }

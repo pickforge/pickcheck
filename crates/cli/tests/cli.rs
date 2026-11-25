@@ -129,14 +129,14 @@ fn changed_results_are_repo_root_keyed_from_nested_cwd() {
     let child = command_output(&nested, &["check", "--changed"]);
     let root_text = String::from_utf8(root.stdout).unwrap();
     let child_text = String::from_utf8(child.stdout).unwrap();
-    for expected in ["top.js", "src/sub/x.js"] {
+    for expected in ["top.js", &native("src/sub/x.js")] {
         assert!(
             root_text.contains(expected),
             "missing {expected}; stdout: {root_text}; stderr: {}",
             String::from_utf8_lossy(&root.stderr)
         );
     }
-    for expected in ["../../top.js", "x.js"] {
+    for expected in [&native("../../top.js"), "x.js"] {
         assert!(
             child_text.contains(expected),
             "missing {expected}; stdout: {child_text}; stderr: {}",
@@ -396,7 +396,7 @@ fn changed_explicit_paths_normalize_parent_components() {
         let output = command_output(&src, &["check", "--changed", path]);
         assert_eq!(output.status.code(), Some(1), "path: {path}");
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("../untracked.js"),
+            String::from_utf8_lossy(&output.stdout).contains(&native("../untracked.js")),
             "path: {path}; stdout: {}; stderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -417,23 +417,25 @@ fn changed_config_note_covers_deleted_and_renamed_configs() {
     .unwrap();
     fs::write(root.join("other/keep.txt"), "keep\n").unwrap();
     fs::write(root.join("notes.txt"), "notes\n").unwrap();
-    fs::create_dir_all(root.join("tab\tdir")).unwrap();
-    fs::write(root.join("tab\tdir/.pickcheck.json"), "{}").unwrap();
+    // Windows file names cannot hold a tab.
+    let tab_dir = root.join("tab\tdir");
+    if cfg!(unix) {
+        fs::create_dir_all(&tab_dir).unwrap();
+        fs::write(tab_dir.join(".pickcheck.json"), "{}").unwrap();
+    }
     init_repo(root);
     commit_all(root, "initial");
 
     // A tab makes Git quote patch headers, and an empty file has none.
-    fs::write(
-        root.join("tab\tdir/.pickcheck.json"),
-        r#"{"limits":{"depth":3}}"#,
-    )
-    .unwrap();
-    let quoted = command_output(root, &["check", "--changed"]);
-    assert!(
-        String::from_utf8_lossy(&quoted.stderr)
-            .contains("note: .pickcheck.json changed in this diff")
-    );
-    git(root, &["reset", "-q", "--hard"]);
+    if cfg!(unix) {
+        fs::write(tab_dir.join(".pickcheck.json"), r#"{"limits":{"depth":3}}"#).unwrap();
+        let quoted = command_output(root, &["check", "--changed"]);
+        assert!(
+            String::from_utf8_lossy(&quoted.stderr)
+                .contains("note: .pickcheck.json changed in this diff")
+        );
+        git(root, &["reset", "-q", "--hard"]);
+    }
     fs::write(root.join("other/.pickcheck.json"), "").unwrap();
     git(root, &["add", "other/.pickcheck.json"]);
     let empty = command_output(root, &["check", "--changed"]);
@@ -608,46 +610,86 @@ fn stop_hook_reason_lists_unverified_files() {
     assert!(reason.ends_with("Fix the listed files, then finish."));
 }
 
+/// A function over the depth limit, then a measurable one on line 2.
+fn deep_function_then(next: &str) -> String {
+    format!(
+        "function deep(a) {{ return {}a; }}\n{next}",
+        "a+".repeat(3_100)
+    )
+}
+
+const SEVEN_PARAMS: &str = "function bad(a, b, c, d, e, f, g) { return a; }\n";
+
 #[test]
-fn too_deep_files_are_unverified_and_the_scan_continues() {
+fn too_deep_units_are_left_out_and_the_rest_is_measured() {
     let dir = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
-    fs::write(root.join("deep.js"), &deep).unwrap();
-    fs::write(root.join("bad.js"), complex_function()).unwrap();
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
+    let chain = format!("function chain(a) {{ return {}a; }}\n", "a+".repeat(20_000));
+    fs::write(root.join("chain.js"), chain).unwrap();
 
     let check = command_output(root, &["check", "."]);
     assert_eq!(check.status.code(), Some(1));
-    let text = String::from_utf8_lossy(&check.stdout);
-    assert!(
-        text.contains("FAIL bad.js:1 bad  cognitive 16 > 15"),
-        "{text}"
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL deep.js:2 bad  params 7 > 6\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
     );
-    assert!(
-        text.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
-        "{text}"
+    let summary = command_output(root, &["check", "--summary", "."]);
+    assert_eq!(summary.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&summary.stdout),
+        "FAIL 1 file, 1 function, 1 violation\n\
+         UNVERIFIED 2 files\n\
+         FAIL deep.js  1 function, 1 violation\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n\
+         DETAILS pickcheck check --verbose <file>\n"
     );
+    let json = command_output(root, &["check", "--format", "json", "."]);
+    assert_eq!(json.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["checked"], 1);
+    assert_eq!(value["violations"][0]["function"], "bad");
+    assert_eq!(
+        value["unverified"],
+        serde_json::json!([
+            {"file": "chain.js", "reason": "syntax nesting too deep to measure"},
+            {"file": "deep.js", "reason": "syntax nesting too deep to measure"}
+        ])
+    );
+}
 
+#[test]
+fn base_units_that_were_too_deep_count_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
     init_repo(root);
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
     commit_all(root, "initial");
     git(root, &["checkout", "-qb", "feature"]);
     fs::write(
         root.join("deep.js"),
-        "function deep(a, b, c, d, e, f, g) { return a; }\n",
+        "function deep(a, b, c, d, e, f, g) { return a; }\n\
+         function bad(a, b, c, d, e, f, g) { return b; }\n",
     )
     .unwrap();
     let base = command_output(root, &["check", "--base", "main", "--verbose", "deep.js"]);
     assert_eq!(base.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&base.stdout).contains("FAIL deep.js:1 deep  params 7 > 6  new")
+    assert_eq!(
+        String::from_utf8_lossy(&base.stdout),
+        "FAIL deep.js:1 deep  params 7 > 6  new\n\
+         FAIL deep.js:2 bad  params 7 > 6  unchanged\n"
     );
-    assert!(
-        String::from_utf8_lossy(&base.stderr)
-            .contains("note: deep.js has no readable base; its functions count as new")
-    );
+    assert_eq!(String::from_utf8_lossy(&base.stderr), "");
 
-    fs::write(root.join("deep.js"), &deep).unwrap();
+    fs::write(
+        root.join("deep.js"),
+        deep_function_then("function bad(a, b, c, d, e, f, g) { return b; }\n"),
+    )
+    .unwrap();
     for event in ["PostToolUse", "Stop"] {
         let input = serde_json::json!({
             "hook_event_name": event, "session_id": "deep", "cwd": root,
@@ -655,12 +697,206 @@ fn too_deep_files_are_unverified_and_the_scan_continues() {
         })
         .to_string();
         let hook = hook_output(state.path(), &input);
+        assert!(hook.status.success(), "{event}");
+        let value: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
+        let reason = value["reason"].as_str().unwrap();
         assert!(
-            hook.status.success(),
-            "{event}: {}",
-            String::from_utf8_lossy(&hook.stderr)
+            reason.contains("FAIL deep.js  1 function, 1 violation\n"),
+            "{event}: {reason}"
+        );
+        assert!(
+            reason.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
+            "{event}: {reason}"
         );
     }
+}
+
+#[test]
+fn closures_keep_an_owner_that_was_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let closure = "[1].map((a, b, c, d, e, f, g) => a);";
+    let file_level = format!("function deep(a) {{ return a; }}\n{closure}\n");
+    fs::write(root.join("deep.js"), file_level).unwrap();
+    commit_all(root, "initial");
+    git(root, &["checkout", "-qb", "feature"]);
+    let inside = format!(
+        "function deep(a) {{ {closure} return {}a; }}\n",
+        "a+".repeat(3_100)
+    );
+    fs::write(root.join("deep.js"), &inside).unwrap();
+    let fail_on = ["--fail-on", "new,worsened,unmatched"];
+    let args = [
+        &["check", "--verbose", "--base", "main"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let moved = command_output(root, &args);
+    assert_eq!(moved.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&moved.stdout),
+        "FAIL deep.js:1 <anonymous>  params 7 > 6  unmatched\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+
+    // The same closure under the same left-out owner at both revisions pairs.
+    commit_all(root, "inside");
+    fs::write(
+        root.join("deep.js"),
+        inside.replace("return a+", "return b+"),
+    )
+    .unwrap();
+    let args = [
+        &["check", "--verbose", "--base", "HEAD"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let kept = command_output(root, &args);
+    assert_eq!(kept.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&kept.stdout),
+        "WARN deep.js:1 <anonymous>  params 7 > 6  unchanged\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+}
+
+/// A note that cannot be written to stderr changes neither the exit code nor
+/// stdout of a hook that does not block.
+#[cfg(unix)]
+#[test]
+fn hook_notes_ignore_an_unwritable_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("note.kt"), "fun f() {}\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "full", "cwd": dir.path(),
+        "tool_name": "Edit", "tool_input": {"file_path": dir.path().join("note.kt")}
+    })
+    .to_string();
+    let writable = hook_output(state.path(), &input);
+    assert_eq!(
+        String::from_utf8_lossy(&writable.stderr),
+        "note: UNVERIFIED note.kt  no grammar for .kt\n"
+    );
+    let full = Path::new("/dev/full");
+    let mut command = if full.exists() {
+        let mut command = binary();
+        let stderr = fs::OpenOptions::new().write(true).open(full).unwrap();
+        command.args(["hook", "claude"]).stderr(stderr);
+        command
+    } else {
+        let mut command = Command::new("sh");
+        let script = "exec \"$0\" hook claude 2>&-";
+        command.args(["-c", script, env!("CARGO_BIN_EXE_pickcheck")]);
+        command
+    };
+    let mut child = command
+        .env("PICKCHECK_HOME", state.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    let unwritable = child.wait_with_output().unwrap();
+    assert_eq!(unwritable.status.code(), writable.status.code());
+    assert_eq!(unwritable.status.code(), Some(0));
+    assert_eq!(unwritable.stdout, writable.stdout);
+}
+
+#[test]
+fn hooks_that_do_not_block_note_unverified_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    fs::write(root.join("deep.js"), "function deep(a) { return a; }\n").unwrap();
+    commit_all(root, "initial");
+    fs::write(root.join("deep.js"), deep_function_then("")).unwrap();
+    let file = root.join("deep.js");
+    let note = "note: UNVERIFIED deep.js  syntax nesting too deep to measure\n";
+    let inputs = [
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "Edit", "tool_input": {"file_path": file}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "apply_patch", "tool_input": {"command": "patch"}}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "stop", "status": "completed",
+            "workspace_roots": [root]}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "afterFileEdit",
+            "workspace_roots": [root], "file_path": file}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "stop", "workspaceRoot": root}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "post_tool_use", "workspaceRoot": root,
+            "toolName": "edit", "toolInput": {"filePath": file}}),
+        ),
+    ];
+    for (harness, input) in inputs {
+        let hook = hook_output_for(state.path(), harness, &input.to_string());
+        assert_eq!(hook.status.code(), Some(0), "{harness} {input}");
+        assert!(hook.stdout.is_empty(), "{harness} {input}");
+        assert_eq!(
+            String::from_utf8_lossy(&hook.stderr),
+            note,
+            "{harness} {input}"
+        );
+    }
+
+    for index in 0..21 {
+        fs::write(root.join(format!("{index:02}.kt")), "fun f() = 1\n").unwrap();
+    }
+    let stop = serde_json::json!({"hook_event_name": "Stop", "cwd": root}).to_string();
+    let hook = hook_output(state.path(), &stop);
+    assert!(hook.status.success() && hook.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&hook.stderr);
+    assert_eq!(stderr.matches("note: UNVERIFIED ").count(), 20, "{stderr}");
+    assert!(stderr.ends_with("note: ... 2 more files\n"), "{stderr}");
+}
+
+#[test]
+fn a_damaged_svelte_script_is_unverified_and_the_rest_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("case.svelte"),
+        "<script>const text = \"</scripture>\"; function bad(a,b,c,d,e,f,g) { return a; }</script>\n\
+         <script context=\"module\">function other(a,b,c,d,e,f,g) { return a; }</script>\n",
+    )
+    .unwrap();
+    let check = command_output(root, &["check", "case.svelte"]);
+    assert_eq!(check.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL case.svelte:2 other  params 7 > 6\n\
+         UNVERIFIED case.svelte  script block could not be parsed\n"
+    );
 }
 
 #[test]
@@ -841,6 +1077,11 @@ fn cursor_and_grok_hooks_follow_native_output_contracts() {
     let grok_stop_output = hook_output_for(state.path(), "grok", &grok_stop);
     assert_eq!(grok_stop_output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&grok_stop_output.stderr).contains("Fix the listed files"));
+}
+
+/// A `/`-separated relative path as the platform reports it.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
 }
 
 fn command_output(cwd: &Path, args: &[&str]) -> Output {
@@ -1121,7 +1362,7 @@ fn base_limits_are_null_where_a_check_does_not_apply() {
             .unwrap_or_else(|| panic!("no {function} in {report}"))["limits"]
             .clone()
     };
-    let test_file = limits("tests/a.js", "t");
+    let test_file = limits(&native("tests/a.js"), "t");
     assert_eq!(test_file["lines"], serde_json::Value::Null);
     assert_eq!(test_file["depth"], 0);
     let template = limits("c.svelte", "{#if}");
@@ -1250,4 +1491,188 @@ fn stop_hook_outside_git_repository_passes_without_scanning() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("note: hook skipped"));
     assert!(!state.path().join("no_repo.count").exists());
+}
+
+/// A path reached through a symlink, like a macOS temporary directory under
+/// `/var`, must match the canonical root Git prints.
+#[cfg(unix)]
+#[test]
+fn symlinked_paths_match_the_repository_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(real.join("src")).unwrap();
+    fs::create_dir_all(real.join("gen")).unwrap();
+    fs::write(real.join(".pickcheck.json"), r#"{"ignore":["gen/**"]}"#).unwrap();
+    for path in ["src/a.js", "gen/g.js"] {
+        fs::write(real.join(path), "function a() { return 1; }\n").unwrap();
+    }
+    init_repo(&real);
+    commit_all(&real, "initial");
+    for path in ["src/a.js", "gen/g.js"] {
+        fs::write(real.join(path), complex_function()).unwrap();
+    }
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let linked_src = link.join("src");
+    let changed = command_output(&real, &["check", "--changed", linked_src.to_str().unwrap()]);
+    let changed_text = String::from_utf8_lossy(&changed.stdout);
+    assert_eq!(changed.status.code(), Some(1), "stdout: {changed_text}");
+    assert!(
+        changed_text.contains("FAIL src/a.js  "),
+        "stdout: {changed_text}"
+    );
+
+    let walked = command_output(&real, &["check", link.to_str().unwrap()]);
+    let walked_text = String::from_utf8_lossy(&walked.stdout);
+    assert!(
+        walked_text.contains("FAIL src/a.js:1 bad"),
+        "stdout: {walked_text}"
+    );
+    assert!(!walked_text.contains("g.js"), "stdout: {walked_text}");
+
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"link", "cwd":&link}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL src/a.js  "), "stdout: {reason}");
+
+    let edit = serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"link",
+        "cwd":&link, "tool_name":"Edit", "tool_input":{"file_path":link.join("gen/g.js")}})
+    .to_string();
+    assert!(hook_output(state.path(), &edit).stdout.is_empty());
+
+    // A link inside the repository names the same files as the path Git prints.
+    std::os::unix::fs::symlink(real.join("src"), real.join("alias")).unwrap();
+    let inner = command_output(&real, &["check", "--changed", "alias/a.js"]);
+    let inner_text = String::from_utf8_lossy(&inner.stdout);
+    assert_eq!(inner.status.code(), Some(1), "stdout: {inner_text}");
+    assert!(
+        inner_text.contains("FAIL src/a.js  "),
+        "stdout: {inner_text}"
+    );
+
+    // A cwd that links straight into a subdirectory reports paths from there.
+    let sub = dir.path().join("sub");
+    std::os::unix::fs::symlink(real.join("src"), &sub).unwrap();
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"sub", "cwd":&sub}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL a.js  "), "stdout: {reason}");
+}
+
+/// Links resolve as the file system resolves them: config comes from the real
+/// ancestors, `..` applies after a directory link, and a link to a file keeps
+/// its own name.
+#[cfg(unix)]
+#[test]
+fn links_resolve_like_the_file_system() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(real.join("src/nested")).unwrap();
+    fs::write(real.join("src/a.js"), "function a() { return 1; }\n").unwrap();
+    fs::write(real.join("legacy.js"), complex_function()).unwrap();
+    fs::write(real.join(".gitignore"), ".pickcheck.json\n").unwrap();
+    init_repo(&real);
+    commit_all(&real, "initial");
+    fs::write(real.join("src/a.js"), complex_function()).unwrap();
+
+    // The directory that holds the link has a config; the repository does not.
+    let holder = dir.path().join("holder");
+    fs::create_dir(&holder).unwrap();
+    fs::write(holder.join(".pickcheck.json"), r#"{"ignore":["**"]}"#).unwrap();
+    let link = holder.join("link");
+    symlink(&real, &link).unwrap();
+    let linked_src = link.join("src");
+    let foreign = command_output(&real, &["check", "--changed", linked_src.to_str().unwrap()]);
+    assert_eq!(foreign.status.code(), Some(1));
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"held", "cwd":&link}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL src/a.js  "), "stdout: {reason}");
+
+    // `..` after a directory link leaves the link target, not the link.
+    symlink("src/nested", real.join("deep")).unwrap();
+    let parent = command_output(&real, &["check", "--changed", "deep/../a.js"]);
+    let parent_text = String::from_utf8_lossy(&parent.stdout);
+    assert_eq!(parent.status.code(), Some(1), "stdout: {parent_text}");
+    assert!(
+        parent_text.contains("FAIL src/a.js  "),
+        "stdout: {parent_text}"
+    );
+
+    // A missing directory before `..` does not stop link resolution.
+    symlink("src", real.join("side")).unwrap();
+    let missing = command_output(&real, &["check", "--changed", "missing/../side/a.js"]);
+    let missing_text = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing_text.contains("FAIL src/a.js  "),
+        "stdout: {missing_text}"
+    );
+
+    // A new link to an unchanged file is a new file under its own name.
+    symlink("legacy.js", real.join("fresh.js")).unwrap();
+    for path in ["fresh.js", "."] {
+        let leaf = command_output(&real, &["check", "--changed", path]);
+        let leaf_text = String::from_utf8_lossy(&leaf.stdout);
+        assert!(
+            leaf_text.contains("FAIL fresh.js  "),
+            "path: {path}; stdout: {leaf_text}"
+        );
+        assert!(!leaf_text.contains("legacy.js"), "stdout: {leaf_text}");
+    }
+
+    // The loop guard reads `hook.max_blocks` from the repository of a linked cwd.
+    fs::write(real.join(".pickcheck.json"), r#"{"hook":{"max_blocks":1}}"#).unwrap();
+    let sub = dir.path().join("sub");
+    symlink(real.join("src"), &sub).unwrap();
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"sub", "cwd":&sub}).to_string();
+    assert!(!hook_output(state.path(), &stop).stdout.is_empty());
+    let released = hook_output(state.path(), &stop);
+    assert!(released.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&released.stderr).contains("UNRESOLVED"));
+}
+
+/// A file system that ignores letter case accepts another spelling of a file
+/// name. The explicit path must still match the name Git prints.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn another_letter_case_matches_the_changed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    let file = dir.path().join("src").join("long-failing-source.js");
+    fs::write(&file, "function a() { return 1; }\n").unwrap();
+    init_repo(dir.path());
+    commit_all(dir.path(), "initial");
+    fs::write(&file, complex_function()).unwrap();
+
+    let given = Path::new("SRC").join("LONG-FAILING-SOURCE.JS");
+    assert!(dir.path().join(&given).exists(), "volume is case-sensitive");
+    let output = command_output(dir.path(), &["check", "--changed", given.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
+    assert!(
+        text.contains(&format!("FAIL {}  ", native("src/long-failing-source.js"))),
+        "stdout: {text}"
+    );
+}
+
+/// Outside Git, the name given on the command line selects the grammar, not
+/// the name of the file a link points to.
+#[cfg(unix)]
+#[test]
+fn a_linked_file_is_measured_under_its_own_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("impl"), complex_function()).unwrap();
+    std::os::unix::fs::symlink("impl", dir.path().join("source.js")).unwrap();
+
+    let output = command_output(dir.path(), &["check", "source.js"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout: {text}");
+    assert!(text.contains("FAIL source.js:1 bad"), "stdout: {text}");
+    assert!(!text.contains("UNVERIFIED"), "stdout: {text}");
 }

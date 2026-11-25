@@ -75,6 +75,20 @@ pub(crate) fn summary(result: &ScanResult, scope: Scope<'_>) -> String {
     lines(output)
 }
 
+/// One `note: UNVERIFIED` line per unverified file, under the summary's path
+/// cap, for a hook run that does not block.
+pub(crate) fn unverified_notes(result: &ScanResult) -> String {
+    let total = result.unverified.len();
+    let rows = result
+        .unverified
+        .iter()
+        .take(SUMMARY_PATH_LIMIT)
+        .map(|item| format!("note: UNVERIFIED {}  {}", item.file.display(), item.reason));
+    let more = (total > SUMMARY_PATH_LIMIT)
+        .then(|| format!("note: ... {} more files", total - SUMMARY_PATH_LIMIT));
+    lines(rows.chain(more))
+}
+
 fn label(scope: Scope<'_>, item: &Violation) -> &'static str {
     if scope.fails(item) { "FAIL" } else { "WARN" }
 }
@@ -266,5 +280,28 @@ mod tests {
         let result = ScanResult::default();
         assert!(summary(&result, Scope::Changed).is_empty());
         assert!(detailed(&result, Scope::Paths).is_empty());
+        assert!(unverified_notes(&result).is_empty());
+    }
+
+    #[test]
+    fn unverified_notes_cap_paths() {
+        let mut result = ScanResult::default();
+        for index in 0..22 {
+            result.unverified.push(Unverified {
+                file: PathBuf::from(format!("src/{index:02}.kt")),
+                reason: "no grammar for .kt".to_owned(),
+            });
+        }
+        let notes = unverified_notes(&result);
+        assert!(notes.starts_with("note: UNVERIFIED src/00.kt  no grammar for .kt\n"));
+        assert_eq!(
+            notes.matches("note: UNVERIFIED ").count(),
+            SUMMARY_PATH_LIMIT
+        );
+        assert!(
+            notes.ends_with(
+                "note: UNVERIFIED src/19.kt  no grammar for .kt\nnote: ... 2 more files\n"
+            )
+        );
     }
 }
