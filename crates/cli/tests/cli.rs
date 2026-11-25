@@ -129,14 +129,14 @@ fn changed_results_are_repo_root_keyed_from_nested_cwd() {
     let child = command_output(&nested, &["check", "--changed"]);
     let root_text = String::from_utf8(root.stdout).unwrap();
     let child_text = String::from_utf8(child.stdout).unwrap();
-    for expected in ["top.js", "src/sub/x.js"] {
+    for expected in ["top.js", &native("src/sub/x.js")] {
         assert!(
             root_text.contains(expected),
             "missing {expected}; stdout: {root_text}; stderr: {}",
             String::from_utf8_lossy(&root.stderr)
         );
     }
-    for expected in ["../../top.js", "x.js"] {
+    for expected in [&native("../../top.js"), "x.js"] {
         assert!(
             child_text.contains(expected),
             "missing {expected}; stdout: {child_text}; stderr: {}",
@@ -396,7 +396,7 @@ fn changed_explicit_paths_normalize_parent_components() {
         let output = command_output(&src, &["check", "--changed", path]);
         assert_eq!(output.status.code(), Some(1), "path: {path}");
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("../untracked.js"),
+            String::from_utf8_lossy(&output.stdout).contains(&native("../untracked.js")),
             "path: {path}; stdout: {}; stderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -417,23 +417,25 @@ fn changed_config_note_covers_deleted_and_renamed_configs() {
     .unwrap();
     fs::write(root.join("other/keep.txt"), "keep\n").unwrap();
     fs::write(root.join("notes.txt"), "notes\n").unwrap();
-    fs::create_dir_all(root.join("tab\tdir")).unwrap();
-    fs::write(root.join("tab\tdir/.pickcheck.json"), "{}").unwrap();
+    // Windows file names cannot hold a tab.
+    let tab_dir = root.join("tab\tdir");
+    if cfg!(unix) {
+        fs::create_dir_all(&tab_dir).unwrap();
+        fs::write(tab_dir.join(".pickcheck.json"), "{}").unwrap();
+    }
     init_repo(root);
     commit_all(root, "initial");
 
     // A tab makes Git quote patch headers, and an empty file has none.
-    fs::write(
-        root.join("tab\tdir/.pickcheck.json"),
-        r#"{"limits":{"depth":3}}"#,
-    )
-    .unwrap();
-    let quoted = command_output(root, &["check", "--changed"]);
-    assert!(
-        String::from_utf8_lossy(&quoted.stderr)
-            .contains("note: .pickcheck.json changed in this diff")
-    );
-    git(root, &["reset", "-q", "--hard"]);
+    if cfg!(unix) {
+        fs::write(tab_dir.join(".pickcheck.json"), r#"{"limits":{"depth":3}}"#).unwrap();
+        let quoted = command_output(root, &["check", "--changed"]);
+        assert!(
+            String::from_utf8_lossy(&quoted.stderr)
+                .contains("note: .pickcheck.json changed in this diff")
+        );
+        git(root, &["reset", "-q", "--hard"]);
+    }
     fs::write(root.join("other/.pickcheck.json"), "").unwrap();
     git(root, &["add", "other/.pickcheck.json"]);
     let empty = command_output(root, &["check", "--changed"]);
@@ -788,6 +790,11 @@ fn cursor_and_grok_hooks_follow_native_output_contracts() {
     assert!(String::from_utf8_lossy(&grok_stop_output.stderr).contains("Fix the listed files"));
 }
 
+/// A `/`-separated relative path as the platform reports it.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 fn command_output(cwd: &Path, args: &[&str]) -> Output {
     binary().current_dir(cwd).args(args).output().unwrap()
 }
@@ -1066,7 +1073,7 @@ fn base_limits_are_null_where_a_check_does_not_apply() {
             .unwrap_or_else(|| panic!("no {function} in {report}"))["limits"]
             .clone()
     };
-    let test_file = limits("tests/a.js", "t");
+    let test_file = limits(&native("tests/a.js"), "t");
     assert_eq!(test_file["lines"], serde_json::Value::Null);
     assert_eq!(test_file["depth"], 0);
     let template = limits("c.svelte", "{#if}");
@@ -1195,4 +1202,87 @@ fn stop_hook_outside_git_repository_passes_without_scanning() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("note: hook skipped"));
     assert!(!state.path().join("no_repo.count").exists());
+}
+
+/// A path reached through a symlink, like a macOS temporary directory under
+/// `/var`, must match the canonical root Git prints.
+#[cfg(unix)]
+#[test]
+fn symlinked_paths_match_the_repository_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(real.join("src")).unwrap();
+    fs::create_dir_all(real.join("gen")).unwrap();
+    fs::write(real.join(".pickcheck.json"), r#"{"ignore":["gen/**"]}"#).unwrap();
+    for path in ["src/a.js", "gen/g.js"] {
+        fs::write(real.join(path), "function a() { return 1; }\n").unwrap();
+    }
+    init_repo(&real);
+    commit_all(&real, "initial");
+    for path in ["src/a.js", "gen/g.js"] {
+        fs::write(real.join(path), complex_function()).unwrap();
+    }
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let linked_src = link.join("src");
+    let changed = command_output(&real, &["check", "--changed", linked_src.to_str().unwrap()]);
+    let changed_text = String::from_utf8_lossy(&changed.stdout);
+    assert_eq!(changed.status.code(), Some(1), "stdout: {changed_text}");
+    assert!(
+        changed_text.contains("FAIL src/a.js  "),
+        "stdout: {changed_text}"
+    );
+
+    let walked = command_output(&real, &["check", link.to_str().unwrap()]);
+    let walked_text = String::from_utf8_lossy(&walked.stdout);
+    assert!(
+        walked_text.contains("FAIL src/a.js:1 bad"),
+        "stdout: {walked_text}"
+    );
+    assert!(!walked_text.contains("g.js"), "stdout: {walked_text}");
+
+    let stop =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"link", "cwd":&link}).to_string();
+    let reason = String::from_utf8(hook_output(state.path(), &stop).stdout).unwrap();
+    assert!(reason.contains("FAIL src/a.js  "), "stdout: {reason}");
+
+    let edit = serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"link",
+        "cwd":&link, "tool_name":"Edit", "tool_input":{"file_path":link.join("gen/g.js")}})
+    .to_string();
+    assert!(hook_output(state.path(), &edit).stdout.is_empty());
+}
+
+#[test]
+fn crlf_sources_report_the_same_metrics_as_lf() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "function f(a, b) {\n  if (a) {\n    return b;\n  }\n  return a;\n}\n";
+    fs::write(dir.path().join("lf.js"), source).unwrap();
+    fs::write(dir.path().join("crlf.js"), source.replace('\n', "\r\n")).unwrap();
+    fs::write(
+        dir.path().join(".pickcheck.json"),
+        r#"{"limits":{"lines":1,"depth":0,"params":1}}"#,
+    )
+    .unwrap();
+
+    let violations = |file: &str| {
+        let output = command_output(dir.path(), &["check", "--format", "json", file]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["metric"].clone(),
+                    item["value"].clone(),
+                    item["line"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let lf = violations("lf.js");
+    assert_eq!(lf.len(), 3, "{lf:?}");
+    assert_eq!(violations("crlf.js"), lf);
 }
