@@ -712,6 +712,78 @@ fn base_units_that_were_too_deep_count_as_missing() {
 }
 
 #[test]
+fn hooks_that_do_not_block_note_unverified_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    fs::write(root.join("deep.js"), "function deep(a) { return a; }\n").unwrap();
+    commit_all(root, "initial");
+    fs::write(root.join("deep.js"), deep_function_then("")).unwrap();
+    let file = root.join("deep.js");
+    let note = "note: UNVERIFIED deep.js  syntax nesting too deep to measure\n";
+    let inputs = [
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "Edit", "tool_input": {"file_path": file}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "apply_patch", "tool_input": {"command": "patch"}}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "stop", "status": "completed",
+            "workspace_roots": [root]}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "afterFileEdit",
+            "workspace_roots": [root], "file_path": file}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "stop", "workspaceRoot": root}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "post_tool_use", "workspaceRoot": root,
+            "toolName": "edit", "toolInput": {"filePath": file}}),
+        ),
+    ];
+    for (harness, input) in inputs {
+        let hook = hook_output_for(state.path(), harness, &input.to_string());
+        assert_eq!(hook.status.code(), Some(0), "{harness} {input}");
+        assert!(hook.stdout.is_empty(), "{harness} {input}");
+        assert_eq!(
+            String::from_utf8_lossy(&hook.stderr),
+            note,
+            "{harness} {input}"
+        );
+    }
+
+    for index in 0..21 {
+        fs::write(root.join(format!("{index:02}.kt")), "fun f() = 1\n").unwrap();
+    }
+    let stop = serde_json::json!({"hook_event_name": "Stop", "cwd": root}).to_string();
+    let hook = hook_output(state.path(), &stop);
+    assert!(hook.status.success() && hook.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&hook.stderr);
+    assert_eq!(stderr.matches("note: UNVERIFIED ").count(), 20, "{stderr}");
+    assert!(stderr.ends_with("note: ... 2 more files\n"), "{stderr}");
+}
+
+#[test]
 fn directory_noise_is_silent_and_invalid_utf8_is_unverified() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("README.md"), "docs\n").unwrap();

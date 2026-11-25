@@ -177,6 +177,7 @@ fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> R
         changed: None,
     })?;
     if result.violations.is_empty() {
+        eprint!("{}", report::unverified_notes(&result));
         return Ok(0);
     }
     emit_feedback(
@@ -198,6 +199,7 @@ fn report_post_changed(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        eprint!("{}", report::unverified_notes(&result));
         return Ok(0);
     }
     emit_feedback(
@@ -220,6 +222,7 @@ fn report_stop(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        eprint!("{}", report::unverified_notes(&result));
         reset_counter(&input.session_id)?;
         return Ok(0);
     }
