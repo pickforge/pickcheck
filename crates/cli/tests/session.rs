@@ -229,7 +229,7 @@ fn concurrent_hook_events_share_one_anchor_and_lose_no_file() {
     inputs.extend((0..PATCHES).map(|_| ("codex", patch.clone())));
     let children = inputs
         .iter()
-        .map(|(harness, _)| spawn_hook(&state, harness))
+        .map(|(harness, _)| spawn_hook(state.path(), harness))
         .collect::<Vec<_>>();
     let outputs = children
         .into_iter()
@@ -252,9 +252,14 @@ fn concurrent_hook_events_share_one_anchor_and_lose_no_file() {
         assert!(!reason.contains("note:"), "{reason}");
         assert!(reason.contains(&format!("--base {initial} ")), "{reason}");
     }
-    let anchors = fs::read_dir(state.path().join("sessions"))
+    let state_files = fs::read_dir(state.path().join("sessions"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    // No temporary anchor file remains.
+    assert_eq!(state_files.len(), 2, "{state_files:?}");
+    let anchors = state_files
+        .into_iter()
         .filter(|path| path.extension().is_some_and(|kind| kind == "anchor"))
         .collect::<Vec<_>>();
     assert_eq!(anchors.len(), 1, "{anchors:?}");
@@ -457,6 +462,239 @@ fn one_session_id_keeps_an_anchor_per_repository() {
     assert_eq!(anchors, 4);
 }
 
+/// A file outside the repository around `cwd` has no base: the edit checks
+/// the whole file, exactly as without a session.
+#[test]
+fn an_edit_outside_the_repository_checks_the_whole_file() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    let loose = tempfile::tempdir().unwrap();
+    let (other, _) = repo(&[("b.js", &simple("b"))]);
+    fs::write(loose.path().join("x.js"), violating("x", 16)).unwrap();
+    fs::write(other.path().join("b.js"), violating("b", 16)).unwrap();
+    for file in [loose.path().join("x.js"), other.path().join("b.js")] {
+        let without = hook(&state, "claude", &edit_input(root, "", &file));
+        let output = hook(&state, "claude", &edit_input(root, "outside", &file));
+        let reason = block_reason(&output);
+        assert!(reason.starts_with("FAIL 1 file, 1 function"), "{reason}");
+        assert_eq!(output.stdout, without.stdout);
+        assert_eq!(output.stderr, without.stderr);
+    }
+    assert!(state.path().join("sessions").exists());
+}
+
+/// Unusable session state is a note on stderr, never a hook error: an event
+/// the hook ignores stays silent, and the others work without a session.
+#[test]
+fn unusable_session_state_is_a_note_and_the_hook_works_without_a_session() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    fs::write(root.join("a.js"), touched_simple("a")).unwrap();
+    fs::write(root.join("b.js"), violating("b", 16)).unwrap();
+    let file = state.path().join("file");
+    fs::write(&file, "").unwrap();
+    assert_without_session(&file, root, "a-file");
+
+    // A corrupt anchor.
+    start(&state, root, "corrupt");
+    let anchor = session_file(&state, "anchor");
+    fs::write(&anchor, "not a commit\n").unwrap();
+    assert_without_session(state.path(), root, "corrupt");
+    fs::remove_file(&anchor).unwrap();
+    fs::remove_file(session_file(&state, "files")).unwrap();
+
+    // A log that cannot be read.
+    start(&state, root, "log");
+    let log = session_file(&state, "files");
+    fs::remove_file(&log).unwrap();
+    fs::create_dir(&log).unwrap();
+    assert_without_session(state.path(), root, "log");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unwritable_state_directory_is_a_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    fs::write(root.join("b.js"), violating("b", 16)).unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    // A superuser writes anyway; there is nothing to test then.
+    if fs::write(state.path().join("probe"), "").is_err() {
+        assert_without_session(state.path(), root, "readonly");
+    }
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Garbage in the log is skipped record by record; the session goes on.
+#[test]
+fn a_corrupt_log_keeps_its_readable_records() {
+    let (dir, state) = repo(&[("a.js", &simple("a")), ("b.js", &simple("b"))]);
+    let root = dir.path();
+    let initial = head(root);
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    edit(&state, root, "garbage", "a.js");
+    let log = session_file(&state, "files");
+    let mut bytes = fs::read(&log).unwrap();
+    bytes.extend_from_slice(b"\xff\xfe{not json\n\"b.js\n\0\n");
+    fs::write(&log, bytes).unwrap();
+    commit_all(root, "violation");
+    let output = stop(&state, root, "garbage");
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    let reason = block_reason(&output);
+    assert!(reason.contains("FAIL a.js  1 function"), "{reason}");
+    assert!(reason.contains(&format!("--base {initial} ")), "{reason}");
+}
+
+/// The Git commands of one event, each at most once. See "Hook sessions"
+/// in `docs/spec.md` for the list.
+#[test]
+fn one_event_runs_each_git_command_once() {
+    let (dir, state) = repo(&[("a.js", &simple("a")), ("b.js", &simple("b"))]);
+    let root = dir.path();
+    start(&state, root, "count");
+    fs::write(root.join("b.js"), simple("b").replace('1', "2")).unwrap();
+    commit_all(root, "a commit in the session");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+
+    let input = edit_input(root, "count", &root.join("a.js"));
+    let (output, commands) = traced(&state, &input);
+    block_reason(&output);
+    // Locate, names and untracked for the record, merge base, the edited
+    // file's names and hunks, and its base content.
+    assert_eq!(commands.len(), 8, "{commands:#?}");
+
+    let input = json!({"hook_event_name":"Stop", "session_id":"count", "cwd":root});
+    let (output, commands) = traced(&state, &input);
+    block_reason(&output);
+    // The same, with whole-tree names and hunks from the base.
+    assert_eq!(commands.len(), 8, "{commands:#?}");
+}
+
+/// Past 100 recorded files that no longer exist, the names diff of an edit
+/// covers the whole tree instead of naming each of them.
+#[test]
+fn many_gone_files_widen_the_names_diff_of_an_edit() {
+    let names = (0..101)
+        .map(|index| format!("gone{index}.js"))
+        .collect::<Vec<_>>();
+    let mut files = names
+        .iter()
+        .map(|name| (name.as_str(), "// gone\n"))
+        .collect::<Vec<_>>();
+    let app = simple("a");
+    files.push(("a.js", &app));
+    let (dir, state) = repo(&files);
+    let root = dir.path();
+    for name in &names {
+        fs::remove_file(root.join(name)).unwrap();
+    }
+    start(&state, root, "gone");
+    commit_all(root, "delete");
+    let base = git_output(root, &["rev-parse", "HEAD~1"]);
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    let (output, commands) = traced(&state, &edit_input(root, "gone", &root.join("a.js")));
+    block_reason(&output);
+    let names_diff = commands
+        .iter()
+        .find(|command| command.contains(&format!("--name-status -z {base}")))
+        .unwrap();
+    assert!(names_diff.ends_with(" --"), "{names_diff}");
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.ends_with(&format!("--unified=0 {base} -- ':(literal)a.js'"))),
+        "{commands:#?}"
+    );
+}
+
+/// The Git commands that one hook event runs, from `GIT_TRACE`, after
+/// checking that none of them ran twice.
+fn traced(state: &TempDir, input: &Value) -> (Output, Vec<String>) {
+    let trace = state.path().join("trace");
+    let _ = fs::remove_file(&trace);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pickcheck"))
+        .args(["hook", "claude"])
+        .env("PICKCHECK_HOME", state.path())
+        .env("GIT_TRACE", &trace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let commands = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            line.split_once("trace: built-in: git ")
+                .map(|(_, args)| args.to_owned())
+        })
+        .collect::<Vec<_>>();
+    let unique = commands.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), commands.len(), "{commands:#?}");
+    (output, commands)
+}
+
+/// Every hook event with session state at `state` that cannot be used.
+fn assert_without_session(state: &Path, root: &Path, session: &str) {
+    let note = "note: hook session state unavailable, the hook runs without a session: ";
+    let bash = json!({"hook_event_name":"PostToolUse", "session_id":session, "cwd":root,
+        "tool_name":"Bash", "tool_input":{"command":"true"}});
+    let output = hook_at(state, "claude", &bash);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(note) && stderr.lines().count() == 1,
+        "{stderr}"
+    );
+
+    // An edit checks the whole file.
+    let output = hook_at(
+        state,
+        "claude",
+        &edit_input(root, session, &root.join("b.js")),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let reason = block_reason(&output);
+    assert!(reason.starts_with("FAIL 1 file, 1 function"), "{reason}");
+    assert!(text(&output.stderr).starts_with(note));
+
+    // `Stop` checks the diff against `HEAD`.
+    let stop = json!({"hook_event_name":"Stop", "session_id":session, "cwd":root});
+    let output = hook_at(state, "claude", &stop);
+    if output.status.code() == Some(0) {
+        let reason = block_reason(&output);
+        assert!(reason.contains("--changed --verbose"), "{reason}");
+    } else {
+        // The loop guard keeps its own error when it cannot count the block.
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(text(&output.stderr).contains("\nerror: "));
+    }
+    assert!(text(&output.stderr).starts_with(note));
+}
+
+/// The one state file of `kind` in the sessions directory.
+fn session_file(state: &TempDir, kind: &str) -> std::path::PathBuf {
+    let mut files = fs::read_dir(state.path().join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == kind));
+    let file = files.next().unwrap();
+    assert!(files.next().is_none());
+    file
+}
+
+fn touched_simple(name: &str) -> String {
+    simple(name).replace('1', "2")
+}
+
 fn repo(files: &[(&str, &str)]) -> (TempDir, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     for (path, content) in files {
@@ -535,6 +773,10 @@ fn block_reason(output: &Output) -> String {
 }
 
 fn hook(state: &TempDir, harness: &str, input: &Value) -> Output {
+    hook_at(state.path(), harness, input)
+}
+
+fn hook_at(state: &Path, harness: &str, input: &Value) -> Output {
     let mut child = spawn_hook(state, harness);
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input.to_string().as_bytes()).unwrap();
@@ -542,10 +784,10 @@ fn hook(state: &TempDir, harness: &str, input: &Value) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn spawn_hook(state: &TempDir, harness: &str) -> Child {
+fn spawn_hook(state: &Path, harness: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_pickcheck"))
         .args(["hook", harness])
-        .env("PICKCHECK_HOME", state.path())
+        .env("PICKCHECK_HOME", state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
