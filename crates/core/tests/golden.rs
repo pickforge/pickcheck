@@ -61,7 +61,8 @@ fn golden_fixtures_match_and_stay_within_reference_bounds() {
         let source_path = source_file(&directory);
         let source = fs::read_to_string(&source_path).unwrap();
         let actual = parse_source(Language::from_path(&source_path).unwrap(), &source).unwrap();
-        let actual: Vec<_> = actual.into_iter().map(Expected::from).collect();
+        assert!(actual.unmeasured.is_empty(), "{}", directory.display());
+        let actual: Vec<_> = actual.functions.into_iter().map(Expected::from).collect();
         assert_eq!(actual, expected.functions, "{}", directory.display());
         assert_strictness(&actual, &expected.reference.functions, &directory);
     }
@@ -81,6 +82,7 @@ fn crlf_sources_match_lf_metrics() {
         let metrics = |source: &str| -> Vec<Expected> {
             parse_source(language, source)
                 .unwrap()
+                .functions
                 .into_iter()
                 .map(Expected::from)
                 .collect()

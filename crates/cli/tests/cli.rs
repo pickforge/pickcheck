@@ -610,46 +610,86 @@ fn stop_hook_reason_lists_unverified_files() {
     assert!(reason.ends_with("Fix the listed files, then finish."));
 }
 
+/// A function over the depth limit, then a measurable one on line 2.
+fn deep_function_then(next: &str) -> String {
+    format!(
+        "function deep(a) {{ return {}a; }}\n{next}",
+        "a+".repeat(3_100)
+    )
+}
+
+const SEVEN_PARAMS: &str = "function bad(a, b, c, d, e, f, g) { return a; }\n";
+
 #[test]
-fn too_deep_files_are_unverified_and_the_scan_continues() {
+fn too_deep_units_are_left_out_and_the_rest_is_measured() {
     let dir = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
-    fs::write(root.join("deep.js"), &deep).unwrap();
-    fs::write(root.join("bad.js"), complex_function()).unwrap();
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
+    let chain = format!("function chain(a) {{ return {}a; }}\n", "a+".repeat(20_000));
+    fs::write(root.join("chain.js"), chain).unwrap();
 
     let check = command_output(root, &["check", "."]);
     assert_eq!(check.status.code(), Some(1));
-    let text = String::from_utf8_lossy(&check.stdout);
-    assert!(
-        text.contains("FAIL bad.js:1 bad  cognitive 16 > 15"),
-        "{text}"
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL deep.js:2 bad  params 7 > 6\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
     );
-    assert!(
-        text.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
-        "{text}"
+    let summary = command_output(root, &["check", "--summary", "."]);
+    assert_eq!(summary.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&summary.stdout),
+        "FAIL 1 file, 1 function, 1 violation\n\
+         UNVERIFIED 2 files\n\
+         FAIL deep.js  1 function, 1 violation\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n\
+         DETAILS pickcheck check --verbose <file>\n"
     );
+    let json = command_output(root, &["check", "--format", "json", "."]);
+    assert_eq!(json.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["checked"], 1);
+    assert_eq!(value["violations"][0]["function"], "bad");
+    assert_eq!(
+        value["unverified"],
+        serde_json::json!([
+            {"file": "chain.js", "reason": "syntax nesting too deep to measure"},
+            {"file": "deep.js", "reason": "syntax nesting too deep to measure"}
+        ])
+    );
+}
 
+#[test]
+fn base_units_that_were_too_deep_count_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
     init_repo(root);
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
     commit_all(root, "initial");
     git(root, &["checkout", "-qb", "feature"]);
     fs::write(
         root.join("deep.js"),
-        "function deep(a, b, c, d, e, f, g) { return a; }\n",
+        "function deep(a, b, c, d, e, f, g) { return a; }\n\
+         function bad(a, b, c, d, e, f, g) { return b; }\n",
     )
     .unwrap();
     let base = command_output(root, &["check", "--base", "main", "--verbose", "deep.js"]);
     assert_eq!(base.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&base.stdout).contains("FAIL deep.js:1 deep  params 7 > 6  new")
+    assert_eq!(
+        String::from_utf8_lossy(&base.stdout),
+        "FAIL deep.js:1 deep  params 7 > 6  new\n\
+         FAIL deep.js:2 bad  params 7 > 6  unchanged\n"
     );
-    assert!(
-        String::from_utf8_lossy(&base.stderr)
-            .contains("note: deep.js has no readable base; its functions count as new")
-    );
+    assert_eq!(String::from_utf8_lossy(&base.stderr), "");
 
-    fs::write(root.join("deep.js"), &deep).unwrap();
+    fs::write(
+        root.join("deep.js"),
+        deep_function_then("function bad(a, b, c, d, e, f, g) { return b; }\n"),
+    )
+    .unwrap();
     for event in ["PostToolUse", "Stop"] {
         let input = serde_json::json!({
             "hook_event_name": event, "session_id": "deep", "cwd": root,
@@ -657,10 +697,16 @@ fn too_deep_files_are_unverified_and_the_scan_continues() {
         })
         .to_string();
         let hook = hook_output(state.path(), &input);
+        assert!(hook.status.success(), "{event}");
+        let value: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
+        let reason = value["reason"].as_str().unwrap();
         assert!(
-            hook.status.success(),
-            "{event}: {}",
-            String::from_utf8_lossy(&hook.stderr)
+            reason.contains("FAIL deep.js  1 function, 1 violation\n"),
+            "{event}: {reason}"
+        );
+        assert!(
+            reason.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
+            "{event}: {reason}"
         );
     }
 }

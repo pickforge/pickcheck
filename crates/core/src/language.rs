@@ -292,30 +292,69 @@ fn ignored_kind_name(kind: &str) -> bool {
         .any(|part| kind.contains(part))
 }
 
-/// The deepest syntax-tree level `parse_source` measures. Every walk over a
-/// tree recurses once per level, so this bound, together with
-/// `on_measurement_stack`, keeps any input from overflowing the stack. Ordinary
-/// code stays far below it: a 1,000-term `a + b + …` chain is about 1,000 deep.
+/// The highest unit `parse_source` measures, in syntax-tree levels below the
+/// unit's own node. Measuring a unit recurses once per level, so this bound,
+/// together with `on_measurement_stack`, keeps any input from overflowing the
+/// stack. Ordinary code stays far below it: a 1,000-term `a + b + …` chain is
+/// about 1,000 levels high.
 pub const MAX_SYNTAX_DEPTH: usize = 3_000;
 
-/// Stack for `on_measurement_stack`. On an unoptimized build, the deepest tree
+/// Stack for `on_measurement_stack`. On an unoptimized build, the highest unit
 /// allowed needed at most 6.4 MiB (nested Svelte elements) and about 3 MiB for
-/// the other languages, so 64 MiB leaves a tenfold margin. Only the pages
-/// actually used are committed.
+/// the other languages, and a Svelte template expression adds its own parse at
+/// most once on top, so 64 MiB leaves a wide margin. Only the pages actually
+/// used are committed.
 const MEASUREMENT_STACK: usize = 64 << 20;
 
-/// `parse_source` fails with this error when a parsed tree is deeper than
-/// `MAX_SYNTAX_DEPTH`. Callers report the file as unverified.
-#[derive(Debug)]
-pub struct TooDeep;
+/// Why `parse_source` left some units of a file out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unmeasured {
+    /// A unit is higher than `MAX_SYNTAX_DEPTH`.
+    TooDeep,
+}
 
-impl fmt::Display for TooDeep {
+impl fmt::Display for Unmeasured {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("syntax nesting too deep to measure")
+        formatter.write_str(match self {
+            Self::TooDeep => "syntax nesting too deep to measure",
+        })
     }
 }
 
-impl std::error::Error for TooDeep {}
+/// The units `parse_source` measured in one file, and why it left others out.
+#[derive(Debug, Default)]
+pub struct ParsedSource {
+    /// Measured units, in source order.
+    pub functions: Vec<FunctionMetrics>,
+    /// Sorted and without repeats; empty when every unit was measured.
+    pub unmeasured: Vec<Unmeasured>,
+}
+
+impl ParsedSource {
+    /// The `UNVERIFIED` reason for a file with units left out.
+    pub fn reason(&self) -> Option<String> {
+        (!self.unmeasured.is_empty()).then(|| {
+            self.unmeasured
+                .iter()
+                .map(Unmeasured::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.functions.extend(other.functions);
+        self.unmeasured.extend(other.unmeasured);
+    }
+
+    fn finish(mut self) -> Self {
+        self.functions
+            .sort_by_key(|item| (item.line, item.end_line));
+        self.unmeasured.sort();
+        self.unmeasured.dedup();
+        self
+    }
+}
 
 /// Runs `task` on a thread with a stack sized for `MAX_SYNTAX_DEPTH`, so
 /// measuring never depends on the caller's stack. Run a whole scan inside one
@@ -336,20 +375,14 @@ pub fn on_measurement_stack<T: Send>(task: impl FnOnce() -> T + Send) -> std::io
     })
 }
 
-/// Parses `source` and rejects a tree deeper than `MAX_SYNTAX_DEPTH` with
-/// `TooDeep`, before any recursive walk can see it.
 fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(grammar)
         .context("incompatible tree-sitter grammar")?;
-    let tree = parser
+    parser
         .parse(source, None)
-        .context("tree-sitter parser returned no tree")?;
-    if exceeds_depth_limit(&tree) {
-        return Err(TooDeep.into());
-    }
-    Ok(tree)
+        .context("tree-sitter parser returned no tree")
 }
 
 /// Whether any node lies deeper than `MAX_SYNTAX_DEPTH`, found with a cursor
@@ -374,48 +407,122 @@ pub(crate) fn exceeds_depth_limit(tree: &Tree) -> bool {
     }
 }
 
-pub fn parse_source(language: Language, source: &str) -> Result<Vec<FunctionMetrics>> {
+/// One step of `walk_tree`.
+enum Step<'tree> {
+    /// A node and its depth below the walk's root. The visitor returns
+    /// whether to walk its children.
+    Enter(Node<'tree>, usize),
+    /// A node entered earlier, after its children.
+    Leave(Node<'tree>),
+}
+
+/// Visits `root` and every node below it in source order with one cursor, so
+/// the walk never recurses however deep the tree is.
+fn walk_tree<'tree>(root: Node<'tree>, mut visit: impl FnMut(Step<'tree>) -> bool) {
+    let mut cursor = root.walk();
+    let mut depth = 0;
+    loop {
+        if visit(Step::Enter(cursor.node(), depth)) && cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            visit(Step::Leave(cursor.node()));
+            if depth == 0 {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            cursor.goto_parent();
+            depth -= 1;
+        }
+    }
+}
+
+/// A unit that `walk_tree` has entered and not yet left.
+struct OpenUnit<'tree> {
+    node: Node<'tree>,
+    depth: usize,
+    deepest: usize,
+}
+
+impl<'tree> OpenUnit<'tree> {
+    fn new(node: Node<'tree>, depth: usize) -> Self {
+        Self {
+            node,
+            depth,
+            deepest: depth,
+        }
+    }
+
+    fn height(&self) -> usize {
+        self.deepest - self.depth
+    }
+}
+
+/// Every function in source order, with the height of its whole subtree.
+/// Nested functions count toward it, because measuring a function can walk
+/// into them.
+fn function_units(root: Node<'_>, language: Language) -> Vec<(Node<'_>, usize)> {
+    let mut open: Vec<(usize, OpenUnit<'_>)> = Vec::new();
+    let mut units = Vec::new();
+    walk_tree(root, |step| {
+        match step {
+            Step::Enter(node, depth) => {
+                if node.is_named() && is_function(language, node.kind()) {
+                    open.push((units.len(), OpenUnit::new(node, depth)));
+                    units.push((node, 0));
+                }
+                if let Some((_, unit)) = open.last_mut() {
+                    unit.deepest = unit.deepest.max(depth);
+                }
+            }
+            Step::Leave(node) => {
+                if let Some((index, unit)) = open.pop_if(|(_, unit)| unit.node == node) {
+                    if let Some((_, outer)) = open.last_mut() {
+                        outer.deepest = outer.deepest.max(unit.deepest);
+                    }
+                    units[index].1 = unit.height();
+                }
+            }
+        }
+        true
+    });
+    units
+}
+
+/// Measures every unit of `source`. A unit higher than `MAX_SYNTAX_DEPTH` is
+/// left out and listed in `unmeasured`; the other units are still measured.
+///
+/// The depth guarantee holds only inside `on_measurement_stack`: measuring a
+/// unit recurses once per level, so a caller on a small stack must run this
+/// there.
+///
+/// # Errors
+///
+/// Fails when a grammar cannot be loaded or the parser returns no tree.
+pub fn parse_source(language: Language, source: &str) -> Result<ParsedSource> {
     if language == Language::Svelte {
         return parse_svelte(source);
     }
     parse_with_offset(language, source, Offset::default())
 }
 
-fn parse_with_offset(
-    language: Language,
-    source: &str,
-    offset: Offset,
-) -> Result<Vec<FunctionMetrics>> {
+fn parse_with_offset(language: Language, source: &str, offset: Offset) -> Result<ParsedSource> {
     let tree = parse_tree(&language.grammar(), source)?;
     let lines = LineIndex::new(source, tree.root_node());
-    let mut functions = Vec::new();
-    collect_functions(
-        tree.root_node(),
-        language,
-        source,
-        offset,
-        &lines,
-        &mut functions,
-    );
-    functions.sort_by_key(|item| (item.line, item.end_line));
-    Ok(functions)
-}
-
-fn collect_functions(
-    node: Node<'_>,
-    language: Language,
-    source: &str,
-    offset: Offset,
-    lines: &LineIndex,
-    output: &mut Vec<FunctionMetrics>,
-) {
-    if is_function(language, node.kind()) {
-        output.push(measure_function(node, language, source, offset, lines));
+    let mut parsed = ParsedSource::default();
+    for (node, height) in function_units(tree.root_node(), language) {
+        if height > MAX_SYNTAX_DEPTH {
+            parsed.unmeasured.push(Unmeasured::TooDeep);
+        } else {
+            parsed
+                .functions
+                .push(measure_function(node, language, source, offset, &lines));
+        }
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_functions(child, language, source, offset, lines, output);
-    }
+    Ok(parsed.finish())
 }
 
 fn measure_function(
@@ -1153,7 +1260,13 @@ impl LineIndex {
             .filter(|start| *start < source.len())
             .collect();
         let mut comments = Vec::new();
-        collect_comments(root, &mut comments);
+        walk_tree(root, |step| match step {
+            Step::Enter(node, _) if node.kind().ends_with("comment") => {
+                comments.push((node.start_byte(), node.end_byte()));
+                false
+            }
+            _ => true,
+        });
         Self { starts, comments }
     }
 
@@ -1177,17 +1290,6 @@ impl LineIndex {
     }
 }
 
-fn collect_comments(node: Node<'_>, comments: &mut Vec<(usize, usize)>) {
-    if node.kind().ends_with("comment") {
-        comments.push((node.start_byte(), node.end_byte()));
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_comments(child, comments);
-    }
-}
-
 /// `comments` is sorted, so only the ones that reach this line are checked.
 fn line_has_code(line_start: usize, line: &str, comments: &[(usize, usize)]) -> bool {
     let first = comments.partition_point(|(_, end)| *end <= line_start);
@@ -1206,56 +1308,91 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
 
-fn parse_svelte(source: &str) -> Result<Vec<FunctionMetrics>> {
+fn parse_svelte(source: &str) -> Result<ParsedSource> {
     let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
-    let mut scripts = Vec::new();
-    collect_scripts(tree.root_node(), source, &mut scripts);
-    let mut functions = Vec::new();
-    for (language, content) in &scripts {
-        functions.extend(parse_with_offset(
-            *language,
-            node_text(*content, source),
-            Offset {
-                line: content.start_position().row,
-                byte: content.start_byte(),
-            },
+    let root = tree.root_node();
+    let units = svelte_units(root);
+    let mut parsed = ParsedSource::default();
+    let mut script = Language::JavaScript;
+    for element in &units.scripts {
+        let Some((language, start, end)) = script_content(*element, source) else {
+            continue;
+        };
+        if language == Language::TypeScript {
+            script = language;
+        }
+        parsed.extend(parse_with_offset(
+            language,
+            &source[start.byte..end],
+            start,
         )?);
     }
-    let template_language = if scripts
-        .iter()
-        .any(|(language, _)| *language == Language::TypeScript)
-    {
-        Language::TypeScript
-    } else {
-        Language::JavaScript
-    };
-    functions.extend(measure_template(
-        tree.root_node(),
-        source,
-        template_language,
-    )?);
-    functions.sort_by_key(|item| (item.line, item.end_line));
-    Ok(functions)
+    for (unit, height) in units.template {
+        let measured = (height <= MAX_SYNTAX_DEPTH)
+            .then(|| measure_template_unit(unit, source, script, unit.id() == root.id()))
+            .flatten();
+        match measured {
+            Some(unit) => parsed.functions.push(unit),
+            None => parsed.unmeasured.push(Unmeasured::TooDeep),
+        }
+    }
+    Ok(parsed.finish())
 }
 
-/// Every `script_element` with its grammar and its `raw_text` content. A
-/// `<script>` inside an HTML comment is part of a `comment` node, not an
+/// The parts of a Svelte tree that are measured, found with one cursor walk.
+#[derive(Default)]
+struct SvelteUnits<'tree> {
+    scripts: Vec<Node<'tree>>,
+    /// Template units, each with the height of the part of the tree its walks
+    /// visit: its own subtree without scripts, styles, and the units inside it.
+    template: Vec<(Node<'tree>, usize)>,
+}
+
+/// A `<script>` inside an HTML comment is part of a `comment` node, not an
 /// element, so it is never collected.
-fn collect_scripts<'tree>(
-    node: Node<'tree>,
-    source: &str,
-    output: &mut Vec<(Language, Node<'tree>)>,
-) {
-    if node.kind() == "script_element" {
-        if let Some(content) = child_of_kind(node, "raw_text") {
-            output.push((script_language(node, source), content));
+fn svelte_units(root: Node<'_>) -> SvelteUnits<'_> {
+    let mut units = SvelteUnits::default();
+    let mut open: Vec<OpenUnit<'_>> = Vec::new();
+    walk_tree(root, |step| match step {
+        Step::Enter(node, depth) => {
+            if let Some(unit) = open.last_mut() {
+                unit.deepest = unit.deepest.max(depth);
+            }
+            match node.kind() {
+                "script_element" => {
+                    units.scripts.push(node);
+                    return false;
+                }
+                "style_element" => return false,
+                kind if open.is_empty()
+                    || kind == "snippet_statement"
+                    || open.len() == 1 && TEMPLATE_BLOCKS.contains(&kind) =>
+                {
+                    open.push(OpenUnit::new(node, depth));
+                }
+                _ => {}
+            }
+            true
         }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_scripts(child, source, output);
-    }
+        Step::Leave(node) => {
+            if let Some(unit) = open.pop_if(|unit| unit.node == node) {
+                units.template.push((unit.node, unit.height()));
+            }
+            true
+        }
+    });
+    units
+}
+
+/// The grammar of a `script_element` and its `raw_text` content.
+fn script_content(element: Node<'_>, source: &str) -> Option<(Language, Offset, usize)> {
+    let tag = child_of_kind(element, "start_tag")?;
+    let content = child_of_kind(element, "raw_text")?;
+    let start = Offset {
+        line: content.start_position().row,
+        byte: content.start_byte(),
+    };
+    Some((script_language(tag, source), start, content.end_byte()))
 }
 
 fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
@@ -1266,10 +1403,7 @@ fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
 
 /// TypeScript when the start tag has `lang="ts"` or `lang="typescript"`,
 /// quoted or not.
-fn script_language(element: Node<'_>, source: &str) -> Language {
-    let Some(tag) = child_of_kind(element, "start_tag") else {
-        return Language::JavaScript;
-    };
+fn script_language(tag: Node<'_>, source: &str) -> Language {
     let mut cursor = tag.walk();
     let typescript = tag
         .named_children(&mut cursor)
@@ -1293,73 +1427,42 @@ fn script_language(element: Node<'_>, source: &str) -> Language {
 
 const TEMPLATE_BLOCKS: [&str; 3] = ["if_statement", "each_statement", "await_statement"];
 
-/// Template units collected so far, plus the grammar of the component's
-/// `<script>`, which `cognitive` also uses to parse template expressions.
-struct TemplateUnits {
+/// The template walks of one unit. `script` is the grammar of the component's
+/// `<script>`, which also parses template expressions. `root` marks the
+/// document, whose walk leaves out the blocks that form their own units.
+struct TemplateWalk<'s> {
+    source: &'s str,
     script: Language,
-    list: Vec<FunctionMetrics>,
-}
-
-fn measure_template(
-    root: Node<'_>,
-    source: &str,
-    script: Language,
-) -> Result<Vec<FunctionMetrics>> {
-    let mut units = TemplateUnits {
-        script,
-        list: Vec::new(),
-    };
-    let mut score = Score {
-        complexity: 1,
-        depth: 0,
-        bool_ops: 0,
-    };
-    score_svelte_node(root, source, 0, true, &mut score, &mut units)?;
-    let mut unit = template_metrics("<template>".to_owned(), root, &score);
-    unit.line = 1;
-    unit.end_line = source.lines().count().max(1);
-    unit.cognitive = cognitive::measure_template_unit(root, source, script, true);
-    units.list.push(unit);
-    Ok(units.list)
-}
-
-fn measure_svelte_node(
-    node: Node<'_>,
-    source: &str,
-    depth: usize,
+    unit_id: usize,
     root: bool,
-    score: &mut Score,
-    units: &mut TemplateUnits,
-) -> Result<()> {
-    match node.kind() {
-        "script_element" | "style_element" => {}
-        "snippet_statement" => {
-            let unit = measure_template_unit(node, source, units)?;
-            units.list.push(unit);
-        }
-        kind if root && TEMPLATE_BLOCKS.contains(&kind) => {
-            let unit = measure_template_unit(node, source, units)?;
-            units.list.push(unit);
-        }
-        _ => score_svelte_node(node, source, depth, root, score, units)?,
-    }
-    Ok(())
 }
 
+/// `None` when an expression in the unit is too deep to measure.
 fn measure_template_unit(
     node: Node<'_>,
     source: &str,
-    units: &mut TemplateUnits,
-) -> Result<FunctionMetrics> {
+    script: Language,
+    root: bool,
+) -> Option<FunctionMetrics> {
+    let walk = TemplateWalk {
+        source,
+        script,
+        unit_id: node.id(),
+        root,
+    };
     let mut score = Score {
         complexity: 1,
         depth: 0,
         bool_ops: 0,
     };
-    score_svelte_node(node, source, 0, false, &mut score, units)?;
+    walk.score(node, 0, &mut score)?;
     let mut unit = template_metrics(template_unit_name(node, source), node, &score);
-    unit.cognitive = cognitive::measure_template_unit(node, source, units.script, false);
-    Ok(unit)
+    if root {
+        unit.line = 1;
+        unit.end_line = source.lines().count().max(1);
+    }
+    unit.cognitive = cognitive::measure_template_unit(node, source, script, root);
+    Some(unit)
 }
 
 fn template_unit_name(node: Node<'_>, source: &str) -> String {
@@ -1367,18 +1470,14 @@ fn template_unit_name(node: Node<'_>, source: &str) -> String {
         "if_statement" => "{#if}".to_owned(),
         "each_statement" => "{#each}".to_owned(),
         "await_statement" => "{#await}".to_owned(),
-        _ => {
+        "snippet_statement" => {
             let name = node
                 .named_child(0)
-                .and_then(|start| {
-                    let mut cursor = start.walk();
-                    start
-                        .named_children(&mut cursor)
-                        .find(|child| child.kind() == "snippet_name")
-                })
+                .and_then(|start| child_of_kind(start, "snippet_name"))
                 .map_or("", |name| node_text(name, source));
             format!("{{#snippet {name}}}")
         }
+        _ => "<template>".to_owned(),
     }
 }
 
@@ -1400,52 +1499,55 @@ fn template_metrics(function: String, node: Node<'_>, score: &Score) -> Function
     }
 }
 
-fn score_svelte_node(
-    node: Node<'_>,
-    source: &str,
-    depth: usize,
-    root: bool,
-    score: &mut Score,
-    units: &mut TemplateUnits,
-) -> Result<()> {
-    if matches!(
-        node.kind(),
-        "if_start" | "else_if_start" | "each_start" | "await_start" | "catch_start"
-    ) {
-        score.complexity += 1;
+impl TemplateWalk<'_> {
+    /// Leaves out scripts, styles, and the units inside this one, the same
+    /// parts `svelte_units` leaves out of the unit's height.
+    fn score(&self, node: Node<'_>, depth: usize, score: &mut Score) -> Option<()> {
+        match node.kind() {
+            "script_element" | "style_element" => return Some(()),
+            "snippet_statement" if node.id() != self.unit_id => return Some(()),
+            kind if self.root && TEMPLATE_BLOCKS.contains(&kind) => return Some(()),
+            "if_start" | "else_if_start" | "each_start" | "await_start" | "catch_start" => {
+                score.complexity += 1;
+            }
+            "svelte_raw_text" if cognitive::scored_raw_text(node) => {
+                let expression = score_expression(node_text(node, self.source), self.script)?;
+                score.complexity += expression.complexity;
+                score.bool_ops = score.bool_ops.max(expression.bool_ops);
+            }
+            _ => {}
+        }
+        let next_depth = depth + usize::from(TEMPLATE_BLOCKS.contains(&node.kind()));
+        score.depth = score.depth.max(next_depth);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.score(child, next_depth, score)?;
+        }
+        Some(())
     }
-    if node.kind() == "svelte_raw_text" && cognitive::scored_raw_text(node) {
-        let expression = score_expression(node_text(node, source), units.script)?;
-        score.complexity += expression.complexity;
-        score.bool_ops = score.bool_ops.max(expression.bool_ops);
-    }
-    let next_depth = depth + usize::from(TEMPLATE_BLOCKS.contains(&node.kind()));
-    score.depth = score.depth.max(next_depth);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        measure_svelte_node(child, source, next_depth, root, score, units)?;
-    }
-    Ok(())
 }
 
 /// Decisions (`complexity` without its base 1) and the widest boolean chain in
 /// one template expression, parsed with the component's script grammar inside
 /// the wrapper `cognitive` also uses. Functions in the expression count
-/// inline; nodes inside an `ERROR` subtree add nothing. An expression deeper
-/// than `MAX_SYNTAX_DEPTH` makes the whole file `TooDeep`.
-fn score_expression(text: &str, script: Language) -> Result<Score> {
+/// inline; nodes inside an `ERROR` subtree add nothing. `None` when the
+/// expression's tree is deeper than `MAX_SYNTAX_DEPTH`.
+fn score_expression(text: &str, script: Language) -> Option<Score> {
     let mut score = Score {
         complexity: 0,
         depth: 0,
         bool_ops: 0,
     };
     let wrapped = format!("function expression() {{ return ({text}); }}");
-    let tree = parse_tree(&script.grammar(), &wrapped)?;
+    let tree = parse_tree(&script.grammar(), &wrapped).ok()?;
+    if exceeds_depth_limit(&tree) {
+        return None;
+    }
     if let Some(function) = cognitive::first_function(tree.root_node(), script) {
         let body = function.child_by_field_name("body").unwrap_or(function);
         score_expression_node(body, &wrapped, script, &mut score);
     }
-    Ok(score)
+    Some(score)
 }
 
 fn score_expression_node(node: Node<'_>, source: &str, script: Language, score: &mut Score) {
@@ -1518,65 +1620,84 @@ mod tests {
         }
     }
 
-    /// Sources whose trees sit exactly at the depth limit and one level over
-    /// it, for a shape that adds one level per repetition.
-    fn at_and_over_limit(language: Language, shape: impl Fn(usize) -> String) -> [String; 2] {
-        let offset = tree_depth(language, &shape(10)) - 10;
+    /// Sources whose unit sits exactly at the height limit and one level over
+    /// it, for a shape that adds one level per repetition. The unit's node is
+    /// `unit_depth` levels below the root, and the deepest node is in the unit.
+    fn at_and_over_limit(
+        language: Language,
+        unit_depth: usize,
+        shape: impl Fn(usize) -> String,
+    ) -> [String; 2] {
+        let height = |source: &str| tree_depth(language, source) - unit_depth;
+        let offset = height(&shape(10)) - 10;
         let at = shape(MAX_SYNTAX_DEPTH - offset);
         let over = shape(MAX_SYNTAX_DEPTH - offset + 1);
-        assert_eq!(tree_depth(language, &at), MAX_SYNTAX_DEPTH);
-        assert_eq!(tree_depth(language, &over), MAX_SYNTAX_DEPTH + 1);
+        assert_eq!(height(&at), MAX_SYNTAX_DEPTH);
+        assert_eq!(height(&over), MAX_SYNTAX_DEPTH + 1);
         [at, over]
     }
 
     #[test]
-    fn depth_limit_holds_on_a_one_mebibyte_caller_stack() {
+    fn depth_limit_holds_per_unit_on_a_one_mebibyte_caller_stack() {
         let chain = |terms: usize| format!("function f(a) {{ return {}a; }}", "a + ".repeat(terms));
         let ifs =
             |levels: usize| format!("function f(a) {{ {}{} }}", "if (a) ".repeat(levels), "a;");
         // Nested elements need the most stack per level of any shape measured.
         let elements =
             |levels: usize| format!("{}x{}", "<b>".repeat(levels), "</b>".repeat(levels));
+        let [chain_at, chain_over] = at_and_over_limit(Language::JavaScript, 1, chain);
+        let [ifs_at, ifs_over] = at_and_over_limit(Language::JavaScript, 1, ifs);
+        let [elements_at, elements_over] = at_and_over_limit(Language::Svelte, 0, elements);
+        // Next to a unit over the limit: a closure inside it, a function after
+        // it, a script function, a block, and a block after a deep expression.
+        let script = format!(
+            "{}\nfunction g(a) {{ return a; }}",
+            chain_over.replace("{ return", "{ const ok = (b) => b; return")
+        );
+        let component = format!("<script>{script}</script>{{#if a}}{{/if}}{elements_over}");
+        let expression = format!(
+            "<p>{{{}a}}</p>{{#if a}}{{/if}}",
+            "a + ".repeat(MAX_SYNTAX_DEPTH)
+        );
         let cases = [
-            (
-                Language::JavaScript,
-                at_and_over_limit(Language::JavaScript, chain),
-            ),
-            (
-                Language::JavaScript,
-                at_and_over_limit(Language::JavaScript, ifs),
-            ),
-            (
-                Language::Svelte,
-                at_and_over_limit(Language::Svelte, elements),
-            ),
+            (Language::JavaScript, chain_at, vec!["f"]),
+            (Language::JavaScript, chain_over, vec![]),
+            (Language::JavaScript, ifs_at, vec!["f"]),
+            (Language::JavaScript, ifs_over, vec![]),
+            (Language::Svelte, elements_at, vec!["<template>"]),
+            (Language::Svelte, elements_over, vec![]),
+            (Language::JavaScript, script, vec!["ok", "g"]),
+            (Language::Svelte, component, vec!["ok", "g", "{#if}"]),
+            (Language::Svelte, expression, vec!["{#if}"]),
         ];
-        let template = format!("<p>{{{}a}}</p>", "a + ".repeat(MAX_SYNTAX_DEPTH));
         let outcome = std::thread::Builder::new()
             .stack_size(1 << 20)
             .spawn(move || {
                 on_measurement_stack(move || {
-                    let mut results = cases
-                        .iter()
-                        .flat_map(|(language, sources)| {
-                            sources.iter().map(|source| parse_source(*language, source))
+                    cases
+                        .into_iter()
+                        .map(|(language, source, names)| {
+                            let parsed = parse_source(language, &source).unwrap();
+                            let found = parsed
+                                .functions
+                                .iter()
+                                .map(|unit| unit.function.clone())
+                                .collect::<Vec<_>>();
+                            (found, parsed.reason(), names)
                         })
-                        .collect::<Vec<_>>();
-                    results.push(parse_source(Language::Svelte, &template));
-                    results
+                        .collect::<Vec<_>>()
                 })
                 .unwrap()
             })
             .unwrap()
             .join()
             .unwrap();
-        for (pair, name) in outcome.chunks(2).zip(["f", "f", "<template>"]) {
-            let at = pair[0].as_ref().unwrap();
-            assert_eq!((at.len(), at[0].function.as_str()), (1, name));
-            assert!(pair[1].as_ref().unwrap_err().is::<TooDeep>());
+        for (index, (found, reason, names)) in outcome.into_iter().enumerate() {
+            assert_eq!(found, names, "case {index}");
+            let expected =
+                (index % 2 == 1 || index > 5).then_some("syntax nesting too deep to measure");
+            assert_eq!(reason.as_deref(), expected, "case {index}");
         }
-        let template = outcome[6].as_ref().unwrap_err();
-        assert_eq!(template.to_string(), "syntax nesting too deep to measure");
     }
 
     #[test]
@@ -1592,7 +1713,8 @@ mod tests {
             Language::JavaScript,
             "function nested(a,b,c){ return (a && b) + c; }\nfunction text(a){ return a + '||'; }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(functions[0].complexity, 2);
         assert_eq!(functions[1].complexity, 1);
         assert_eq!(functions[0].bool_ops, 1);
@@ -1624,7 +1746,7 @@ mod tests {
             ),
         ];
         for (language, source) in cases {
-            let functions = parse_source(language, source).unwrap();
+            let functions = parse_source(language, source).unwrap().functions;
             assert_eq!(functions[0].bool_ops, 3, "{}", language.name());
             assert_eq!(functions[1].bool_ops, 1, "{} closure", language.name());
         }
@@ -1633,7 +1755,8 @@ mod tests {
             Language::TypeScript,
             "function f(a:boolean,b:boolean,c:boolean,d:boolean,e:boolean){ return (a && b) ? (c || d) : e; }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(ternary[0].bool_ops, 1);
     }
 
@@ -1655,7 +1778,8 @@ class Screen {
 }
 "#,
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(functions[0].widget_depth, 5);
         assert_eq!(functions[1].widget_depth, 0);
         assert_eq!(functions[2].widget_depth, 0);
@@ -1667,17 +1791,20 @@ class Screen {
             Language::JavaScript,
             "function chain(x){ if(x===1){} else if(x===2){} else if(x===3){} else{} try{}catch(e){} }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let rust = parse_source(
             Language::Rust,
             "fn chain(x:u8){ if x==1 {} else if x==2 {} else if x==3 {} else {} }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let python = parse_source(
             Language::Python,
             "def guarded():\n    try:\n        pass\n    except Exception:\n        pass\n    finally:\n        pass\n",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!((javascript[0].complexity, javascript[0].depth), (5, 1));
         assert_eq!((rust[0].complexity, rust[0].depth), (4, 1));
         assert_eq!(python[0].depth, 1);
@@ -1689,12 +1816,14 @@ class Screen {
             Language::JavaScript,
             "function branches(x) { if (x) {} else for (;;) { while (x) { if (x) {} } } if (x) {} else try { while (x) { if (x) {} } } catch {} if (x) {} else switch (x) { case 1: while (x) { if (x) {} } } }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let dart = parse_source(
             Language::Dart,
             "void branches(int x) { if (x > 0) {} else for (;;) { while (x > 0) { if (x > 0) {} } } if (x > 0) {} else try { while (x > 0) { if (x > 0) {} } } catch (_) {} if (x > 0) {} else switch (x) { case 1: while (x > 0) { if (x > 0) {} } } }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(javascript[0].depth, 4);
         assert_eq!(dart[0].depth, 4);
     }
@@ -1705,7 +1834,8 @@ class Screen {
             Language::JavaScript,
             "function outer(list){ const mapped = list.map(x => x + 1); return mapped; }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(functions[0].function, "outer");
         assert_eq!(functions[1].function, "<anonymous>");
         assert_eq!(functions[1].params, 1);
@@ -1714,7 +1844,7 @@ class Screen {
     #[test]
     fn svelte_expressions_are_scored_from_the_syntax_tree() {
         let template = |source: &str| {
-            let functions = parse_source(Language::Svelte, source).unwrap();
+            let functions = parse_source(Language::Svelte, source).unwrap().functions;
             let unit = functions.last().unwrap();
             assert_eq!(unit.function, "<template>");
             (unit.complexity, unit.bool_ops)
@@ -1747,7 +1877,7 @@ class Screen {
             <script module>\nfunction second(a) { return a; }\n</script>\n\
             <script lang=ts>\nfunction third(a: number) { return a; }\n</script>\n\
             <script>\nfunction fourth(a, b) { return a; }\n</script>\n";
-        let functions = parse_source(Language::Svelte, source).unwrap();
+        let functions = parse_source(Language::Svelte, source).unwrap().functions;
         let names = functions
             .iter()
             .map(|item| (item.function.as_str(), item.line, item.params))
@@ -1775,27 +1905,32 @@ class Screen {
             Language::Dart,
             "int choose(int x) => switch (x) { 1 => 1, _ => 0 };",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let rust = parse_source(
             Language::Rust,
             "fn choose(default_value:u8)->u8 { match default_value { 0 => 1, default_value => 2 } }",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let guarded_dart = parse_source(
             Language::Dart,
             "int guarded(int v) => switch (v) { _ when v > 0 => 1, _ => 2 };",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let named_dart = parse_source(
             Language::Dart,
             "int named(int defaultValue) => switch (defaultValue) { defaultValue => 1 };",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         let svelte = parse_source(
             Language::Svelte,
             "<p>{\"question? && ||\"} {`s: ${ready && v}`}</p>",
         )
-        .unwrap();
+        .unwrap()
+        .functions;
         assert_eq!(dart[0].complexity, 2);
         assert_eq!(guarded_dart[0].complexity, 2);
         assert_eq!(named_dart[0].complexity, 2);

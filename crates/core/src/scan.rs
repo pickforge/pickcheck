@@ -9,7 +9,7 @@ use ignore::WalkBuilder;
 use serde::Serialize;
 
 use crate::{
-    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric, TooDeep,
+    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric,
     base_blob,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
@@ -92,6 +92,14 @@ impl FileContext<'_> {
     }
 }
 
+/// Scans the files that `options` selects.
+///
+/// The depth guarantee of `parse_source` holds only inside
+/// `on_measurement_stack`, so a caller on a small stack must run this there.
+///
+/// # Errors
+///
+/// Fails on a bad config, an unreadable path, or a Git failure.
 pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
     let cwd = physical(options.cwd);
     let options = &ScanOptions {
@@ -292,17 +300,14 @@ fn scan_file(
             return Ok(());
         }
     };
-    let functions = match parse_source(language, &source) {
-        Ok(functions) => functions,
-        Err(error) if error.is::<TooDeep>() => {
-            result.unverified.push(Unverified {
-                file: display,
-                reason: error.to_string(),
-            });
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
+    let parsed = parse_source(language, &source)?;
+    if let Some(reason) = parsed.reason() {
+        result.unverified.push(Unverified {
+            file: display.clone(),
+            reason,
+        });
+    }
+    let functions = parsed.functions;
     let context = FileContext {
         display: &display,
         matched: &matched_path,
@@ -386,7 +391,9 @@ fn base_units(
         BaseBlob::Content(bytes) => String::from_utf8(bytes).ok(),
     };
     let units = content.and_then(|source| {
-        Language::from_path(path).and_then(|language| parse_source(language, &source).ok())
+        Language::from_path(path)
+            .and_then(|language| parse_source(language, &source).ok())
+            .map(|parsed| parsed.functions)
     });
     if units.is_none() {
         result.notes.push(format!(

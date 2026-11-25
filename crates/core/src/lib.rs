@@ -15,8 +15,8 @@ pub use diff::{
     parse_diff_hunks, physical,
 };
 pub use language::{
-    FunctionMetrics, Language, MAX_SYNTAX_DEPTH, TooDeep, coverage_unknowns, grammar_inventory,
-    on_measurement_stack, parse_source,
+    FunctionMetrics, Language, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured, coverage_unknowns,
+    grammar_inventory, on_measurement_stack, parse_source,
 };
 pub use metric::Metric;
 pub use scan::{Baseline, ScanOptions, ScanResult, Unverified, Violation, scan};
