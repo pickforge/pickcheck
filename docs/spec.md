@@ -834,7 +834,9 @@ Session state. The first hook event of a session in a repository records the
 `HEAD` commit as the session anchor. Every event, including an event that a
 hook does not check, records the file it edits and every file that Git lists
 as changed or untracked against `HEAD` at that moment. Paths are relative to
-the physical repository root. The state lives in the `sessions` directory of
+the physical repository root, and the edited path is resolved as the file
+system resolves it before it is compared, so an event from a linked working
+directory and one from the physical directory share one session. The state lives in the `sessions` directory of
 the state directory (see State). Its file names are the sanitized session id
 and a key hash: the 64-bit FNV-1a hash, in 16 lowercase hex digits, of the
 raw session id, a zero byte, and the physical repository root path. One
@@ -873,9 +875,19 @@ session, so an event that the hook does not check still exits 0 with no
 output. A record in the log that does not parse is skipped, not a failure.
 The loop guard keeps its own error behavior.
 
+Notes. Every stderr note that session code writes, the state note above and
+the `note: UNVERIFIED` lines, is one write whose failure is ignored, so a
+stderr that cannot be written never changes the exit code or stdout. A
+session run that does not block, including one whose violations are all
+`WARN`, writes the `note: UNVERIFIED <file>  <reason>` lines of its
+unverified files, under the 20-path cap, as a hook outside a session does.
+The session comparison pairs units as `--base` does, with the units left out
+at either revision taking part, so a unit paired with a left-out base unit is
+`new`.
+
 Scope. The base is the merge base of the anchor and `HEAD`. When the anchor
-is `HEAD`, the base is `HEAD` and no merge base is computed. The changed set is the diff from the base to
-the working tree plus untracked files, as under `--base`, restricted to the
+is `HEAD`, the base is `HEAD` and no merge base is computed. The changed set
+is the diff from the base to the working tree plus untracked files, as under `--base`, restricted to the
 files that the session recorded. A file that the diff renames stays in the
 set when the session recorded its old path. A commit that a merge, a pull, or
 a rebase brings in therefore counts only where it touches a recorded file.
@@ -886,7 +898,12 @@ finds a rename only between two paths of one diff, so the post-edit names
 diff from the base lists the edited file, every recorded file that no longer
 exists, and every `.pickcheck.json`. Past 100 such recorded files it covers the
 whole tree. An edit of a file outside the repository around `cwd` checks the
-whole file, exactly as without a session, because that file has no base.
+whole file, exactly as without a session, because that file has no base. An
+edited file that is in no diff and that Git ignores (`git check-ignore`) is
+checked as a whole file with no base, as an untracked file is, so its
+violations are `new` and block with the default `hook.fail_on`. An ignored
+file that the event does not edit is never checked, and `Stop` does not check
+ignored files.
 
 Git commands. One event runs no Git command twice with the same arguments.
 The repository root and `HEAD` come from one `rev-parse`. Recording runs one
@@ -896,8 +913,9 @@ base. Otherwise one `merge-base` and one names diff from the base follow. The
 hunks come from one `diff --unified=0` from the base. Each file with a
 violation then reads its base content with one `ls-tree` and one `cat-file`.
 When a `.pickcheck.json` changed, one `ls-tree -r` lists the configs of the
-base commit, and one `cat-file` reads each config that a lookup reaches. A
-post-edit or `Stop` event with one violating file therefore runs at most 8
+base commit, and one `cat-file` reads each config that a lookup reaches. An
+edited file that is in no diff adds one `check-ignore`; it has no base to
+read. A post-edit or `Stop` event with one violating file therefore runs at most 8
 commands, and 2 more for each other violating file. A config change adds 1
 command, and 1 more for each config that is read.
 
@@ -921,8 +939,8 @@ built-in defaults resolve as usual. The block reason starts with
 and other scan notes follow it.
 
 Fallbacks. Outside a Git repository, without `HEAD`, without a session id, or
-with unusable session state, hooks behave as they did before sessions. An edit checks the whole edited
-file, and `Stop` checks the diff against `HEAD`, where every violation blocks
+with unusable session state, hooks behave as they did before sessions. An
+edit checks the whole edited file, and `Stop` checks the diff against `HEAD`, where every violation blocks
 and the repository config comes from the working tree. Without a session id
 nothing is recorded. When the anchor names no commit or has no merge base
 with `HEAD`, hooks behave the same way, and a block reason starts with

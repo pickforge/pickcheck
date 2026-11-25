@@ -52,7 +52,9 @@ are changed or untracked at that moment. `Stop` checks the diff from the merge
 base of the anchor and `HEAD` to the working tree, restricted to the recorded
 files. A post-edit event checks the functions that the session changed in the
 edited file. An edit of a file outside the repository checks the whole file,
-as without a session. Commits made during the session stay in scope. Commits that a
+as without a session. An edit of a file that Git ignores checks the whole
+file with no base, so its violations are new; ignored files that the session
+does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 
 Violations are compared with that base. `hook.fail_on` lists the statuses that
@@ -78,7 +80,10 @@ that are older than 30 days, and no other file.
 
 Session state never fails a hook. When the state directory cannot be written,
 or the anchor or log is unusable, the hook prints one `note:` line to stderr
-and works as without a session.
+and works as without a session. A session run that does not block writes the
+same `note: UNVERIFIED` lines as a run outside a session. A failed write to
+stderr is ignored. A session started from a linked working directory and
+continued from the physical one keeps one anchor.
 
 Outside Git, without `HEAD`, or without a session ID, hooks work as before
 sessions. When the anchor no longer resolves or has no merge base with `HEAD`,

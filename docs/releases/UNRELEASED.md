@@ -58,7 +58,10 @@
   older than 30 days is deleted. A state failure, such as an unwritable state
   directory or a corrupt anchor, is one `note:` line on stderr, and the hook
   then works as without a session; it never changes the exit code or stdout.
-  An edit of a file outside the repository still checks the whole file.
+  An edit of a file outside the repository still checks the whole file, and
+  an edit of a file that Git ignores checks the whole file with no base, so
+  its violations are new. A session run that does not block writes the same
+  `note: UNVERIFIED` lines on stderr as a run outside a session.
 - Default change: hooks now compare every violation with the session base and
   block only the statuses in the new `hook.fail_on` key, by default
   `["new", "worsened", "unmatched"]`. A legacy violation that an edit leaves
