@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use pickcheck_core::{
     ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange, Pathspec, Repository, ScanOptions,
-    ScanResult, config_changed, diff_spans, diff_status, load_config, load_config_at,
+    ScanResult, config_changed, diff_spans, diff_status, is_ignored, load_config, load_config_at,
     merge_base_with_head, physical, repository, resolve_path, scan, untracked_files,
 };
 use serde::Deserialize;
@@ -466,11 +466,24 @@ fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) ->
     let configs = config_changed(&changes)
         .then(|| CommitConfigs::read(&changes.repo_root, &base))
         .transpose()?;
+    if let Some(edited) = edited
+        && edited_but_ignored(&changes, edited)?
+    {
+        changes.untracked.push(edited.to_path_buf());
+    }
     Ok(Gate::new(Mode::Session {
         changes,
         base,
         configs,
     }))
+}
+
+/// Whether `edited` is in no diff because Git ignores it. Such a file is
+/// checked as a whole file with no base, as an untracked file is.
+fn edited_but_ignored(changes: &ChangedFiles, edited: &Path) -> Result<bool> {
+    let listed =
+        changes.spans.contains_key(edited) || changes.untracked.iter().any(|path| path == edited);
+    Ok(!listed && is_ignored(&changes.repo_root, edited)?)
 }
 
 /// The diff from `base`, with the names diff when it differs from the one

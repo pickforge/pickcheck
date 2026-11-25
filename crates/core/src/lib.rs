@@ -14,8 +14,8 @@ pub use config::{
 };
 pub use diff::{
     BaseBlob, ChangedFiles, DiffStatus, LineRange, Pathspec, Repository, base_blob, changed_files,
-    changed_files_since, diff_spans, diff_status, merge_base_with_head, parse_diff_hunks, physical,
-    repository, untracked_files,
+    changed_files_since, diff_spans, diff_status, is_ignored, merge_base_with_head,
+    parse_diff_hunks, physical, repository, untracked_files,
 };
 pub use language::{
     FunctionMetrics, Language, LeftOut, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured,

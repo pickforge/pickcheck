@@ -455,6 +455,18 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
+/// Whether Git ignores `path`, relative to the repository root: an untracked
+/// path that a `.gitignore` or exclude rule matches. A tracked path is never
+/// ignored.
+pub fn is_ignored(repo_root: &Path, path: &Path) -> Result<bool> {
+    let output = git_command(repo_root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(slash_path(path))
+        .output()
+        .context("failed to execute git check-ignore")?;
+    Ok(output.status.success())
+}
+
 /// The untracked files that Git does not ignore.
 pub fn untracked_files(cwd: &Path) -> Result<Vec<PathBuf>> {
     let output = git_command(cwd)
