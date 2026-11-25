@@ -849,6 +849,19 @@ osv-scanner jobs; `Swatinem/rust-cache@v2` in every workflow including release;
 macos-aarch64, macos-x86_64, windows-x86_64 archives with checksums. The binary
 gates itself: CI runs `pickcheck check crates` and fails on violations.
 
+The `corpus` CI job measures a pinned corpus of public, permissively licensed
+repositories. `tests/corpus/manifest.json` pins each repository by full commit
+SHA and records its license. `scripts/fetch-corpus.sh <dir>` fetches each one
+at that commit. The ignored test `crates/core/tests/corpus.rs` scans every
+repository with the built-in defaults only. It compares the result with
+`tests/corpus/snapshot.json`. Per repository and language, the snapshot holds
+the file and function counts, the violations per metric, and the value
+histogram of every metric, plus the unverified count per repository. A mismatch
+fails the job and prints each changed count. To regenerate the snapshot, run
+`PICKCHECK_CORPUS_UPDATE=1 PICKCHECK_CORPUS_DIR=<dir> cargo test -p
+pickcheck-core --test corpus --release -- --ignored`. Plain `cargo test` never
+fetches the corpus.
+
 ## Layout
 
 ```
@@ -859,6 +872,8 @@ config.default.json
 docs/spec.md  docs/hooks.md
 docs/assets/branding/      # PickCheck marks, README art, social card
 tests/fixtures/<language>/
+tests/corpus/              # pinned corpus manifest and snapshot
+scripts/fetch-corpus.sh
 .github/workflows/{ci,release}.yml
 clippy.toml  osv-scanner.toml
 ```
