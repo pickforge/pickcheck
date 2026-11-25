@@ -311,12 +311,16 @@ const MEASUREMENT_STACK: usize = 64 << 20;
 pub enum Unmeasured {
     /// A unit is higher than `MAX_SYNTAX_DEPTH`.
     TooDeep,
+    /// A Svelte `<script>` start tag that the grammar could not close, so its
+    /// content is not known.
+    ScriptBlock,
 }
 
 impl fmt::Display for Unmeasured {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::TooDeep => "syntax nesting too deep to measure",
+            Self::ScriptBlock => "script block could not be parsed",
         })
     }
 }
@@ -1311,8 +1315,11 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 fn parse_svelte(source: &str) -> Result<ParsedSource> {
     let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
     let root = tree.root_node();
-    let units = svelte_units(root);
+    let units = svelte_units(root, source);
     let mut parsed = ParsedSource::default();
+    if units.damaged_script {
+        parsed.unmeasured.push(Unmeasured::ScriptBlock);
+    }
     let mut script = Language::JavaScript;
     for element in &units.scripts {
         let Some((language, start, end)) = script_content(*element, source) else {
@@ -1343,6 +1350,9 @@ fn parse_svelte(source: &str) -> Result<ParsedSource> {
 #[derive(Default)]
 struct SvelteUnits<'tree> {
     scripts: Vec<Node<'tree>>,
+    /// A `<script>` start tag outside any `script_element`, as the grammar
+    /// leaves one whose content holds a string such as `"</scripts>"`.
+    damaged_script: bool,
     /// Template units, each with the height of the part of the tree its walks
     /// visit: its own subtree without scripts, styles, and the units inside it.
     template: Vec<(Node<'tree>, usize)>,
@@ -1350,7 +1360,7 @@ struct SvelteUnits<'tree> {
 
 /// A `<script>` inside an HTML comment is part of a `comment` node, not an
 /// element, so it is never collected.
-fn svelte_units(root: Node<'_>) -> SvelteUnits<'_> {
+fn svelte_units<'tree>(root: Node<'tree>, source: &str) -> SvelteUnits<'tree> {
     let mut units = SvelteUnits::default();
     let mut open: Vec<OpenUnit<'_>> = Vec::new();
     walk_tree(root, |step| match step {
@@ -1364,6 +1374,7 @@ fn svelte_units(root: Node<'_>) -> SvelteUnits<'_> {
                     return false;
                 }
                 "style_element" => return false,
+                "start_tag" => units.damaged_script |= is_script_tag(node, source),
                 kind if open.is_empty()
                     || kind == "snippet_statement"
                     || open.len() == 1 && TEMPLATE_BLOCKS.contains(&kind) =>
@@ -1384,15 +1395,22 @@ fn svelte_units(root: Node<'_>) -> SvelteUnits<'_> {
     units
 }
 
-/// The grammar of a `script_element` and its `raw_text` content.
+/// The Svelte grammar recognises only a lowercase `script` tag as a script.
+fn is_script_tag(tag: Node<'_>, source: &str) -> bool {
+    child_of_kind(tag, "tag_name").is_some_and(|name| node_text(name, source) == "script")
+}
+
+/// The grammar of a `script_element` and its content: every byte between its
+/// start tag and its end tag. A string such as `"</scripts>"` can split the
+/// content into `raw_text` and an `ERROR` node; this range still covers both.
 fn script_content(element: Node<'_>, source: &str) -> Option<(Language, Offset, usize)> {
     let tag = child_of_kind(element, "start_tag")?;
-    let content = child_of_kind(element, "raw_text")?;
+    let end = child_of_kind(element, "end_tag").map_or(element.end_byte(), |end| end.start_byte());
     let start = Offset {
-        line: content.start_position().row,
-        byte: content.start_byte(),
+        line: tag.end_position().row,
+        byte: tag.end_byte(),
     };
-    Some((script_language(tag, source), start, content.end_byte()))
+    Some((script_language(tag, source), start, end.max(start.byte)))
 }
 
 fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
@@ -1897,6 +1915,25 @@ class Screen {
             &source[first.span.0..first.span.1],
             "function first(a: number) { return a; }"
         );
+
+        // A string such as "</scripts>" splits the content into `raw_text` and
+        // an `ERROR` node. Inside a `script_element`, the content up to the
+        // end tag is still measured; outside one, the file is incomplete.
+        let recovered =
+            "<script>const t = \"</scripts>\"; function after(a) {}</script>\n<style>.a{}</style>";
+        let recovered = parse_source(Language::Svelte, recovered).unwrap();
+        assert_eq!(recovered.functions[0].function, "after");
+        assert!(recovered.unmeasured.is_empty());
+        let damaged = "<script>const t = \"</scripture>\"; function lost(a) { return a; }</script>\n\
+            <script module>function kept(a) { return a; }</script>";
+        let damaged = parse_source(Language::Svelte, damaged).unwrap();
+        let names = damaged
+            .functions
+            .iter()
+            .map(|item| item.function.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["<template>", "kept"]);
+        assert_eq!(damaged.unmeasured, [Unmeasured::ScriptBlock]);
     }
 
     #[test]

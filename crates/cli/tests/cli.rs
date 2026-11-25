@@ -784,6 +784,25 @@ fn hooks_that_do_not_block_note_unverified_files() {
 }
 
 #[test]
+fn a_damaged_svelte_script_is_unverified_and_the_rest_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("case.svelte"),
+        "<script>const text = \"</scripture>\"; function bad(a,b,c,d,e,f,g) { return a; }</script>\n\
+         <script context=\"module\">function other(a,b,c,d,e,f,g) { return a; }</script>\n",
+    )
+    .unwrap();
+    let check = command_output(root, &["check", "case.svelte"]);
+    assert_eq!(check.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL case.svelte:2 other  params 7 > 6\n\
+         UNVERIFIED case.svelte  script block could not be parsed\n"
+    );
+}
+
+#[test]
 fn directory_noise_is_silent_and_invalid_utf8_is_unverified() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("README.md"), "docs\n").unwrap();
