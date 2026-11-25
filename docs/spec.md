@@ -510,7 +510,15 @@ pickcheck --version
   (which already include tracked files that a later `.gitignore` rule covers)
   plus untracked files from `git ls-files --others --exclude-standard`; config
   `ignore` applies before any language lookup, so ignored paths never appear as
-  `UNVERIFIED`. Explicit paths are normalized (`.`/`..`) before intersecting.
+  `UNVERIFIED`. Explicit paths are resolved as the file system resolves them
+  before intersecting: symbolic links in the directory part are followed, then
+  `.` and `..` apply. A link to a file keeps its own name, which is the path
+  Git lists and the one that selects the language. Every other existing path
+  gets the name the file system stores, so a Windows short name or another
+  letter case matches. A path whose directory does not exist is normalized
+  lexically first. The working directory and
+  the repository root are resolved the same way, so config lookup, `ignore`
+  globs, and report paths follow the real directories.
   Non-UTF-8 diff output is decoded lossily; hunk headers are ASCII. Git is invoked with
   `--no-ext-diff --no-textconv --find-renames`, external diff, textconv, fsmonitor, and hooks
   disabled, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_EXTERNAL_DIFF`/`GIT_CONFIG_*`

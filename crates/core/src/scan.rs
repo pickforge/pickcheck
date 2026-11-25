@@ -12,7 +12,7 @@ use crate::{
     BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric, TooDeep,
     base_blob,
     baseline::{self, MetricValues, Pairing, Status},
-    diff::repository_root,
+    diff::{physical, repository_root},
     load_config, parse_source,
 };
 
@@ -93,6 +93,13 @@ impl FileContext<'_> {
 }
 
 pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
+    let cwd = physical(options.cwd);
+    let options = &ScanOptions {
+        cwd: &cwd,
+        paths: options.paths,
+        explicit_config: options.explicit_config,
+        changed: options.changed,
+    };
     let roots = scan_roots(options);
     let match_base = match_base(options, &roots)?;
     let files = if let Some(changed) = options.changed.filter(|changed| !changed.fallback) {
@@ -438,13 +445,31 @@ fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &m
     }
 }
 
+/// An explicit path as the file system resolves it: links in its directory
+/// part are followed before `..` applies. A path whose directory does not
+/// exist is normalized lexically first, then resolved the same way.
 fn absolute(cwd: &Path, path: &Path) -> PathBuf {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    normalize(&path)
+    let path = cwd.join(path);
+    resolved(&path).unwrap_or_else(|| {
+        let lexical = normalize(&path);
+        resolved(&lexical).unwrap_or(lexical)
+    })
+}
+
+/// The physical spelling of `path`, or `None` when its directory does not
+/// exist. A link to a file keeps its own name, which is the name Git lists
+/// and the one that selects the grammar. Every other existing entry gets the
+/// name the file system stores, so a Windows short name or another letter
+/// case still matches the path Git prints.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let link = path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    if path.is_dir() || (!link && path.exists()) {
+        return Some(physical(path));
+    }
+    let parent = path.parent().filter(|parent| parent.is_dir())?;
+    Some(physical(parent).join(path.file_name()?))
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -511,6 +536,21 @@ fn read_reason(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_under_a_missing_directory_is_normalized_lexically() {
+        let cwd = Path::new("/no-such-root/work");
+        for (given, expected) in [
+            ("gone/../a.js", "/no-such-root/work/a.js"),
+            ("./gone/./b.js", "/no-such-root/work/gone/b.js"),
+        ] {
+            assert_eq!(absolute(cwd, Path::new(given)), Path::new(expected));
+        }
+        // `..` stops at the root, and stays when there is nothing to leave.
+        for (given, expected) in [("/a/../../c.js", "/c.js"), ("../../d.js", "../../d.js")] {
+            assert_eq!(normalize(Path::new(given)), Path::new(expected));
+        }
+    }
 
     #[test]
     fn violations_skip_metrics_that_do_not_apply_to_the_unit() {

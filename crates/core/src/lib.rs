@@ -12,7 +12,7 @@ pub use baseline::{MetricValues, Pairing, Status, pair_units};
 pub use config::{Config, ConfigResolution, Limits, load_config};
 pub use diff::{
     BaseBlob, ChangedFiles, LineRange, base_blob, changed_files, changed_files_since,
-    parse_diff_hunks,
+    parse_diff_hunks, physical,
 };
 pub use language::{
     FunctionMetrics, Language, MAX_SYNTAX_DEPTH, TooDeep, coverage_unknowns, grammar_inventory,

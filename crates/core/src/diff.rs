@@ -102,10 +102,10 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
 /// textconv or filters. Only an entry that `ls-tree` does not list is
 /// missing; every Git failure makes the base unreadable.
 pub fn base_blob(repo_root: &Path, commit: &str, path: &Path) -> BaseBlob {
-    let path = path.to_string_lossy();
+    let path = slash_path(path);
     let listing = match git_command(repo_root)
         .env("GIT_LITERAL_PATHSPECS", "1")
-        .args(["ls-tree", "-z", commit, "--", path.as_ref()])
+        .args(["ls-tree", "-z", commit, "--", path.as_str()])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,
@@ -173,9 +173,9 @@ fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>)
     let mut touched = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        let path = PathBuf::from(path);
+        let path = git_path(path);
         if matches!(status.chars().next(), Some('R' | 'C'))
-            && let Some(new) = fields.next().map(PathBuf::from)
+            && let Some(new) = fields.next().map(git_path)
         {
             if status.starts_with('R') {
                 renames.insert(new.clone(), path.clone());
@@ -196,7 +196,47 @@ pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
-    Ok(Some(PathBuf::from(root.trim())))
+    Ok(Some(physical(Path::new(root.trim()))))
+}
+
+/// The physical spelling of an existing path: symbolic links and Windows
+/// short names resolved, as Git prints the repository root. Config lookup,
+/// globs, the changed set, and reports all use this one spelling. A path that
+/// does not resolve is returned as given.
+pub fn physical(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .map_or_else(|_| path.to_path_buf(), plain)
+}
+
+/// On Windows `canonicalize` returns a verbatim path (`\\?\C:\repo`), which
+/// never compares equal to the `C:/repo` that Git prints.
+#[cfg(windows)]
+fn plain(path: PathBuf) -> PathBuf {
+    let plain = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .map(PathBuf::from);
+    plain.unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn plain(path: PathBuf) -> PathBuf {
+    path
+}
+
+/// A path Git printed, which always uses `/`, with native separators. The
+/// separators change in the string, because pushing a component such as
+/// `a:b.js` would replace the path on Windows.
+fn git_path(path: &str) -> PathBuf {
+    PathBuf::from(path.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
+/// A relative path in the `/` form Git expects. The separators change in
+/// the string, for the reason `git_path` gives.
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 fn merge_base(repo_root: &Path, base: &str) -> Result<String> {
@@ -270,7 +310,7 @@ fn untracked(cwd: &Path) -> Result<Vec<PathBuf>> {
         .stdout
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .map(|part| PathBuf::from(String::from_utf8_lossy(part).as_ref()))
+        .map(|part| git_path(&String::from_utf8_lossy(part)))
         .collect())
 }
 
@@ -305,7 +345,7 @@ fn diff_path(value: &str) -> Option<PathBuf> {
     }
     let value = value.split('\t').next().unwrap_or(value);
     let path = value.strip_prefix("b/")?;
-    Some(PathBuf::from(path))
+    Some(git_path(path))
 }
 
 fn post_image_range(header: &str) -> Option<LineRange> {
@@ -352,6 +392,26 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn git_paths_round_trip_without_losing_components() {
+        for git in ["src/sub/a.js", "a:b.js", "dir/a:b.js", "top.js"] {
+            assert_eq!(slash_path(&git_path(git)), git);
+        }
+        assert_eq!(
+            git_path("src/sub/a.js"),
+            Path::new("src").join("sub").join("a.js")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_paths_are_not_verbatim() {
+        let dir = std::env::temp_dir();
+        let text = physical(&dir).to_string_lossy().into_owned();
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert_eq!(physical(&physical(&dir)), physical(&dir));
     }
 
     #[test]

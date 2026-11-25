@@ -401,6 +401,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn globs_match_paths_built_with_native_separators() {
+        let ignore = Config::matcher(&["gen/**".to_owned()]).unwrap();
+        let tests =
+            Config::matcher(&["**/tests/**".to_owned(), "**/*_test.go".to_owned()]).unwrap();
+        let generated = Path::new("gen").join("sub").join("a.rs");
+        assert!(ignore.is_match(&generated));
+        assert!(!ignore.is_match(Path::new("src").join("gen.rs")));
+        assert!(tests.is_match(Path::new("pkg").join("tests").join("a.js")));
+        assert!(tests.is_match(Path::new("pkg").join("a_test.go")));
+        assert!(!tests.is_match(Path::new("pkg").join("a.go")));
+    }
+
+    #[test]
     fn partial_top_level_objects_merge() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");

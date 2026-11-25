@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use pickcheck_core::{ScanOptions, changed_files, load_config, scan};
+use pickcheck_core::{ScanOptions, changed_files, load_config, physical, scan};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -279,18 +279,27 @@ fn emit_feedback(harness: Harness, reason: &str, stop: bool) -> Result<u8> {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("PICKCHECK_HOME") {
+    state_dir_from(env::var_os("PICKCHECK_HOME"), dirs::home_dir())
+}
+
+fn state_dir_from(
+    pickcheck_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = pickcheck_home {
         return Ok(PathBuf::from(path));
     }
-    let home = dirs_home().context("cannot determine home directory")?;
-    Ok(home.join(".pickforge/pickcheck"))
+    let home = home.context("cannot determine home directory")?;
+    Ok(home.join(".pickforge").join("pickcheck"))
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
-}
-
+/// The physical working directory, so the config lookup for the loop guard
+/// walks the same ancestors as the scan.
 fn working_directory(input: &HookInput) -> PathBuf {
+    physical(&requested_directory(input))
+}
+
+fn requested_directory(input: &HookInput) -> PathBuf {
     input
         .cwd
         .clone()
@@ -437,6 +446,21 @@ mod tests {
         assert!(parsed.session_id.is_empty());
         assert!(parsed.cwd.is_none());
         assert!(matches!(classify(Harness::Claude, &parsed), Event::Ignore));
+    }
+
+    #[test]
+    fn state_dir_prefers_pickcheck_home_then_platform_home() {
+        let home = PathBuf::from("home");
+        assert_eq!(
+            state_dir_from(Some("override".into()), Some(home.clone())).unwrap(),
+            Path::new("override")
+        );
+        assert_eq!(
+            state_dir_from(None, Some(home)).unwrap(),
+            Path::new("home").join(".pickforge").join("pickcheck")
+        );
+        let error = state_dir_from(None, None).unwrap_err();
+        assert_eq!(error.to_string(), "cannot determine home directory");
     }
 
     #[test]
