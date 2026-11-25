@@ -760,6 +760,7 @@ fn stop_loop_guard_blocks_three_then_releases_without_reset() {
 #[test]
 fn both_hook_commands_parse_current_post_tool_input() {
     let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
     let file = dir.path().join("bad.js");
     fs::write(&file, "function bad(x) { return x; }\n").unwrap();
     git(dir.path(), &["init", "-q"]);
@@ -777,19 +778,7 @@ fn both_hook_commands_parse_current_post_tool_input() {
         let input = serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"test",
             "cwd":dir.path(), "tool_name":tool, "tool_input":tool_input})
         .to_string();
-        let mut child = binary()
-            .args(["hook", harness])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = hook_output_for(state.path(), harness, &input);
         assert!(output.status.success());
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["decision"], "block");
