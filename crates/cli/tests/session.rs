@@ -407,7 +407,12 @@ fn changed_entries_that_are_not_files_keep_the_session_gate() {
         }),
         ("submodule", |root| {
             fs::write(root.join("sub/m.txt"), "bumped\n").unwrap();
-            git(&root.join("sub"), &["commit", "-qam", "bump"]);
+            // The clone has no identity of its own.
+            let identity = ["-c", "user.email=test@example.com", "-c", "user.name=Test"];
+            git(
+                &root.join("sub"),
+                &[&identity[..], &["commit", "-qam", "bump"]].concat(),
+            );
         }),
     ];
     #[cfg(unix)]
