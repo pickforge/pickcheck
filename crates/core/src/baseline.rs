@@ -1,7 +1,10 @@
 //! Pairs each unit with the same unit at the merge base and decides the
 //! status of a violation, as "Baseline (`--base`)" in `docs/spec.md` defines.
 
-use std::{cmp::Reverse, collections::BTreeMap};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -101,8 +104,60 @@ impl From<&FunctionMetrics> for MetricValues {
 /// and still own their closures; a unit paired with a left-out base unit is
 /// new.
 pub fn pair_units(current: &ParsedSource, base: &ParsedSource) -> Vec<Pairing> {
+    pair_with_claims(current, base, &BTreeMap::new())
+}
+
+/// A file's text with its units.
+#[derive(Clone, Copy)]
+pub struct Text<'a> {
+    pub source: &'a str,
+    pub parsed: &'a ParsedSource,
+}
+
+/// Pairs like `pair_units`, but each named unit marked in `untouched` first
+/// claims a base unit with its name and its text, one base unit per claim.
+/// The other units of that name then pair in source order with the base
+/// units that no claim took. So a unit of the same name that is added before
+/// an old unit is the new one, and the old unit keeps its own base.
+pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, untouched: &[bool]) -> Vec<Pairing> {
+    if !untouched.contains(&true) {
+        return pair_units(current.parsed, base.parsed);
+    }
+    // Base units by name and text, the first in the file last, so `pop`
+    // takes them in file order.
+    let mut free = BTreeMap::<(&str, &str), Vec<usize>>::new();
+    for (index, unit) in base.parsed.functions.iter().enumerate().rev() {
+        if let Some(text) = unit_text(base.source, unit) {
+            free.entry((&unit.function, text)).or_default().push(index);
+        }
+    }
+    let mut claims = BTreeMap::new();
+    for (index, unit) in current.parsed.functions.iter().enumerate() {
+        if !untouched[index] || unit.function == ANONYMOUS {
+            continue;
+        }
+        let claimed = unit_text(current.source, unit)
+            .and_then(|text| free.get_mut(&(unit.function.as_str(), text))?.pop());
+        if let Some(base_index) = claimed {
+            claims.insert(index, base_index);
+        }
+    }
+    pair_with_claims(current.parsed, base.parsed, &claims)
+}
+
+fn unit_text<'a>(source: &'a str, unit: &FunctionMetrics) -> Option<&'a str> {
+    source.get(unit.span.0..unit.span.1)
+}
+
+/// `claims` maps a measured current unit to the measured base unit it pairs
+/// with before the pairing by order.
+fn pair_with_claims(
+    current: &ParsedSource,
+    base: &ParsedSource,
+    claims: &BTreeMap<usize, usize>,
+) -> Vec<Pairing> {
     let (current_keys, base_keys) = (keys(current), keys(base));
-    let mut pairing = pair_named(&current_keys, &base_keys);
+    let mut pairing = pair_named(&current_keys, &base_keys, claims);
     pair_anonymous(&current_keys, &base_keys, &mut pairing);
     let measured = base.functions.len();
     pairing
@@ -115,14 +170,24 @@ pub fn pair_units(current: &ParsedSource, base: &ParsedSource) -> Vec<Pairing> {
         .collect()
 }
 
-fn pair_named(current: &[Key<'_>], base: &[Key<'_>]) -> Vec<Pairing> {
+fn pair_named(
+    current: &[Key<'_>],
+    base: &[Key<'_>],
+    claims: &BTreeMap<usize, usize>,
+) -> Vec<Pairing> {
     let mut pairing = vec![Pairing::New; current.len()];
+    let taken = claims.values().collect::<BTreeSet<_>>();
     let base_names = named_occurrences(base);
     for (name, indices) in named_occurrences(current) {
         let base_indices = base_names.get(name).map_or(&[][..], Vec::as_slice);
-        for (&index, &base_index) in indices.iter().zip(base_indices) {
+        let unclaimed = indices.iter().filter(|index| !claims.contains_key(index));
+        let free = base_indices.iter().filter(|index| !taken.contains(index));
+        for (&index, &base_index) in unclaimed.zip(free) {
             pairing[index] = Pairing::Paired(base_index);
         }
+    }
+    for (&index, &base_index) in claims {
+        pairing[index] = Pairing::Paired(base_index);
     }
     pairing
 }
@@ -333,6 +398,85 @@ mod tests {
                 Pairing::New,
                 Pairing::Paired(5),
             ]
+        );
+    }
+
+    /// A file whose units are `name`s with their text, one per line.
+    fn file(units: &[(&str, &str)]) -> (String, ParsedSource) {
+        let mut source = String::new();
+        let mut functions = Vec::new();
+        for (name, text) in units {
+            let start = source.len();
+            source.push_str(text);
+            functions.push(unit(name, (start, source.len()), text.len()));
+            source.push('\n');
+        }
+        let parsed = ParsedSource {
+            functions,
+            ..ParsedSource::default()
+        };
+        (source, parsed)
+    }
+
+    fn by_text(
+        current: &[(&str, &str)],
+        base: &[(&str, &str)],
+        untouched: &[bool],
+    ) -> Vec<Pairing> {
+        let (source, parsed) = file(current);
+        let (base_source, base_parsed) = file(base);
+        let current = Text {
+            source: &source,
+            parsed: &parsed,
+        };
+        let base = Text {
+            source: &base_source,
+            parsed: &base_parsed,
+        };
+        pair_units_by_text(current, base, untouched)
+    }
+
+    #[test]
+    fn an_untouched_unit_claims_the_base_unit_with_its_text() {
+        use Pairing::{New, Paired};
+        // A unit of the same name added before the old one is the new one.
+        let old = ("f", "old body");
+        assert_eq!(
+            by_text(&[("f", "added"), old], &[old], &[false, true]),
+            [New, Paired(0)]
+        );
+        // Also when the added unit is a copy of the old one.
+        assert_eq!(
+            by_text(&[old, old], &[old], &[false, true]),
+            [New, Paired(0)]
+        );
+        // Without untouched units the pairing is the one by order.
+        assert_eq!(
+            by_text(&[("f", "added"), old], &[old], &[false, false]),
+            [Paired(0), New]
+        );
+    }
+
+    #[test]
+    fn one_base_unit_takes_one_claim() {
+        use Pairing::Paired;
+        // Two untouched units with the text of one base unit: the second
+        // keeps its place by order, so its values are compared with its own
+        // base unit.
+        let base = [("f", "long body"), ("f", "short")];
+        assert_eq!(
+            by_text(&[base[0], base[0]], &base, &[true, true]),
+            [Paired(0), Paired(1)]
+        );
+        // A claim leaves the other units of the name the other base units.
+        assert_eq!(
+            by_text(&[("f", "edited"), base[0]], &base, &[false, true]),
+            [Paired(1), Paired(0)]
+        );
+        // Another name with the same text is not claimed.
+        assert_eq!(
+            by_text(&[("g", "long body")], &[("f", "long body")], &[true]),
+            [Pairing::New]
         );
     }
 

@@ -456,13 +456,20 @@ fn compare_with_base(
     let functions = &current.parsed.functions;
     let units_of = &current.measured.units_of;
     let base = base_units(changed, file, result)?;
-    let mut pairing = base.as_ref().map_or_else(
+    let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| baseline::pair_units(current.parsed, &base.parsed),
+        |base| {
+            let current_text = baseline::Text {
+                source: current.source,
+                parsed: current.parsed,
+            };
+            let base_text = baseline::Text {
+                source: &base.source,
+                parsed: &base.parsed,
+            };
+            baseline::pair_units_by_text(current_text, base_text, &current.measured.untouched)
+        },
     );
-    if let Some(base) = &base {
-        pair_untouched_by_text(&mut pairing, current, base);
-    }
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
         let base_unit = match pairing[index] {
@@ -483,28 +490,6 @@ fn compare_with_base(
         });
     }
     Ok(())
-}
-
-/// A unit that no hunk touches is old when the base has a unit with its name
-/// and its text. It pairs with that unit, whatever its position among the
-/// units of that name, so a unit of the same name that the session adds
-/// before it does not make it look new.
-fn pair_untouched_by_text(pairing: &mut [Pairing], current: &Current<'_>, base: &BaseUnits) {
-    for (index, unit) in current.parsed.functions.iter().enumerate() {
-        if !current.measured.untouched[index] {
-            continue;
-        }
-        let Some(text) = current.source.get(unit.span.0..unit.span.1) else {
-            continue;
-        };
-        let same = base.parsed.functions.iter().position(|candidate| {
-            candidate.function == unit.function
-                && base.source.get(candidate.span.0..candidate.span.1) == Some(text)
-        });
-        if let Some(base_index) = same {
-            pairing[index] = Pairing::Paired(base_index);
-        }
-    }
 }
 
 /// The file's text and units at the merge base, or `None` when it has no

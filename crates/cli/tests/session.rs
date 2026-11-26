@@ -1279,6 +1279,24 @@ fn old_debt_that_the_session_leaves_as_it_was_is_never_listed() {
     }
 }
 
+/// A copy of an old violating unit, added before it under the same name, is
+/// new debt: the old unit keeps its own base, and the copy has none.
+#[test]
+fn a_copy_of_old_debt_under_the_same_name_blocks() {
+    let old = params("old", 7);
+    let (dir, state) = repo(&[("a.js", &format!("{old}{}", simple("a")))]);
+    let root = dir.path();
+    start(&state, root, "copy");
+    let content = fs::read_to_string(root.join("a.js")).unwrap();
+    fs::write(root.join("a.js"), format!("{old}{content}")).unwrap();
+    let reason = block_reason(&edit(&state, root, "copy", "a.js"));
+    assert!(
+        reason.contains("FAIL a.js  1 function, 1 violation"),
+        "{reason}"
+    );
+    block_reason(&stop(&state, root, "copy"));
+}
+
 /// Past 100 recorded files that no longer exist, the names diff of an edit
 /// covers the whole tree instead of naming each of them.
 #[test]
