@@ -1086,19 +1086,22 @@ kept with any other status.
 
 A unit that no hunk touches pairs first with a base unit of the same text,
 one base unit for each such unit. CRLF and LF line ends count as the same
-text. A named unit looks among the base units of its name, and an
-`<anonymous>` unit among the base `<anonymous>` units of its owner. A unit
-that finds none there looks among the other named base units, or the other
-base `<anonymous>` units, and takes one whose name or owner is gone first.
-Its text counts before the name or the position of another unit. So an old
+text. The hunks before the unit give the line of the base file where its
+first line was. The unit takes the base unit that starts at that line and
+has its text, before any other unit pairs by name or position. So an old
 unit keeps its base when a change outside it renames it or its owner, also
-when a new unit takes the old name.
+when a new unit takes the old name. A unit that finds no such base unit, as
+when Git hides a change from the hunks, looks among the base units of its
+name, or for an `<anonymous>` unit among the base `<anonymous>` units of
+its owner.
 
 A unit that lies wholly in the lines of one hunk that removes no line is an
 added unit. It is no edit of a base unit. After the units that no hunk
 touches, an added unit takes a base unit of the same text among the base
 units of its name or owner, because a unit can move with its text. An added
-`<anonymous>` unit that takes none does not pair by position and is `new`.
+`<anonymous>` unit that takes none does not pair by position and does not
+count among the `<anonymous>` units of its owner. It is `new` unless the
+last step gives it a base unit.
 
 The units that are left pair as under `--base`, with the base units that
 are left. So a unit that the session adds before an old unit is the new
@@ -1181,7 +1184,9 @@ event; the next event sees the change. Pruning a session that has been idle
 for 30 days can race with that session's next event, which then starts the
 session with a new anchor. A unit whose text a checkout rewrites, as the
 `ident` attribute does, finds no base unit by its text; it then pairs as
-under `--base`.
+under `--base`. Git decides which lines a hunk adds. When a unit with the
+old text of an edited unit stays elsewhere in the file, Git can show the
+edited unit as added lines, and an edited `<anonymous>` unit is then `new`.
 
 ### `init`
 

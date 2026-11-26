@@ -383,7 +383,8 @@ fn measure_units(
             .units_of
             .resize(result.violations.len() - first, index);
         if !touched {
-            measured.changes[index] = UnitChange::Untouched;
+            let base_line = LineRange::base_line(spans.unwrap_or_default(), function.line);
+            measured.changes[index] = UnitChange::Untouched { base_line };
             continue;
         }
         if measure_untouched && spans.is_some_and(|ranges| added(function, ranges)) {
@@ -410,7 +411,7 @@ fn keep_untouched_changes(
     let mut kept = BTreeSet::new();
     let violations = result.violations.split_off(first);
     for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
-        if measured.changes[index] == UnitChange::Untouched {
+        if matches!(measured.changes[index], UnitChange::Untouched { .. }) {
             let status = violation.baseline.as_ref().map(|baseline| baseline.status);
             if matches!(status, Some(Status::Unchanged | Status::Improved) | None) {
                 continue;
@@ -611,9 +612,9 @@ fn touches(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
 
 /// Whether one hunk that removes no line adds every line of the unit.
 fn added(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.added && range.start <= function.line && function.end_line <= range.end)
+    ranges.iter().any(|range| {
+        range.removed == 0 && range.start <= function.line && function.end_line <= range.end
+    })
 }
 
 fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &mut ScanResult) {

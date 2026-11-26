@@ -1375,6 +1375,20 @@ fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
                  function foo(list) {{\n  return list.map((b) => b);\n}}\n"
             ),
         ),
+        // Another owner has a closure with the same text, which no hunk
+        // touches either.
+        (
+            "twin",
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return list.map({old});\n}}\n"
+            ),
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\n\
+                 function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return bar(list);\n}}\n"
+            ),
+        ),
     ];
     for (session, base, current) in cases {
         let (dir, state) = repo(&[("a.js", &base)]);

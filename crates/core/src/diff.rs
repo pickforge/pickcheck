@@ -33,16 +33,32 @@ const REPO_CONFIGS: &str = ":(glob)**/.pickcheck.json";
 static ROOTS: Mutex<BTreeMap<PathBuf, Option<PathBuf>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The post-image lines of one hunk. A hunk that only removes lines has an
+/// empty range, with `end` at the line before the removal and `start` one
+/// line after it.
 pub struct LineRange {
     pub start: usize,
     pub end: usize,
-    /// The hunk adds these lines and removes none.
-    pub added: bool,
+    /// The count of lines that the hunk removes.
+    pub removed: usize,
 }
 
 impl LineRange {
+    /// Whether the range has a line from `start` to `end`. An empty range
+    /// has none.
     pub fn intersects(self, start: usize, end: usize) -> bool {
-        self.start <= end && start <= self.end
+        self.start <= self.end && self.start <= end && start <= self.end
+    }
+
+    /// The line of the base file for `line` of the post-image, when no
+    /// range reaches `line`: the ranges before it move it by the lines that
+    /// their hunks add and remove.
+    pub fn base_line(ranges: &[Self], line: usize) -> usize {
+        let before = ranges.iter().filter(|range| range.end < line);
+        let (added, removed) = before.fold((0, 0), |(added, removed), range| {
+            (added + range.end + 1 - range.start, removed + range.removed)
+        });
+        (line + removed).saturating_sub(added)
     }
 }
 
@@ -812,16 +828,16 @@ pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
         };
         skip_hunk_body(&mut lines, old.1, new.1);
         let Some(path) = file.as_ref() else { continue };
-        if new.1 > 0 {
-            result
-                .entry(path.clone())
-                .or_insert_with(Vec::new)
-                .push(LineRange {
-                    start: new.0,
-                    end: new.0 + new.1 - 1,
-                    added: old.1 == 0,
-                });
-        }
+        // The start of a side with no line is the line before the hunk.
+        let start = if new.1 > 0 { new.0 } else { new.0 + 1 };
+        result
+            .entry(path.clone())
+            .or_insert_with(Vec::new)
+            .push(LineRange {
+                start,
+                end: start + new.1 - 1,
+                removed: old.1,
+            });
     }
     result
 }
@@ -1080,18 +1096,20 @@ mod tests {
             "diff --git a/b.js b/b.js\n--- a/b.js\n+++ b/b.js\n@@ -1 +1 @@\n-a\n+b\n",
         );
         let spans = parse_diff_hunks(diff);
-        // Only the first hunk removes no line.
-        let ranges = |ranges: &[(usize, usize, bool)]| {
-            ranges
-                .iter()
-                .map(|&(start, end, added)| LineRange { start, end, added })
-                .collect::<Vec<_>>()
+        // Each range with the count of lines that its hunk removes.
+        let ranges = |ranges: &[(usize, usize, usize)]| {
+            let range = |&(start, end, removed)| LineRange {
+                start,
+                end,
+                removed,
+            };
+            ranges.iter().map(range).collect::<Vec<_>>()
         };
         assert_eq!(
             spans[Path::new("a.js")],
-            ranges(&[(1, 4, true), (8, 9, false), (12, 12, false)])
+            ranges(&[(1, 4, 0), (8, 9, 1), (12, 12, 2)])
         );
-        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1, false)]));
+        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1, 1)]));
         // Lines that only look like headers name no file.
         assert_eq!(spans.len(), 2, "{spans:?}");
     }
@@ -1129,20 +1147,26 @@ mod tests {
             "@@ -20 +19 @@\n-f\n+g\n",
         );
         let spans = parse_diff_hunks(diff);
+        let ranges = &spans[Path::new("a.rs")];
+        let range = |start, end, removed| LineRange {
+            start,
+            end,
+            removed,
+        };
+        // The hunk that only removes lines has an empty range.
         assert_eq!(
-            spans[Path::new("a.rs")],
-            vec![
-                LineRange {
-                    start: 2,
-                    end: 4,
-                    added: false
-                },
-                LineRange {
-                    start: 19,
-                    end: 19,
-                    added: false
-                },
-            ]
+            ranges,
+            &[range(2, 4, 2), range(12, 11, 2), range(19, 19, 1)]
         );
+        let touched = |line| ranges.iter().any(|range| range.intersects(line, line));
+        assert_eq!(
+            (1..=20).filter(|&line| touched(line)).collect::<Vec<_>>(),
+            [2, 3, 4, 19]
+        );
+        // Each line that no range reaches, with its line in the base file.
+        let base_lines = [(1, 1), (5, 4), (11, 10), (12, 13), (18, 19), (20, 21)];
+        for (line, base_line) in base_lines {
+            assert_eq!(LineRange::base_line(ranges, line), base_line, "{line}");
+        }
     }
 }

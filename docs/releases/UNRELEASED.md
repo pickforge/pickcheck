@@ -88,9 +88,9 @@
   change that an encoding attribute, a clean filter, or a renamed link hides
   from the hunks still blocks, and old debt that the session leaves as it
   was is still never listed. A file with any violation now reads its base content. (#53)
-- In a session, a function that no hunk touches keeps the base function with
-  its text, also when a new function takes its old name, as after a class
-  is renamed and a wrapper is added under the old name. An anonymous
+- In a session, a function that no hunk touches keeps the base function at
+  the same lines, also when a new function takes its old name, as after a
+  class is renamed and a wrapper is added under the old name. An anonymous
   function in lines that a hunk only adds is new unless it moved with its
   text, so it no longer pairs by position with a function that the same
   edit removes. (#74)
