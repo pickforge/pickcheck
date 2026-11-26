@@ -82,7 +82,9 @@ The state lives in `sessions/` under the state directory: one
 covers the raw session ID and the repository root. The anchor is written to a
 temporary file and published with a hard link, so a reader never sees half of
 it. A hook that starts a session deletes the state files of other sessions
-that are older than 30 days, and no other file.
+that are older than 30 days, and no other file. An event refreshes the
+modification time of an anchor older than one day, so a session in use is
+not pruned.
 
 Session code never fails a hook. When the state directory cannot be written,
 the anchor or log is unusable, or another step of the session gate fails,

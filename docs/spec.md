@@ -863,7 +863,10 @@ sanitize alike, such as `a/b` and `a:b`, never share state:
   duplicates.
 
 When a hook publishes an anchor, it deletes the state files of every other
-session whose newest file is older than 30 days. A state file is a regular
+session whose newest file is older than 30 days. When an event opens a session
+whose anchor file is older than one day, it sets the anchor's modification
+time to the current time and keeps its content, so a session in use is not
+pruned. A failure to set it is ignored. A state file is a regular
 file whose name has one of the three forms above, with a session name that
 sanitizing leaves unchanged and a key hash of 16 lowercase hex digits. Pruning
 never deletes the files of the current session name, a directory, a link, the

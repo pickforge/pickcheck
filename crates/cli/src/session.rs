@@ -17,6 +17,9 @@ use crate::hooks::sanitized_session_id;
 /// Session state untouched for this long is removed when another session
 /// starts.
 const STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// An event refreshes the modification time of an anchor this old, so a
+/// session in use outlives `STALE_AFTER`.
+const REFRESH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const ANCHOR: &str = "anchor";
 const FILES: &str = "files";
 const TEMPORARY: &str = "tmp";
@@ -38,7 +41,10 @@ impl Session {
         let key = format!("{name}.{:016x}", state_hash(id, repo_root));
         let anchor_path = directory.join(format!("{key}.{ANCHOR}"));
         let anchor = match read_anchor(&anchor_path)? {
-            Some(anchor) => anchor,
+            Some(anchor) => {
+                refresh(&anchor_path, SystemTime::now());
+                anchor
+            }
             None if publish_anchor(&anchor_path, head)? => {
                 prune(&directory, &name, SystemTime::now());
                 head.to_owned()
@@ -98,6 +104,19 @@ fn read_anchor(path: &Path) -> Result<Option<String>> {
     match text.strip_suffix('\n') {
         Some(anchor) if is_commit_name(anchor) => Ok(Some(anchor.to_owned())),
         _ => bail!("corrupt state {}", path.display()),
+    }
+}
+
+/// Sets the modification time of the anchor to `now` when it is older than
+/// `REFRESH_AFTER`, and keeps its content. A failure keeps the old time.
+fn refresh(anchor: &Path, now: SystemTime) {
+    let modified = fs::metadata(anchor).and_then(|meta| meta.modified());
+    let stale = modified.is_ok_and(|modified| {
+        now.duration_since(modified)
+            .is_ok_and(|age| age > REFRESH_AFTER)
+    });
+    if stale && let Ok(file) = File::options().write(true).open(anchor) {
+        let _ = file.set_modified(now);
     }
 }
 
@@ -322,6 +341,36 @@ mod tests {
             names.iter().all(|name| name.ends_with(".anchor")),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn opening_a_session_refreshes_an_anchor_older_than_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new("repo");
+        Session::open(dir.path(), "s", root, AAA).unwrap();
+        let anchor = fs::read_dir(dir.path().join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let set = |age: Duration| {
+            let file = File::options().write(true).open(&anchor).unwrap();
+            file.set_modified(SystemTime::now() - age).unwrap();
+        };
+        let age = || {
+            let modified = fs::metadata(&anchor).unwrap().modified().unwrap();
+            SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default()
+        };
+        set(REFRESH_AFTER - Duration::from_secs(60));
+        Session::open(dir.path(), "s", root, BBB).unwrap();
+        assert!(age() > REFRESH_AFTER / 2);
+        set(STALE_AFTER - Duration::from_secs(60));
+        Session::open(dir.path(), "s", root, BBB).unwrap();
+        assert!(age() < Duration::from_secs(60));
+        assert_eq!(fs::read_to_string(&anchor).unwrap(), format!("{AAA}\n"));
     }
 
     #[test]
