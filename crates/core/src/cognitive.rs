@@ -159,7 +159,7 @@ impl Walk<'_, '_> {
             }
             Some(Kind::Sequence(operator)) => {
                 if !self.continues_sequence(node, operator) {
-                    self.add(node, 1, sequence_label(operator), None);
+                    self.add(operator_token(node), 1, sequence_label(operator), None);
                 }
                 self.visit_children(node, level);
             }
@@ -238,6 +238,12 @@ impl Walk<'_, '_> {
     }
 
     fn visit_alternative(&mut self, owner: Node<'_>, alternative: Node<'_>, level: usize) {
+        // Where the `else` is: the clause, or else the owner's `else` token.
+        let position = if alternative.kind() == "else_clause" {
+            alternative
+        } else {
+            anonymous_child(owner, &["else"]).unwrap_or(alternative)
+        };
         match alternative.kind() {
             "elif_clause" => {
                 self.add(alternative, 1, "else if", None);
@@ -256,11 +262,11 @@ impl Walk<'_, '_> {
         };
         match inner {
             Some(inner) if inner.kind() == owner.kind() => {
-                self.add(alternative, 1, "else if", None);
+                self.add(position, 1, "else if", None);
                 self.visit_if(inner, level);
             }
             _ => {
-                self.add(alternative, 1, "else", None);
+                self.add(position, 1, "else", None);
                 self.visit(alternative, level + 1);
             }
         }
@@ -287,6 +293,20 @@ impl Walk<'_, '_> {
             Language::Svelte => None,
         }
     }
+}
+
+/// The operator of a sequence: its `operator` field, or else its first
+/// anonymous `&&`, `||` or `??` token (Dart, the Rust `let_chain`).
+fn operator_token(node: Node<'_>) -> Node<'_> {
+    node.child_by_field_name("operator")
+        .or_else(|| anonymous_child(node, &["&&", "||", "??"]))
+        .unwrap_or(node)
+}
+
+fn anonymous_child<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| !child.is_named() && kinds.contains(&child.kind()))
 }
 
 fn first_code_child(node: Node<'_>) -> Option<Node<'_>> {

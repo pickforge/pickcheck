@@ -215,16 +215,16 @@ function visit(items) {
                 .map(|item| (item.line, item.column, item.construct))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(positions("f"), [(1, 63, "sequence &&")]);
+        assert_eq!(positions("f"), [(1, 65, "sequence &&")]);
         assert_eq!(
             positions("{#if}"),
             [
                 (2, 1, "{#if}"),
                 (3, 7, "ternary"),
-                (5, 7, "sequence &&"),
-                (6, 7, "sequence ||"),
+                (5, 9, "sequence &&"),
+                (6, 9, "sequence ||"),
                 (6, 16, "ternary"),
-                (8, 5, "sequence ??"),
+                (8, 7, "sequence ??"),
             ]
         );
     }

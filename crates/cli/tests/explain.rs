@@ -108,7 +108,7 @@ fn json_carries_metrics_limits_and_increments() {
     );
     assert_eq!(
         unit["increments"][2],
-        serde_json::json!({"line": 3, "column": 9, "add": 1, "construct": "sequence &&",
+        serde_json::json!({"line": 3, "column": 13, "add": 1, "construct": "sequence &&",
                            "nesting": null})
     );
     assert_eq!(

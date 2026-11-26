@@ -827,7 +827,8 @@ Dart collection `if` / `for` is `if` / `for`.
 Output `json`; `metrics` and `limits` use the same shapes as `base_metrics`
 and `limits` under `--base`. Each increment adds `column`, the 1-based byte
 column where its node starts in the file, also in Svelte `<script>` blocks and
-template expressions. `nesting` is `null` for flat increments:
+template expressions. A sequence starts at its operator token, and an `else` or
+`else if` at its `else` keyword. `nesting` is `null` for flat increments:
 
 ```json
 {
@@ -841,7 +842,7 @@ template expressions. `nesting` is `null` for flat increments:
                 "params": 6, "bool_ops": 3, "widget_depth": null},
      "increments": [
        {"line": 43, "column": 3, "add": 1, "construct": "for", "nesting": 0},
-       {"line": 44, "column": 9, "add": 1, "construct": "sequence &&",
+       {"line": 44, "column": 13, "add": 1, "construct": "sequence &&",
         "nesting": null}
      ]}
   ]

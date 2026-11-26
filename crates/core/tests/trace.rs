@@ -105,3 +105,70 @@ fn svelte_role_wrapper_units_trace_at_their_tags() {
         ]
     );
 }
+
+/// Line, column and construct of every increment of the only unit.
+fn positions(language: Language, source: &str) -> Vec<(usize, usize, &'static str)> {
+    let traced = trace_source(language, source).unwrap();
+    let [unit] = traced.units.as_slice() else {
+        panic!("{} units", traced.units.len());
+    };
+    let sum = unit.increments.iter().map(|item| item.add).sum::<usize>();
+    assert_eq!(sum, unit.metrics.cognitive);
+    unit.increments
+        .iter()
+        .map(|item| (item.line, item.column, item.construct))
+        .collect()
+}
+
+#[test]
+fn a_sequence_sits_at_its_operator() {
+    let ts = "function f(u: any) {\n  return (\n    u.active &&\n    u.verified ||\n    u.admin\n  );\n}\n";
+    assert_eq!(
+        positions(Language::TypeScript, ts),
+        [(3, 14, "sequence &&"), (4, 16, "sequence ||")]
+    );
+    let py =
+        "def f(u):\n    return (u.active and\n            u.verified or\n            u.admin)\n";
+    assert_eq!(
+        positions(Language::Python, py),
+        [(2, 22, "sequence and"), (3, 24, "sequence or")]
+    );
+    let rust = "fn f(a: bool, b: bool, c: bool) -> bool {\n    a &&\n        b ||\n        c\n}\n";
+    assert_eq!(
+        positions(Language::Rust, rust),
+        [(2, 7, "sequence &&"), (3, 11, "sequence ||")]
+    );
+    let chain = "fn f(a: Option<u8>, b: bool) {\n    if let Some(x) = a\n        && b\n    {}\n}\n";
+    assert_eq!(
+        positions(Language::Rust, chain),
+        [(2, 5, "if"), (3, 9, "sequence &&")]
+    );
+    let go = "package m\n\nfunc f(a, b, c bool) bool {\n\treturn a &&\n\t\tb ||\n\t\tc\n}\n";
+    assert_eq!(
+        positions(Language::Go, go),
+        [(4, 11, "sequence &&"), (5, 5, "sequence ||")]
+    );
+    let dart = "bool f(bool a, bool b, bool? c) {\n  return a &&\n      b ||\n      (c ??\n      false);\n}\n";
+    assert_eq!(
+        positions(Language::Dart, dart),
+        [
+            (2, 12, "sequence &&"),
+            (3, 9, "sequence ||"),
+            (4, 10, "sequence ??")
+        ]
+    );
+}
+
+#[test]
+fn an_else_sits_at_its_keyword() {
+    let dart = "int f(bool a, bool b, List l) {\n  if (a && b)\n    return 1;\n  else\n    l.add(1);\n  return 0;\n}\n";
+    assert_eq!(
+        positions(Language::Dart, dart),
+        [(2, 3, "if"), (2, 9, "sequence &&"), (4, 3, "else")]
+    );
+    let go = "package m\n\nfunc f(a, b bool) int {\n\tif a {\n\t\treturn 1\n\t} else if b {\n\t\treturn 2\n\t} else {\n\t\treturn 3\n\t}\n}\n";
+    assert_eq!(
+        positions(Language::Go, go),
+        [(4, 2, "if"), (6, 4, "else if"), (8, 4, "else")]
+    );
+}
