@@ -160,6 +160,21 @@ fn a_sequence_sits_at_its_operator() {
 }
 
 #[test]
+fn a_logical_assignment_sits_at_its_operator() {
+    let js = "function f(a, b, c) {\n  a\n    &&= b;\n  a ||=\n    c;\n  a ??= b;\n}\n";
+    assert_eq!(
+        positions(Language::JavaScript, js),
+        [
+            (3, 5, "sequence &&="),
+            (4, 5, "sequence ||="),
+            (6, 5, "sequence ??=")
+        ]
+    );
+    let dart = "void f(int? a, int b) {\n  a\n      ??= b;\n  a = b;\n}\n";
+    assert_eq!(positions(Language::Dart, dart), [(3, 7, "sequence ??=")]);
+}
+
+#[test]
 fn an_else_sits_at_its_keyword() {
     let dart = "int f(bool a, bool b, List l) {\n  if (a && b)\n    return 1;\n  else\n    l.add(1);\n  return 0;\n}\n";
     assert_eq!(

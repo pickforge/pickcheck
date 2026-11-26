@@ -18,12 +18,14 @@ pub struct UnitTrace {
     pub increments: Vec<Increment>,
 }
 
-/// A unit that `parse_source` left out, with its first and last file line.
+/// A unit that `parse_source` left out, with its first and last file line
+/// and its byte span in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeftOutLines {
     pub function: String,
     pub line: usize,
     pub end_line: usize,
+    pub span: (usize, usize),
 }
 
 /// The measured units of a file with their increments, and what `check`
@@ -58,6 +60,7 @@ pub fn trace_source(language: Language, source: &str) -> Result<SourceTrace> {
             function: unit.function.clone(),
             line: line_of(unit.span.0),
             end_line: line_of(unit.span.1),
+            span: unit.span,
         })
         .collect();
     let units = parsed

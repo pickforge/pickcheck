@@ -84,6 +84,9 @@ enum Kind {
     FlatStructural(&'static str),
     Flat(&'static str),
     Sequence(&'static str),
+    /// A logical assignment (`&&=`, `||=`, `??=`): a flat increment at its
+    /// operator.
+    Assignment(&'static str),
 }
 
 /// Scores one function. `origin` is where `source` starts in the file (a
@@ -159,11 +162,25 @@ impl Walk<'_, '_> {
             }
             Some(Kind::Sequence(operator)) => {
                 if !self.continues_sequence(node, operator) {
-                    self.add(operator_token(node), 1, sequence_label(operator), None);
+                    self.add(self.operator(node), 1, sequence_label(operator), None);
                 }
                 self.visit_children(node, level);
             }
+            Some(Kind::Assignment(construct)) => {
+                self.add(self.operator(node), 1, construct, None);
+                self.visit_children(node, level);
+            }
             None => self.visit_children(node, level),
+        }
+    }
+
+    /// Where the increment of a sequence or logical assignment sits. Only a
+    /// trace needs the position, so the score alone looks up no token.
+    fn operator<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
+        if self.trace.is_some() {
+            operator_token(node)
+        } else {
+            node
         }
     }
 
@@ -239,7 +256,8 @@ impl Walk<'_, '_> {
 
     fn visit_alternative(&mut self, owner: Node<'_>, alternative: Node<'_>, level: usize) {
         // Where the `else` is: the clause, or else the owner's `else` token.
-        let position = if alternative.kind() == "else_clause" {
+        // Only a trace needs the token.
+        let position = if alternative.kind() == "else_clause" || self.trace.is_none() {
             alternative
         } else {
             anonymous_child(owner, &["else"]).unwrap_or(alternative)
@@ -295,11 +313,11 @@ impl Walk<'_, '_> {
     }
 }
 
-/// The operator of a sequence: its `operator` field, or else its first
-/// anonymous `&&`, `||` or `??` token (Dart, the Rust `let_chain`).
+/// The operator of a sequence or logical assignment: its `operator` field,
+/// or else its first anonymous operator token (Dart, the Rust `let_chain`).
 fn operator_token(node: Node<'_>) -> Node<'_> {
     node.child_by_field_name("operator")
-        .or_else(|| anonymous_child(node, &["&&", "||", "??"]))
+        .or_else(|| anonymous_child(node, &["&&", "||", "??", "&&=", "||=", "??="]))
         .unwrap_or(node)
 }
 
@@ -323,7 +341,7 @@ fn sequence_operator(node: Node<'_>, source: &str, wanted: &[&'static str]) -> O
         .map(|item| Kind::Sequence(item))
 }
 
-/// A logical assignment (`&&=`, `||=`, `??=`): a flat sequence increment that
+/// A logical assignment (`&&=`, `||=`, `??=`): a sequence increment that
 /// never continues a run. The operator is the `operator` field, or else an
 /// anonymous token child.
 fn assignment_sequence(node: Node<'_>, source: &str, wanted: &[&'static str]) -> Option<Kind> {
@@ -331,7 +349,7 @@ fn assignment_sequence(node: Node<'_>, source: &str, wanted: &[&'static str]) ->
         wanted
             .iter()
             .find(|item| **item == node_text(child, source))
-            .map(|item| Kind::Flat(sequence_label(item)))
+            .map(|item| Kind::Assignment(sequence_label(item)))
     };
     if let Some(operator) = node.child_by_field_name("operator") {
         return matches(operator);

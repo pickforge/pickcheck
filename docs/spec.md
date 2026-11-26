@@ -778,6 +778,12 @@ Selection:
   innermost unit (smallest byte span) whose lines contain it.
 - `--function <name>` selects every unit with that reported name, in source
   order.
+- Units are always printed in source order (start byte), also when several
+  start on one line.
+- When a line or name matches measured units and also units `check` left out,
+  it explains the measured units; the `note:` line names the units left out.
+- A line inside a measured unit that sits inside a unit left out selects the
+  measured unit.
 - Giving both is a usage error.
 - With neither, it selects every unit whose `cognitive` exceeds its effective
   limit. When none does, the text output prints
@@ -858,7 +864,7 @@ Exit codes: `0` whenever it explains, whatever the scores. `2` with a one-line
 `error:` for a missing or unreadable file, a file with no grammar, a line or
 name that matches no unit, a malformed `<file>:<line>` (an empty, non-numeric,
 or zero line after an existing file), both a line and `--function`, a line or
-name that selects a unit `check` left out (deeper than 3,000 levels), and a
+name that selects only a unit `check` left out (deeper than 3,000 levels), and a
 file whose units `check` all left out, with the `UNVERIFIED` reason. A unit
 that is not measured has no increments.
 

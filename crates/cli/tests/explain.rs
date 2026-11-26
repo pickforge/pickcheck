@@ -331,6 +331,76 @@ fn an_unverified_file_explains_the_units_it_measured() {
 }
 
 #[test]
+fn a_measured_unit_inside_a_unit_left_out_is_selected_by_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = "a+".repeat(20_000);
+    fs::write(
+        dir.path().join("nested.js"),
+        format!(
+            "function outer(a) {{ function inner(a) {{\n  return a && true;\n}} return {chain}a; }}\n"
+        ),
+    )
+    .unwrap();
+    let output = run(dir.path(), &["nested.js:2"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "nested.js:1 inner  cognitive 1 <= 15\n  2  +1  sequence &&\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "note: nested.js is UNVERIFIED: syntax nesting too deep to measure, \
+         left out outer at line 1\n"
+    );
+}
+
+#[test]
+fn units_that_start_on_one_line_keep_source_order() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("same.rs"),
+        "fn same() { fn same() { if true {} }\n    if true { if true {} }\n}\n",
+    )
+    .unwrap();
+    for args in [&["same.rs", "--function", "same"][..], &["same.rs:1"]] {
+        let output = run(dir.path(), args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            stdout(&output),
+            "same.rs:1 same  cognitive 3 <= 15\n  2  +1  if  nesting 0\n  2  +2  if  nesting 1\n\n\
+             same.rs:1 same  cognitive 1 <= 15\n  1  +1  if  nesting 0\n",
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn a_selection_with_measured_and_left_out_units_explains_the_measured_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = "a+".repeat(20_000);
+    fs::write(
+        dir.path().join("pair.js"),
+        format!("function f(a) {{ return a && true; }} function f(a) {{ return {chain}a; }}\n"),
+    )
+    .unwrap();
+    for args in [&["pair.js:1"][..], &["pair.js", "--function", "f"]] {
+        let output = run(dir.path(), args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            stdout(&output),
+            "pair.js:1 f  cognitive 1 <= 15\n  1  +1  sequence &&\n",
+            "{args:?}"
+        );
+        assert_eq!(
+            stderr(&output),
+            "note: pair.js is UNVERIFIED: syntax nesting too deep to measure, \
+             left out f at line 1\n",
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn json_without_a_unit_over_the_limit_prints_an_empty_list() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("visit.js"), VISIT).unwrap();

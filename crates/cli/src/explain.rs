@@ -8,8 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use pickcheck_core::{
-    FileLimits, Increment, Language, Limits, MetricValues, SourceTrace, UnitTrace, Unmeasured,
-    trace_source,
+    FileLimits, Increment, Language, LeftOutLines, Limits, MetricValues, SourceTrace, UnitTrace,
+    Unmeasured, trace_source,
 };
 use serde::Serialize;
 
@@ -45,13 +45,15 @@ pub(crate) fn run(
     {
         anyhow::bail!("cannot explain {}: {reason}", path.display());
     }
-    let units = std::mem::take(&mut traced.units)
+    let mut units = std::mem::take(&mut traced.units)
         .into_iter()
         .map(|trace| Explained {
             limits: limits.for_unit(&trace.metrics),
             trace,
         })
         .collect::<Vec<_>>();
+    // Source order, also for units that start on one line.
+    units.sort_by_key(|unit| unit.trace.metrics.span.0);
     let selected = select(&units, &traced, line, function, &path)?;
     if let Some(note) = left_out_note(&traced, &path) {
         eprintln!("{note}");
@@ -152,16 +154,15 @@ fn select<'a>(
         .iter()
         .filter(|unit| (unit.trace.metrics.line..=unit.trace.metrics.end_line).contains(&line))
         .min_by_key(|unit| unit.trace.metrics.span.1 - unit.trace.metrics.span.0);
-    let lines = |unit: &Explained| (unit.trace.metrics.line, unit.trace.metrics.end_line);
-    let within = |start: usize, end: usize| {
-        (start..=end).contains(&line)
-            && inner.is_none_or(|unit| lines(unit).0 <= start && end <= lines(unit).1)
+    // A unit left out wins when it sits inside the innermost measured unit.
+    let within = |unit: &&LeftOutLines| {
+        (unit.line..=unit.end_line).contains(&line)
+            && inner.is_none_or(|inner| {
+                let outer = inner.trace.metrics.span;
+                outer.0 <= unit.span.0 && unit.span.1 <= outer.1
+            })
     };
-    if let Some(unit) = traced
-        .left_out
-        .iter()
-        .find(|unit| within(unit.line, unit.end_line))
-    {
+    if let Some(unit) = traced.left_out.iter().find(within) {
         anyhow::bail!(
             "cannot explain {}:{line}: {} at line {} is left out: {}",
             path.display(),
