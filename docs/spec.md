@@ -970,7 +970,8 @@ HEAD; the hook checks the diff against HEAD`.
 Known limits. A file that a shell command changes and that is committed
 before any later hook event is not attributed to the session. An installer
 can close this by sending shell tool events to the hook, because every event
-records the changed files.
+records the changed files. An agent that can write to the state directory can
+replace its own anchor, and with it the base of its session.
 
 ### `init`
 
