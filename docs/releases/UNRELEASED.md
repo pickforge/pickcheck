@@ -70,9 +70,13 @@
   changed in the edited file, not the whole file. To restore the old
   strictness, set
   `"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}`.
-- When a session changes any `.pickcheck.json`, hooks read the repository
-  config from the session base, so loosening a limit no longer empties the
-  gate, and the block reason carries the note. (#53)
+- When a session changes any `.pickcheck.json`, or a config that a hook
+  reads differs from the session base, hooks scan with the base configs and
+  with the working-tree configs and block when either scan blocks. Loosening
+  a limit therefore no longer empties the gate, and a stricter working-tree
+  config, such as one in a renamed directory or a nested repository, still
+  applies. The block reason carries a note that names the config side, and
+  `hook.max_blocks` comes from the base. (#53)
 
 - `check --changed`, `check --base`, and hooks now diff every file as text.
   Before, a `-diff` or `binary` attribute, or a NUL byte in a source file,

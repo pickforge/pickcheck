@@ -942,9 +942,11 @@ An edited file that exists and is in no diff adds one `ls-files --stage`; it
 has no base to read. When at least one file is checked, one `cat-file --batch
 --follow-symlinks` reads the base config of every directory from each checked
 file and from `cwd` up to the root, which serves both the comparison and the
-base config. A post-edit or `Stop` event with one violating file therefore
-runs at most 9 commands, and 2 more for each other violating file. A config
-change adds none, and an operation in progress adds 1.
+base config. The second scan of a config change reads each base content
+that the first scan read from memory. A post-edit or `Stop` event with one
+violating file therefore runs at most 9 commands, and 2 more for each other
+violating file. A config change adds 2 only for each file that violates in
+the second scan alone, and an operation in progress adds 1.
 
 Status. Every violation in the set is compared with the base, as under
 `--base`. The config key `hook.fail_on` lists the statuses that block, by
@@ -954,8 +956,8 @@ prints nothing and counts as a clean run for the loop guard. The block reason
 is the `--base` summary, and its `DETAILS` line names the base commit and the
 fail set.
 
-Config. Hooks read the repository config from the base commit when a config
-that they would read differs from the base. The working-tree lookup walks
+Config. When a config that hooks would read differs from the base, the
+session gate scans twice and blocks when either scan blocks. The working-tree lookup walks
 from the directory of each checked file, and from `cwd`, up to the repository
 root, and stops at the first `.pickcheck.json` that is a file. Only a checked
 entry that is a file starts a lookup, so an untracked nested repository, which
@@ -968,16 +970,26 @@ and a changed link target therefore count, as does a name that the file
 system matches without regard to case. Content is compared as parsed JSON, so a
 line-ending conversion such as `core.autocrlf` is no change; when either side
 is not JSON, its bytes are compared. A diff from the base that adds,
-edits, deletes, or renames any `.pickcheck.json` is also a change. For each
-checked file the config then is the nearest `.pickcheck.json` in the tree of
-the base commit, from the file's directory up to the repository root, and
-then the working tree above the root. That config gives the limits, `ignore`,
-the test patterns, `hook.max_blocks`, and `hook.fail_on`. The user config and
-the built-in defaults resolve as usual. A base link that leaves the
-repository, dangles, or loops cannot be read: when a lookup reaches it, the
-session gate fails (see State failures). The block reason starts with
-`note: .pickcheck.json changed in this diff; the config comes from <base>`,
-and other scan notes follow it.
+edits, deletes, or renames any `.pickcheck.json` is also a change. Both
+scans use the same changed set and base. The first scan reads the base
+configs: for each checked file the config is the nearest `.pickcheck.json` in
+the tree of the base commit, from the file's directory up to the repository
+root, and then the working tree above the root. The second scan reads the
+working-tree configs, exactly as the hook without a session id does. Each
+config gives the limits, `ignore`, the test patterns, and `hook.fail_on` of
+its own scan. The user config and the built-in defaults resolve as usual.
+`hook.max_blocks` always comes from the base config, so the working tree
+cannot lower it. When the first scan blocks, its report is the block reason
+and starts with `note: .pickcheck.json changed in this diff; the config comes
+from <base>`. Otherwise the report of the second scan is the block reason and
+starts with `note: .pickcheck.json changed in this diff; the working-tree
+config also applies`. Other scan notes follow the note. When the first scan
+blocks, the second does not run, because its result cannot change the
+outcome. A run that does not block writes the unverified files of both scans.
+When no config differs, the gate scans once with the working-tree configs. A
+base link that leaves the repository, dangles, or loops cannot be read: when
+a lookup reaches it, the session gate fails (see State failures). So does a
+working-tree config that does not load when the second scan runs.
 
 Fallbacks. Outside a Git repository, without `HEAD`, without a session id, or
 with unusable session state, hooks behave as they did before sessions. An

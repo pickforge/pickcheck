@@ -4,7 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -58,6 +58,30 @@ pub struct ChangedFiles {
     /// every base read.
     pub base: Option<String>,
     pub fallback: bool,
+    /// When set, each base read is kept, so a second scan of this diff runs
+    /// no Git command twice.
+    pub base_reads: Option<BaseReads>,
+}
+
+/// The base reads of one diff, shared by its clones.
+#[derive(Clone, Debug, Default)]
+pub struct BaseReads(Arc<Mutex<BTreeMap<PathBuf, BaseBlob>>>);
+
+impl ChangedFiles {
+    /// `path` at `commit`, as `base_blob` reads it, from `base_reads` when
+    /// it holds the path.
+    pub fn base_blob(&self, commit: &str, path: &Path) -> BaseBlob {
+        let Some(BaseReads(reads)) = &self.base_reads else {
+            return base_blob(&self.repo_root, commit, path);
+        };
+        let mut reads = reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reads
+            .entry(path.to_path_buf())
+            .or_insert_with(|| base_blob(&self.repo_root, commit, path))
+            .clone()
+    }
 }
 
 /// The paths that `git diff --name-status` lists.
@@ -174,7 +198,7 @@ pub fn merge_base_with_head(repo_root: &Path, commit: &str) -> Result<Option<Str
 }
 
 /// A file's content at the merge base.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseBlob {
     /// The base commit has no file at that path.
     Missing,
@@ -221,6 +245,7 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
         base,
         repo_root,
         fallback: false,
+        base_reads: None,
     })
 }
 

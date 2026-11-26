@@ -63,8 +63,9 @@ target. Files outside the diff that the
 session does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 A post-edit or `Stop` event with one violating file runs at most 9 Git
-commands, and 2 more for each other violating file. An unfinished merge,
-cherry-pick, revert, or rebase adds 1.
+commands, and 2 more for each other violating file. A config change adds 2
+only for each file that violates with the working-tree config alone. An
+unfinished merge, cherry-pick, revert, or rebase adds 1.
 
 Violations are compared with that base. `hook.fail_on` lists the statuses that
 block, by default `["new", "worsened", "unmatched"]`. A block reason lists the
@@ -76,10 +77,14 @@ violation in scope, set:
 ```
 
 When a `.pickcheck.json` that a hook would read differs from the base, or the
-diff changes any `.pickcheck.json`, hooks read the repository config from the
-base commit, and the block reason starts with a note that says so. The
-comparison reads content through links, so a config that Git ignores, a
-skip-worktree entry, or a changed link target counts too.
+diff changes any `.pickcheck.json`, hooks scan twice: once with the configs of
+the base commit and once with the working-tree configs. The hook blocks when
+either scan blocks, and the block reason starts with a note that names the
+config side. Loosening a config therefore never empties the gate, and a
+stricter working-tree config still applies. `hook.max_blocks` comes from the
+base. The comparison reads content through links, so a config that Git
+ignores, a skip-worktree entry, or a changed link target counts too. It
+compares parsed JSON, so a line-ending conversion is no change.
 
 The state lives in `sessions/` under the state directory: one
 `<session>.<key hash>.anchor` file and one append-only

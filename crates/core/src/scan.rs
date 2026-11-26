@@ -10,11 +10,15 @@ use serde::Serialize;
 
 use crate::{
     BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
-    Metric, ParsedSource, base_blob,
+    Metric, ParsedSource,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
     load_config, load_config_at, parse_source,
 };
+
+/// The scan note of a diff that changes a `.pickcheck.json`, when the
+/// configs come from the working tree.
+pub const CONFIG_CHANGED_NOTE: &str = ".pickcheck.json changed in this diff";
 
 const UNVERIFIED_SOURCE_EXTENSIONS: &[&str] = &[
     "kt", "java", "c", "cc", "cpp", "h", "hpp", "cs", "swift", "rb", "php", "scala", "lua", "zig",
@@ -127,9 +131,7 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
             configs.commit()
         ));
     } else if options.changed.is_some_and(config_changed) {
-        result
-            .notes
-            .push(".pickcheck.json changed in this diff".to_owned());
+        result.notes.push(CONFIG_CHANGED_NOTE.to_owned());
     }
     for file in files {
         scan_file(&file, &match_base, options, &mut result)?;
@@ -405,7 +407,7 @@ fn base_units(
         .renames
         .get(file.matched)
         .map_or(file.matched, PathBuf::as_path);
-    let content = match base_blob(&changed.repo_root, commit, path) {
+    let content = match changed.base_blob(commit, path) {
         BaseBlob::Missing => return Ok(None),
         BaseBlob::Unreadable => None,
         BaseBlob::Content(bytes) => String::from_utf8(bytes).ok(),

@@ -227,6 +227,81 @@ fn a_config_in_no_diff_that_differs_from_the_base_keeps_the_base_limits() {
     assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
 }
 
+const WORKING_TREE_NOTE: &str =
+    "note: .pickcheck.json changed in this diff; the working-tree config also applies\n";
+
+/// When a config differs from the base, the gate also scans with the
+/// working-tree configs, as the hook without a session id does, so a config
+/// that the base lookup misses still applies: after a directory rename, and
+/// in a nested repository.
+#[test]
+fn a_stricter_working_tree_config_still_blocks() {
+    let strict = r#"{"limits":{"params":1}}"#;
+    let (dir, state) = repo(&[
+        ("src/.pickcheck.json", strict),
+        ("src/a.js", &params("a", 1)),
+    ]);
+    let root = dir.path();
+    start(&state, root, "rename");
+    git(root, &["mv", "src", "lib"]);
+    fs::write(root.join("lib/a.js"), params("a", 2)).unwrap();
+    fs::write(root.join("lib/new.js"), params("n", 2)).unwrap();
+    for file in ["lib/a.js", "lib/new.js"] {
+        let reason = block_reason(&edit(&state, root, "rename", file));
+        assert!(reason.starts_with(WORKING_TREE_NOTE), "{reason}");
+        assert!(
+            reason.contains(&native(&format!("FAIL {file}  "))),
+            "{reason}"
+        );
+    }
+    let reason = block_reason(&stop(&state, root, "rename"));
+    assert!(
+        reason.starts_with(&format!("{WORKING_TREE_NOTE}FAIL 2 changed files")),
+        "{reason}"
+    );
+
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "nested");
+    fs::create_dir(root.join("nested")).unwrap();
+    git(&root.join("nested"), &["init", "-q"]);
+    fs::write(root.join("nested/.pickcheck.json"), strict).unwrap();
+    fs::write(root.join("nested/b.js"), params("b", 2)).unwrap();
+    let reason = block_reason(&edit(&state, root, "nested", "nested/b.js"));
+    assert!(reason.starts_with(WORKING_TREE_NOTE), "{reason}");
+}
+
+/// Each scan blocks with the `hook.fail_on` of its own config, and the loop
+/// guard keeps the `hook.max_blocks` of the base. The second scan reads no
+/// base content twice.
+#[test]
+fn each_config_side_keeps_its_fail_on_and_the_base_keeps_max_blocks() {
+    let legacy = params("old", 7);
+    let (dir, state) = repo(&[(".pickcheck.json", "{}"), ("legacy.js", &legacy)]);
+    let root = dir.path();
+    start(&state, root, "sides");
+    fs::write(
+        root.join("legacy.js"),
+        legacy.replace("return p0", "return p1"),
+    )
+    .unwrap();
+    assert!(stop(&state, root, "sides").stdout.is_empty());
+    let stricter = r#"{"hook":{"fail_on":["unchanged"],"max_blocks":1}}"#;
+    fs::write(root.join(".pickcheck.json"), stricter).unwrap();
+    let input = json!({"hook_event_name":"Stop", "session_id":"sides", "cwd":root});
+    let (output, _) = traced(&state, &input);
+    let reason = block_reason(&output);
+    assert!(reason.starts_with(WORKING_TREE_NOTE), "{reason}");
+    assert!(reason.contains("--fail-on unchanged "), "{reason}");
+    // The base allows 3 blocks; the working tree asks for 1.
+    for _ in 0..2 {
+        assert!(block_reason(&stop(&state, root, "sides")).starts_with(WORKING_TREE_NOTE));
+    }
+    let output = stop(&state, root, "sides");
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).starts_with("UNRESOLVED\n"));
+}
+
 /// A config that `core.autocrlf` checks out with CRLF holds the same JSON
 /// as its LF base, so it is no config change.
 #[test]
@@ -1151,6 +1226,38 @@ fn another_letter_case_neither_hides_an_edit_nor_a_config() {
     let reason = block_reason(&edit(&state, root, "case", "src/a.js"));
     let note = "note: .pickcheck.json changed in this diff; the config comes from";
     assert!(reason.starts_with(note), "{reason}");
+}
+
+/// On a file system that ignores letter case, the base lookup misses a
+/// config under another spelling or in a directory renamed to another case,
+/// so the working-tree config applies too.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn another_letter_case_keeps_a_stricter_working_tree_config() {
+    let strict = r#"{"limits":{"params":1}}"#;
+    let (dir, state) = repo(&[
+        ("src/.Pickcheck.json", strict),
+        ("src/a.js", &params("a", 1)),
+    ]);
+    let root = dir.path();
+    assert!(root.join("SRC").exists(), "volume is case-sensitive");
+    start(&state, root, "spelling");
+    fs::write(root.join("src/a.js"), params("a", 2)).unwrap();
+    let reason = block_reason(&edit(&state, root, "spelling", "src/a.js"));
+    assert!(reason.starts_with(WORKING_TREE_NOTE), "{reason}");
+    let reason = block_reason(&stop(&state, root, "spelling"));
+    assert!(reason.starts_with(WORKING_TREE_NOTE), "{reason}");
+
+    let (dir, state) = repo(&[
+        ("src/.pickcheck.json", strict),
+        ("src/a.js", &params("a", 1)),
+    ]);
+    let root = dir.path();
+    start(&state, root, "directory");
+    fs::rename(root.join("src"), root.join("Src")).unwrap();
+    fs::write(root.join("Src").join("a.js"), params("a", 2)).unwrap();
+    let reason = block_reason(&edit(&state, root, "directory", "Src/a.js"));
+    assert!(reason.contains("FAIL "), "{reason}");
 }
 
 /// The hook with stderr that cannot be written: `/dev/full` where it exists,

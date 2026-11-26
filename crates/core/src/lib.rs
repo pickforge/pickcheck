@@ -13,9 +13,9 @@ pub use config::{
     CommitConfigs, Config, ConfigResolution, HookConfig, Limits, load_config, load_config_at,
 };
 pub use diff::{
-    BaseBlob, ChangedFiles, DiffStatus, LineRange, Pathspec, Repository, base_blob, changed_files,
-    changed_files_since, diff_spans, diff_status, is_plainly_tracked, merge_base_with_head,
-    parse_diff_hunks, physical, repository, unmerged_files, untracked_files,
+    BaseBlob, BaseReads, ChangedFiles, DiffStatus, LineRange, Pathspec, Repository, base_blob,
+    changed_files, changed_files_since, diff_spans, diff_status, is_plainly_tracked,
+    merge_base_with_head, parse_diff_hunks, physical, repository, unmerged_files, untracked_files,
 };
 pub use language::{
     FunctionMetrics, Language, LeftOut, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured,
@@ -23,5 +23,6 @@ pub use language::{
 };
 pub use metric::Metric;
 pub use scan::{
-    Baseline, ScanOptions, ScanResult, Unverified, Violation, config_changed, resolve_path, scan,
+    Baseline, CONFIG_CHANGED_NOTE, ScanOptions, ScanResult, Unverified, Violation, config_changed,
+    resolve_path, scan,
 };

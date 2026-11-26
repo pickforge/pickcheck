@@ -7,10 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use pickcheck_core::{
-    ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange, Pathspec, Repository, ScanOptions,
-    ScanResult, config_changed, diff_spans, diff_status, is_plainly_tracked, load_config,
-    load_config_at, merge_base_with_head, physical, repository, resolve_path, scan, unmerged_files,
-    untracked_files,
+    BaseReads, CONFIG_CHANGED_NOTE, ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange,
+    Pathspec, Repository, ScanOptions, ScanResult, config_changed, diff_spans, diff_status,
+    is_plainly_tracked, load_config, load_config_at, merge_base_with_head, physical, repository,
+    resolve_path, scan, unmerged_files, untracked_files,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -195,11 +195,24 @@ enum Mode {
     Session {
         changes: ChangedFiles,
         base: String,
-        /// Set when a `.pickcheck.json` differs from `base`: the repository
-        /// config is then read from `base`.
+        /// Set when a `.pickcheck.json` differs from `base`: the gate then
+        /// scans with the configs of `base` and with those of the working
+        /// tree, and blocks when either scan blocks.
         configs: Option<CommitConfigs>,
     },
 }
+
+/// The configs of a scan: from the base commit when a session config
+/// differs from it, otherwise from the working tree, as without a session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Base,
+    WorkingTree,
+}
+
+/// The first note of a block reason from the working-tree configs.
+const WORKING_TREE_NOTE: &str =
+    ".pickcheck.json changed in this diff; the working-tree config also applies";
 
 struct Gate {
     mode: Mode,
@@ -214,13 +227,16 @@ impl Gate {
         }
     }
 
-    fn scan(&self, cwd: &Path, paths: &[PathBuf]) -> Result<ScanResult> {
+    fn scan(&self, cwd: &Path, paths: &[PathBuf], side: Side) -> Result<ScanResult> {
         let (changed, commit_configs) = match &self.mode {
             Mode::Paths => (None, None),
             Mode::Head(changes) => (Some(changes), None),
             Mode::Session {
                 changes, configs, ..
-            } => (Some(changes), configs.as_ref()),
+            } => (
+                Some(changes),
+                configs.as_ref().filter(|_| side == Side::Base),
+            ),
         };
         scan(&ScanOptions {
             cwd,
@@ -231,24 +247,39 @@ impl Gate {
         })
     }
 
-    fn config(&self, cwd: &Path) -> Result<Config> {
-        let resolution = match &self.mode {
+    /// Whether a session config differs from the base, so the gate scans
+    /// with the configs of both sides.
+    fn compares_configs(&self) -> bool {
+        matches!(
+            self.mode,
             Mode::Session {
-                configs: Some(configs),
+                configs: Some(_),
                 ..
-            } => load_config_at(cwd, configs)?,
+            }
+        )
+    }
+
+    fn config(&self, cwd: &Path, side: Side) -> Result<Config> {
+        let resolution = match (&self.mode, side) {
+            (
+                Mode::Session {
+                    configs: Some(configs),
+                    ..
+                },
+                Side::Base,
+            ) => load_config_at(cwd, configs)?,
             _ => load_config(cwd, None)?,
         };
         Ok(resolution.config)
     }
 
     /// The feedback for `result`, or `None` when no violation blocks.
-    fn feedback(&self, cwd: &Path, result: &ScanResult) -> Result<Option<String>> {
+    fn feedback(&self, cwd: &Path, result: &ScanResult, side: Side) -> Result<Option<String>> {
         if result.violations.is_empty() {
             return Ok(None);
         }
         let fail_on = match self.mode {
-            Mode::Session { .. } => self.config(cwd)?.hook.fail_on,
+            Mode::Session { .. } => self.config(cwd, side)?.hook.fail_on,
             _ => Vec::new(),
         };
         let (scope, scan_notes) = match &self.mode {
@@ -265,8 +296,15 @@ impl Gate {
         if !result.violations.iter().any(|item| scope.fails(item)) {
             return Ok(None);
         }
-        let notes = self.notes.iter().chain(scan_notes);
-        let notes = notes.map(|note| format!("note: {note}\n"));
+        let working_tree = (side == Side::WorkingTree).then_some(WORKING_TREE_NOTE);
+        let scan_notes = scan_notes
+            .iter()
+            .map(String::as_str)
+            .filter(|note| working_tree.is_none() || *note != CONFIG_CHANGED_NOTE);
+        let notes = self.notes.iter().map(String::as_str).chain(working_tree);
+        let notes = notes
+            .chain(scan_notes)
+            .map(|note| format!("note: {note}\n"));
         Ok(Some(
             notes.collect::<String>() + &report::summary(result, scope),
         ))
@@ -315,6 +353,7 @@ impl Snapshot {
             touched: status.touched,
             base,
             fallback: false,
+            base_reads: None,
         }
     }
 }
@@ -369,7 +408,8 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
     if !stop {
         return emit_feedback(harness, report, false);
     }
-    let max = outcome.gate.config(cwd)?.hook.max_blocks;
+    // From the base when a config differs, so the working tree cannot lower it.
+    let max = outcome.gate.config(cwd, Side::Base)?.hook.max_blocks;
     if increment_counter(&input.session_id)? > max {
         eprintln!("UNRESOLVED\n{report}");
         return Ok(0);
@@ -431,9 +471,22 @@ impl Outcome {
         note_unverified(&self.result);
     }
 
+    /// Scans with the gate's configs. When a session config differs from the
+    /// base and that scan does not block, scans again with the working-tree
+    /// configs, which then give the block reason.
     fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf]) -> Result<Self> {
-        let result = gate.scan(cwd, paths)?;
-        let report = gate.feedback(cwd, &result)?;
+        let mut result = gate.scan(cwd, paths, Side::Base)?;
+        let mut report = gate.feedback(cwd, &result, Side::Base)?;
+        if report.is_none() && gate.compares_configs() {
+            let working = gate.scan(cwd, paths, Side::WorkingTree)?;
+            report = gate.feedback(cwd, &working, Side::WorkingTree)?;
+            for item in working.unverified {
+                if !result.unverified.contains(&item) {
+                    result.unverified.push(item);
+                }
+            }
+            result.unverified.sort_by(|a, b| a.file.cmp(&b.file));
+        }
         Ok(Self {
             gate,
             result,
@@ -522,6 +575,9 @@ fn session_gate(
         changes.untracked.push(edited.to_path_buf());
     }
     let configs = base_configs(cwd, &changes, &base, edited)?;
+    if configs.is_some() {
+        changes.base_reads = Some(BaseReads::default());
+    }
     Ok(Gate::new(Mode::Session {
         changes,
         base,
