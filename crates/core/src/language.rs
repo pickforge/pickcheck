@@ -1705,9 +1705,10 @@ fn template_wrappers(node: Node<'_>) -> (&'static [Wrapper], Wrapper) {
 /// Decisions (`complexity` without its base 1) and the widest boolean chain in
 /// one template text, parsed with the component's script grammar in the first
 /// of its wrappers that parses without `ERROR` or `MISSING` nodes, or else in
-/// its fallback wrapper. Functions in the text count inline; nodes inside an
-/// `ERROR` subtree add nothing. `None` when the text's own subtree is higher
-/// than `MAX_SYNTAX_DEPTH`; the wrapper's levels do not count.
+/// its fallback wrapper. Functions in the text count inline, and so do the
+/// operator nodes that error recovery keeps inside an `ERROR` subtree. `None`
+/// when the text's own subtree is higher than `MAX_SYNTAX_DEPTH`; the wrapper's
+/// levels do not count.
 fn score_expression(node: Node<'_>, source: &str, script: Language) -> Option<Score> {
     let text = node_text(node, source);
     let grammar = script.grammar();
@@ -1736,43 +1737,18 @@ fn score_expression(node: Node<'_>, source: &str, script: Language) -> Option<Sc
 }
 
 fn score_expression_node(node: Node<'_>, source: &str, script: Language, score: &mut Score) {
-    if node.is_error() {
-        return;
-    }
     let operator = is_boolean_operator(node, script, source);
     score.complexity += usize::from(operator || is_conditional_expression(node.kind()));
     if is_boolean_chain_root(node, script, source) {
         score.bool_ops =
             score
                 .bool_ops
-                .max(template_chain_operators(node, node.id(), script, source));
+                .max(boolean_operators_in_chain(node, node.id(), script, source));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         score_expression_node(child, source, script, score);
     }
-}
-
-/// `boolean_operators_in_chain` for a template expression, which also skips
-/// `ERROR` subtrees.
-fn template_chain_operators(
-    node: Node<'_>,
-    root_id: usize,
-    script: Language,
-    source: &str,
-) -> usize {
-    if node.is_error()
-        || node.id() != root_id
-            && (is_function(script, node.kind()) || is_conditional_expression(node.kind()))
-    {
-        return 0;
-    }
-    let mut cursor = node.walk();
-    usize::from(is_boolean_operator(node, script, source))
-        + node
-            .named_children(&mut cursor)
-            .map(|child| template_chain_operators(child, root_id, script, source))
-            .sum::<usize>()
 }
 
 #[cfg(test)]
@@ -2129,15 +2105,48 @@ class Screen {
             }
         }
         // A key after a pattern parses only as a call, so a binding with a key
-        // falls back to the expression wrapper: a plain pattern still counts,
-        // a destructuring default inside an `ERROR` adds nothing.
+        // falls back to the expression wrapper. So does an inline `then` or
+        // `catch` binding, which shares one text with the promise. The
+        // operator nodes of the recovered tree count, inside `ERROR` nodes too.
         assert_eq!(
             unit("", &format!("{{#each a as x, i ({chain})}}{{x}}{{/each}}")),
             ("{#each}".to_owned(), 6, 4)
         );
+        for (script, typed) in [(" lang=\"ts\"", ": boolean"), ("", "")] {
+            for (template, name) in [
+                (
+                    format!("{{#each a as {{ x = {chain} }}, i (k)}}{{x}}{{/each}}"),
+                    "{#each}",
+                ),
+                (
+                    format!("{{#each a as {{ x = {chain}, ...r }}, i (k)}}{{x}}{{/each}}"),
+                    "{#each}",
+                ),
+                (
+                    format!("{{#await p then {{ x = {chain}, ...r }}}}{{x}}{{/await}}"),
+                    "{#await}",
+                ),
+                (
+                    format!("{{#await p catch {{ x = {chain}, ...r }}}}{{x}}{{/await}}"),
+                    "{#await}",
+                ),
+                (
+                    format!("{{#await p then [x{typed} = {chain}]}}{{x}}{{/await}}"),
+                    "{#await}",
+                ),
+            ] {
+                let (found, complexity, bool_ops) = unit(script, &template);
+                assert_eq!(found, name, "{template}");
+                assert_eq!((complexity, bool_ops), (6, 4), "{script} {template}");
+            }
+        }
+        // Operator characters in a string add nothing in a recovered tree.
         assert_eq!(
-            unit("", "{#each a as { x = b && c }, i (k)}{x}{/each}"),
-            ("{#each}".to_owned(), 2, 0)
+            unit(
+                "",
+                "{#await p then { x = \"a && b || c\", ...r }}{x}{/await}"
+            ),
+            ("{#await}".to_owned(), 2, 0)
         );
     }
 

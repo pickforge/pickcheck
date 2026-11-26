@@ -275,3 +275,8 @@ function ternaryBreak(a: boolean, b: boolean, c: boolean, d: boolean, e: boolean
 {#await job}{:then { v = a || b }}{v}{/await}
 <!-- negative: an optional parameter and a string default add nothing -->
 {#snippet hint(x?: string, y = "a || b")}{x}{/snippet}
+<!-- a text that no wrapper parses cleanly: the operator nodes of the recovered tree count -->
+{#await job then { v = a && b, ...rest }}{v}{/await}
+{#each rows as { x = a || b }, i (x)}{x}{/each}
+<!-- negative: a string default in such a text adds nothing -->
+{#await job then { v = "a && b", ...rest }}{v}{/await}
