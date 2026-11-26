@@ -306,22 +306,57 @@ pub(crate) enum TreeFile {
     Unresolved,
 }
 
+/// One path of `files_at`: a line of the batch request, or an answer that
+/// needs no request.
+enum TreeRequest {
+    Batch(String),
+    Answer(TreeFile),
+}
+
 /// The content of each of `paths`, relative to the repository root, at
-/// `commit`, from one `cat-file --batch --follow-symlinks`, or none for no
-/// paths.
+/// `commit`, from one `cat-file --batch --follow-symlinks`, or none when no
+/// path needs it. The batch request is line-based, so a path with a newline
+/// is first resolved by one `ls-tree` that takes the paths as arguments.
 pub(crate) fn files_at(repo_root: &Path, commit: &str, paths: &[PathBuf]) -> Result<Vec<TreeFile>> {
+    let paths = paths
+        .iter()
+        .map(|path| slash_path(path))
+        .collect::<Vec<_>>();
+    let entries = newline_entries(repo_root, commit, &paths)?;
     let requests = paths
         .iter()
-        .map(|path| Some(slash_path(path)).filter(|path| !path.contains('\n')))
+        .map(|path| {
+            if path.contains('\n') {
+                newline_request(&entries, path)
+            } else {
+                TreeRequest::Batch(format!("{commit}:{path}\n"))
+            }
+        })
         .collect::<Vec<_>>();
-    if requests.iter().all(Option::is_none) {
-        return Ok(requests.iter().map(|_| TreeFile::Unresolved).collect());
-    }
     let input = requests
         .iter()
-        .flatten()
-        .map(|path| format!("{commit}:{path}\n"))
+        .filter_map(|request| match request {
+            TreeRequest::Batch(line) => Some(line.as_str()),
+            TreeRequest::Answer(_) => None,
+        })
         .collect::<String>();
+    let output = if input.is_empty() {
+        Vec::new()
+    } else {
+        batch(repo_root, input)?
+    };
+    let mut rest = output.as_slice();
+    requests
+        .into_iter()
+        .map(|request| match request {
+            TreeRequest::Batch(_) => next_tree_file(&mut rest),
+            TreeRequest::Answer(answer) => Ok(answer),
+        })
+        .collect()
+}
+
+/// The output of `cat-file --batch --follow-symlinks` for `input`.
+fn batch(repo_root: &Path, input: String) -> Result<Vec<u8>> {
     let mut child = git_command(repo_root)
         .args(["cat-file", "--batch", "--follow-symlinks"])
         .stdin(Stdio::piped())
@@ -340,14 +375,90 @@ pub(crate) fn files_at(repo_root: &Path, commit: &str, paths: &[PathBuf]) -> Res
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let mut rest = output.stdout.as_slice();
-    requests
-        .iter()
-        .map(|request| match request {
-            Some(_) => next_tree_file(&mut rest),
-            None => Ok(TreeFile::Unresolved),
+    Ok(output.stdout)
+}
+
+/// A tree entry that `ls-tree` lists: its mode, type, and object name.
+struct TreeEntry {
+    mode: String,
+    kind: String,
+    object: String,
+}
+
+/// The entries at `commit` of every path in `paths` that has a newline and
+/// of each of its directories, by path, from one `ls-tree -t`. No such path
+/// runs no command.
+fn newline_entries(
+    repo_root: &Path,
+    commit: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, TreeEntry>> {
+    let mut specs = std::collections::BTreeSet::new();
+    for path in paths.iter().filter(|path| path.contains('\n')) {
+        let mut end = 0;
+        for part in path.split('/') {
+            end += part.len();
+            specs.insert(&path[..end]);
+            end += 1;
+        }
+    }
+    if specs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let output = git_command(repo_root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-tree", "-z", "-t", commit, "--"])
+        .args(specs)
+        .output()
+        .context("failed to execute git ls-tree")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            let mut fields = meta.split(' ').map(str::to_owned);
+            let entry = TreeEntry {
+                mode: fields.next()?,
+                kind: fields.next()?,
+                object: fields.next()?,
+            };
+            Some((path.to_owned(), entry))
         })
-        .collect()
+        .collect())
+}
+
+/// The request for `path`, which has a newline, from its `ls-tree`
+/// entries: its blob by object name, or the answer when a directory on the
+/// way is missing or not a tree. A link on the way cannot be followed here,
+/// so it is unresolved.
+fn newline_request(entries: &BTreeMap<String, TreeEntry>, path: &str) -> TreeRequest {
+    let mut end = 0;
+    for part in path.split('/') {
+        end += part.len();
+        let entry = entries.get(&path[..end]);
+        let last = end == path.len();
+        end += 1;
+        match entry {
+            None => return TreeRequest::Answer(TreeFile::Missing),
+            Some(entry) if entry.mode == "120000" => {
+                return TreeRequest::Answer(TreeFile::Unresolved);
+            }
+            Some(entry) if last && entry.kind == "blob" => {
+                return TreeRequest::Batch(format!("{}\n", entry.object));
+            }
+            Some(entry) if last || entry.kind != "tree" => {
+                return TreeRequest::Answer(TreeFile::Missing);
+            }
+            Some(_) => {}
+        }
+    }
+    TreeRequest::Answer(TreeFile::Missing)
 }
 
 /// Reads one `cat-file --batch --follow-symlinks` answer from `rest`.
@@ -738,6 +849,68 @@ mod tests {
         for broken in ["0123 blob 5\n{}\n", "odd\n", "0123 blob x\n", "no newline"] {
             assert!(next_tree_file(&mut broken.as_bytes()).is_err(), "{broken}");
         }
+    }
+
+    /// A path with a newline cannot be asked for in a batch line; its
+    /// directories decide its answer from one `ls-tree`.
+    #[cfg(unix)]
+    #[test]
+    fn paths_with_a_newline_resolve_through_their_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = physical(dir.path());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        fs::create_dir_all(root.join("a\nb/sub")).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("a\nb/c.json"), "{}").unwrap();
+        fs::write(root.join("a\nb/file"), "").unwrap();
+        fs::write(root.join("real/c.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("real", root.join("l\nk")).unwrap();
+        std::os::unix::fs::symlink("c.json", root.join("a\nb/link.json")).unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e.x",
+            "commit",
+            "-qm",
+            "c",
+        ]);
+        let paths = [
+            "a\nb/c.json",
+            "a\nb/sub/c.json",
+            "a\nb/sub",
+            "a\nb/file/c.json",
+            "a\nb/link.json",
+            "l\nk/c.json",
+            "gone\n/c.json",
+            "real/c.json",
+        ]
+        .map(PathBuf::from);
+        use TreeFile::{Content, Missing, Unresolved};
+        assert_eq!(
+            files_at(&root, "HEAD", &paths).unwrap(),
+            [
+                Content(b"{}".to_vec()),
+                Missing,
+                Missing,
+                Missing,
+                Unresolved,
+                Unresolved,
+                Missing,
+                Content(b"{}".to_vec()),
+            ]
+        );
+        let only = files_at(&root, "HEAD", &[PathBuf::from("gone\n/c.json")]).unwrap();
+        assert_eq!(only, [Missing]);
     }
 
     #[test]

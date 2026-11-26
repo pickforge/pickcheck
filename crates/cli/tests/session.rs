@@ -305,6 +305,29 @@ fn each_config_side_keeps_its_fail_on_and_the_base_keeps_max_blocks() {
     assert!(text(&output.stderr).starts_with("UNRESOLVED\n"));
 }
 
+/// The base config of a directory whose name has a newline is still read,
+/// so loosening the config keeps the base limits there too.
+#[cfg(unix)]
+#[test]
+fn a_newline_in_a_directory_name_keeps_the_base_config() {
+    let strict = r#"{"limits":{"params":6}}"#;
+    let (dir, state) = repo(&[(".pickcheck.json", strict), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "newline");
+    fs::write(root.join(".pickcheck.json"), r#"{"limits":{"params":20}}"#).unwrap();
+    fs::create_dir(root.join("new\nfolder")).unwrap();
+    fs::write(root.join("new\nfolder/b.js"), params("b", 7)).unwrap();
+    let output = stop(&state, root, "newline");
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    let reason = block_reason(&output);
+    let note = "note: .pickcheck.json changed in this diff; the config comes from ";
+    assert!(reason.starts_with(note), "{reason}");
+    assert!(
+        reason.contains("FAIL new\nfolder/b.js  1 function"),
+        "{reason}"
+    );
+}
+
 /// A config that `core.autocrlf` checks out with CRLF holds the same JSON
 /// as its LF base, so it is no config change.
 #[test]

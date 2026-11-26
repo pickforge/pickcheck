@@ -942,11 +942,15 @@ An edited file that exists and is in no diff adds one `ls-files --stage`; it
 has no base to read. When at least one file is checked, one `cat-file --batch
 --follow-symlinks` reads the base config of every directory from each checked
 file and from `cwd` up to the root, which serves both the comparison and the
-base config. The second scan of a config change reads each base content
+base config. Its request is line-based, so the config paths that hold a
+newline are first resolved by one `ls-tree -t` that takes them and their
+directories as arguments; the batch then reads such a config by its object
+name. A link on such a path cannot be read (see Config). The second scan of a config change reads each base content
 that the first scan read from memory. A post-edit or `Stop` event with one
 violating file therefore runs at most 9 commands, and 2 more for each other
 violating file. A config change adds 2 only for each file that violates in
-the second scan alone, and an operation in progress adds 1.
+the second scan alone, a config path with a newline adds 1, and an operation
+in progress adds 1.
 
 Status. Every violation in the set is compared with the base, as under
 `--base`. The config key `hook.fail_on` lists the statuses that block, by
