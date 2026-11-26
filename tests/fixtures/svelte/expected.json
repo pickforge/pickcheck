@@ -224,6 +224,30 @@
         "hand_derived": true,
         "derivation": "base 1; the optional parameter's ? is not an operator node, and the || in the string default is not an operator node",
         "cognitive_derivation": "a snippet adds nothing; cognitive does not score snippet parameters"
+      },
+      {
+        "function": "{#await}",
+        "line": 279,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; await block +1; the promise and the inline then binding are one text that no wrapper parses cleanly, so the && node that error recovery keeps in the destructuring default +1",
+        "cognitive_derivation": "{#await} +1; the text does not parse as an expression and cognitive scores nothing inside its ERROR node"
+      },
+      {
+        "function": "{#each}",
+        "line": 280,
+        "complexity": 3,
+        "hand_derived": true,
+        "derivation": "base 1; each block +1; a binding with a destructuring default and a key parses cleanly in no wrapper, so the || node that error recovery keeps in the default +1",
+        "cognitive_derivation": "{#each} +1; the parameter is a binding and cognitive does not score it"
+      },
+      {
+        "function": "{#await}",
+        "line": 282,
+        "complexity": 2,
+        "hand_derived": true,
+        "derivation": "base 1; await block +1; the && in the string default is not an operator node in the recovered tree",
+        "cognitive_derivation": "{#await} +1; the text does not parse as an expression and cognitive scores nothing inside its ERROR node"
       }
     ]
   },
@@ -564,6 +588,39 @@
       "complexity": 1,
       "cognitive": 0,
       "depth": 0,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 0,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#await}",
+      "line": 279,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#each}",
+      "line": 280,
+      "complexity": 3,
+      "cognitive": 1,
+      "depth": 1,
+      "lines": 0,
+      "params": 0,
+      "bool_ops": 1,
+      "widget_depth": 0
+    },
+    {
+      "function": "{#await}",
+      "line": 282,
+      "complexity": 2,
+      "cognitive": 1,
+      "depth": 1,
       "lines": 0,
       "params": 0,
       "bool_ops": 0,
