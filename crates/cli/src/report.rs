@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pickcheck_core::{ScanResult, Violation};
+use pickcheck_core::{Metric, ScanResult, Violation};
 
 use crate::Scope;
 
@@ -30,7 +30,12 @@ pub(crate) fn detailed(result: &ScanResult, scope: Scope<'_>) -> String {
         .unverified
         .iter()
         .map(|item| format!("UNVERIFIED {}  {}", item.file.display(), item.reason));
-    lines(violations.chain(unverified))
+    let explain = result
+        .violations
+        .iter()
+        .any(|item| item.metric == Metric::Cognitive.name())
+        .then(|| "EXPLAIN pickcheck explain <file>:<line>".to_owned());
+    lines(violations.chain(unverified).chain(explain))
 }
 
 pub(crate) fn summary(result: &ScanResult, scope: Scope<'_>) -> String {

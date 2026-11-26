@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use crate::cognitive;
+use crate::cognitive::{self, Increment, Origin};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
@@ -46,7 +46,46 @@ pub struct FunctionMetrics {
 #[derive(Clone, Copy, Default)]
 struct Offset {
     line: usize,
+    column: usize,
     byte: usize,
+}
+
+impl Offset {
+    fn origin(self) -> Origin {
+        Origin {
+            row: self.line,
+            column: self.column,
+            skip: 0,
+        }
+    }
+}
+
+/// The cognitive increments of one unit, which `explain` pairs with the
+/// unit's `span` and `function`.
+pub(crate) struct TracedUnit {
+    pub(crate) span: (usize, usize),
+    pub(crate) function: String,
+    pub(crate) increments: Vec<Increment>,
+}
+
+/// Sets `unit.cognitive` with `measure`. When the caller traces, `measure`
+/// gets a sink for the increments, which are then kept with the unit's key.
+fn measure_cognitive(
+    unit: &mut FunctionMetrics,
+    trace: Option<&mut Vec<TracedUnit>>,
+    measure: impl FnOnce(Option<&mut Vec<Increment>>) -> usize,
+) {
+    let Some(trace) = trace else {
+        unit.cognitive = measure(None);
+        return;
+    };
+    let mut increments = Vec::new();
+    unit.cognitive = measure(Some(&mut increments));
+    trace.push(TracedUnit {
+        span: unit.span,
+        function: unit.function.clone(),
+        increments,
+    });
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -404,7 +443,7 @@ pub fn on_measurement_stack<T: Send>(task: impl FnOnce() -> T + Send) -> std::io
     })
 }
 
-fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
+pub(crate) fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(grammar)
@@ -536,13 +575,28 @@ fn function_units(root: Node<'_>, language: Language) -> Vec<(Node<'_>, usize)> 
 ///
 /// Fails when a grammar cannot be loaded or the parser returns no tree.
 pub fn parse_source(language: Language, source: &str) -> Result<ParsedSource> {
-    if language == Language::Svelte {
-        return parse_svelte(source);
-    }
-    parse_with_offset(language, source, Offset::default())
+    parse_units(language, source, None)
 }
 
-fn parse_with_offset(language: Language, source: &str, offset: Offset) -> Result<ParsedSource> {
+/// `parse_source`, plus the cognitive increments of every measured unit,
+/// pushed into `trace` when it is given.
+pub(crate) fn parse_units(
+    language: Language,
+    source: &str,
+    trace: Option<&mut Vec<TracedUnit>>,
+) -> Result<ParsedSource> {
+    if language == Language::Svelte {
+        return parse_svelte(source, trace);
+    }
+    parse_with_offset(language, source, Offset::default(), trace)
+}
+
+fn parse_with_offset(
+    language: Language,
+    source: &str,
+    offset: Offset,
+    mut trace: Option<&mut Vec<TracedUnit>>,
+) -> Result<ParsedSource> {
     let tree = parse_tree(&language.grammar(), source)?;
     let lines = LineIndex::new(source, tree.root_node());
     let mut parsed = ParsedSource::default();
@@ -551,14 +605,18 @@ fn parse_with_offset(language: Language, source: &str, offset: Offset) -> Result
             let name = function_name(node, language, source);
             parsed.leave_out(name, node, offset.byte, false);
         } else {
-            parsed
-                .functions
-                .push(measure_function(node, language, source, offset, &lines));
+            let mut unit = measure_function(node, language, source, offset, &lines);
+            measure_cognitive(&mut unit, trace.as_deref_mut(), |sink| {
+                cognitive::measure_function(node, language, source, offset.origin(), sink)
+            });
+            parsed.functions.push(unit);
         }
     }
     Ok(parsed.finish())
 }
 
+/// Every metric of one function but `cognitive`, which `measure_cognitive`
+/// sets.
 fn measure_function(
     node: Node<'_>,
     language: Language,
@@ -581,7 +639,7 @@ fn measure_function(
         line: start + offset.line,
         end_line: end + offset.line,
         complexity: score.complexity,
-        cognitive: cognitive::measure_function(node, language, source),
+        cognitive: 0,
         depth: score.depth,
         lines: lines.significant_lines(source, start, end, node),
         params: parameter_count(node, language, source),
@@ -1345,7 +1403,7 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
 
-fn parse_svelte(source: &str) -> Result<ParsedSource> {
+fn parse_svelte(source: &str, mut trace: Option<&mut Vec<TracedUnit>>) -> Result<ParsedSource> {
     let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
     let root = tree.root_node();
     let units = svelte_units(root, source);
@@ -1365,11 +1423,15 @@ fn parse_svelte(source: &str) -> Result<ParsedSource> {
             language,
             &source[start.byte..end],
             start,
+            trace.as_deref_mut(),
         )?);
     }
     for (unit, height) in units.template {
         let measured = (height <= MAX_SYNTAX_DEPTH)
-            .then(|| measure_template_unit(unit, source, script, unit.id() == root.id()))
+            .then(|| {
+                let root = unit.id() == root.id();
+                measure_template_unit(unit, source, script, root, trace.as_deref_mut())
+            })
             .flatten();
         match measured {
             Some(unit) => parsed.functions.push(unit),
@@ -1441,6 +1503,7 @@ fn script_content(element: Node<'_>, source: &str) -> Option<(Language, Offset, 
     let end = child_of_kind(element, "end_tag").map_or(element.end_byte(), |end| end.start_byte());
     let start = Offset {
         line: tag.end_position().row,
+        column: tag.end_position().column,
         byte: tag.end_byte(),
     };
     Some((script_language(tag, source), start, end.max(start.byte)))
@@ -1494,6 +1557,7 @@ fn measure_template_unit(
     source: &str,
     script: Language,
     root: bool,
+    trace: Option<&mut Vec<TracedUnit>>,
 ) -> Option<FunctionMetrics> {
     let walk = TemplateWalk {
         source,
@@ -1512,7 +1576,9 @@ fn measure_template_unit(
         unit.line = 1;
         unit.end_line = source.lines().count().max(1);
     }
-    unit.cognitive = cognitive::measure_template_unit(node, source, script, root);
+    measure_cognitive(&mut unit, trace, |sink| {
+        cognitive::measure_template_unit(node, source, script, root, sink)
+    });
     Some(unit)
 }
 

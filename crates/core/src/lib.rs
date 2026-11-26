@@ -4,11 +4,13 @@ pub mod baseline;
 mod cognitive;
 pub mod config;
 pub mod diff;
+pub mod explain;
 pub mod language;
 mod metric;
 pub mod scan;
 
 pub use baseline::{MetricValues, Pairing, Status, pair_units};
+pub use cognitive::Increment;
 pub use config::{
     CommitConfigs, Config, ConfigResolution, HookConfig, Limits, load_config, load_config_at,
 };
@@ -17,12 +19,13 @@ pub use diff::{
     changed_files, changed_files_since, diff_spans, diff_status, is_plainly_tracked,
     merge_base_with_head, parse_diff_hunks, physical, repository, unmerged_files, untracked_files,
 };
+pub use explain::{LeftOutLines, SourceTrace, UnitTrace, trace_source};
 pub use language::{
     FunctionMetrics, Language, LeftOut, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured,
     coverage_unknowns, grammar_inventory, on_measurement_stack, parse_source,
 };
 pub use metric::Metric;
 pub use scan::{
-    Baseline, CONFIG_CHANGED_NOTE, ScanOptions, ScanResult, Unverified, Violation, config_changed,
-    resolve_path, scan,
+    Baseline, CONFIG_CHANGED_NOTE, FileLimits, ScanOptions, ScanResult, Unverified, Violation,
+    config_changed, resolve_path, scan,
 };

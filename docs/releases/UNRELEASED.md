@@ -49,6 +49,10 @@
 - `lines` now indexes each file's lines and comments once instead of
   rescanning the file for every function, so a 100,000-line file with 20,000
   functions is measured in about a second instead of tens of seconds. (#49)
+- New `pickcheck explain <file>[:<line>]` prints where a unit's `cognitive`
+  score comes from, one line per increment with its line, amount, construct,
+  and nesting level, as text or JSON. Detailed `check` output ends with an
+  `EXPLAIN` hint when it lists a `cognitive` violation. (#51)
 - Hooks now anchor the gate to the agent session (#53). The first hook event
   of a session records `HEAD`, and `Stop` checks the diff from the merge base
   of that commit and `HEAD`, restricted to the files the session touched. A
@@ -77,7 +81,6 @@
   config, such as one in a renamed directory or a nested repository, still
   applies. The block reason carries a note that names the config side, and
   `hook.max_blocks` comes from the base. (#53)
-
 - `check --changed`, `check --base`, and hooks now diff every file as text.
   Before, a `-diff` or `binary` attribute, or a NUL byte in a source file,
   made Git report the file as binary with no changed lines, so its changes
