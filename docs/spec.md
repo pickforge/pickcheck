@@ -1200,7 +1200,14 @@ then `new`. A unit that moves with its text is `new` when the hunk that
 removes its old lines also adds lines, as when the session edits the unit
 beside those lines or puts another unit in their place. The `<anonymous>`
 units of that hunk can then be `unmatched`. An `<anonymous>` unit that moves
-into lines of a hunk that also removes lines is `unmatched`.
+into lines of a hunk that also removes lines does not take its base unit by
+its text. It pairs by position as an edit of the lines that the hunk
+removes, and it is `unmatched` when the counts of its owner differ. Units
+of one name pair by that name. So when the session removes or renames a
+unit, a unit that takes its name, or a copy of it, can pair with its base
+unit and be `unchanged`. A unit that becomes code when the session removes
+comment marks around it can pair by position with a unit of its owner that
+the session turns into a comment.
 
 ### `init`
 

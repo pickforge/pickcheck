@@ -754,6 +754,60 @@ fn base_units_that_were_too_deep_count_as_missing() {
     }
 }
 
+/// Outside a hook session the hunks do not change the pairing: a closure
+/// that the diff removes still counts among the closures of its owner, and
+/// units of one name pair in their order.
+#[test]
+fn a_base_check_outside_a_session_does_not_pair_by_the_hunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let on = |event: &str, result: &str| {
+        format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g) => {result});\n")
+    };
+    let flush = "  worker.flush();\n";
+    let bind = |lines: &str| format!("function bind(worker) {{\n{lines}}}\n");
+    let inner = |list: &str| format!("  function validate({list}) {{ return a; }}\n");
+    let outer = |name: &str, lines: &str| format!("function {name}() {{\n{lines}  {name}();\n}}\n");
+    let eight = "a, b, c, d, e, f, g, h";
+    let closures = bind(&[on("data", "a").as_str(), flush, &on("close", "b")].concat());
+    let named = outer("first", &inner(eight)) + &outer("second", &inner("a, b, c, d, e, f, g"));
+    fs::write(root.join("closures.js"), closures).unwrap();
+    fs::write(root.join("named.js"), named).unwrap();
+    commit_all(root, "initial");
+    // One closure is removed, and the other is edited where it is.
+    let closures = bind(&[flush, &on("close", "b + 1")].concat());
+    fs::write(root.join("closures.js"), closures).unwrap();
+    // The first `validate` is removed, and the second gains a parameter.
+    let named = outer("first", "") + &outer("second", &inner(eight));
+    fs::write(root.join("named.js"), named).unwrap();
+    let check = |file: &str| {
+        let args = ["check", "--verbose", "--base", "HEAD", "--fail-on"];
+        let output = command_output(
+            root,
+            &[&args[..], &["new,worsened,unmatched", file]].concat(),
+        );
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+    assert_eq!(
+        check("closures.js"),
+        (
+            Some(1),
+            "FAIL closures.js:3 <anonymous>  params 7 > 6  unmatched\n".to_owned()
+        )
+    );
+    assert_eq!(
+        check("named.js"),
+        (
+            Some(0),
+            "WARN named.js:5 validate  params 8 > 6  unchanged\n".to_owned()
+        )
+    );
+}
+
 #[test]
 fn closures_keep_an_owner_that_was_left_out() {
     let dir = tempfile::tempdir().unwrap();

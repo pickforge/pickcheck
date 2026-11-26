@@ -340,7 +340,7 @@ fn scan_file(
             source: &source,
             parsed: &parsed,
             measured: &measured,
-            spans,
+            hunks: spans.filter(|_| measure_untouched).unwrap_or_default(),
         };
         compare_with_base(changed, &context, &current, result)?;
     }
@@ -442,8 +442,9 @@ struct Current<'a> {
     source: &'a str,
     parsed: &'a ParsedSource,
     measured: &'a Measured,
-    /// The hunks of the file, or `None` when the whole file is checked.
-    spans: Option<&'a [LineRange]>,
+    /// The hunks of the file that pairing reads: only those of a scan with
+    /// `measure_untouched`, so that other scans pair as `pair_units` does.
+    hunks: &'a [LineRange],
 }
 
 /// The file's text and units at the merge base.
@@ -500,13 +501,8 @@ fn pair_with_base(current: &Current<'_>, base: &BaseUnits) -> Vec<Pairing> {
         source: &base.source,
         parsed: &base.parsed,
     };
-    let ranges = current.spans.unwrap_or_default();
     let removed = (base.parsed.functions.iter())
-        .map(|unit| {
-            ranges
-                .iter()
-                .any(|range| range.removes(unit.line, unit.end_line))
-        })
+        .map(|unit| (current.hunks.iter()).any(|range| range.removes(unit.line, unit.end_line)))
         .collect::<Vec<_>>();
     let hunks = baseline::Hunks {
         changes: &current.measured.changes,
