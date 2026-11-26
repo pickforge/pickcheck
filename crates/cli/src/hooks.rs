@@ -576,6 +576,7 @@ fn session_gate(
         add_edited_outside_diff(&mut changes, edited);
     }
     check_links_whole(&mut changes);
+    keep_only_files(&mut changes);
     let configs = base_configs(cwd, &changes, &base, edited)?;
     if configs.is_some() {
         changes.base_reads = Some(BaseReads::default());
@@ -606,6 +607,17 @@ fn check_links_whole(changes: &mut ChangedFiles) {
     }
 }
 
+/// Keeps only the changed entries that are files. Git lists an untracked
+/// nested repository or work tree as its directory, and a submodule, a
+/// dangling link, or a link to a directory is no file either. Such an entry
+/// is neither scanned nor a start of a config lookup.
+fn keep_only_files(changes: &mut ChangedFiles) {
+    let root = &changes.repo_root;
+    let is_file = |path: &PathBuf| root.join(path).is_file();
+    changes.spans.retain(|path, _| is_file(path));
+    changes.untracked.retain(is_file);
+}
+
 /// The configs of `base` when the config of a checked file or of `cwd`
 /// differs from it, or when the diff changes any config. `None` also when
 /// no file is checked.
@@ -628,12 +640,10 @@ fn base_configs(
             .map(PathBuf::as_path)
             .collect::<Vec<_>>(),
     };
-    // Git lists an untracked nested repository as its directory, which is
-    // not a checked file and starts no lookup.
+    // Every changed entry is a file (see `keep_only_files`).
     let checked = checked
         .into_iter()
         .map(|path| root.join(path))
-        .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     if checked.is_empty() {
         return Ok(None);

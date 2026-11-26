@@ -1094,9 +1094,11 @@ fail set.
 Config. When a config that hooks would read differs from the base, the
 session gate scans twice and blocks when either scan blocks. The working-tree lookup walks
 from the directory of each checked file, and from `cwd`, up to the repository
-root, and stops at the first `.pickcheck.json` that is a file. Only a checked
-entry that is a file starts a lookup, so an untracked nested repository, which
-Git lists as a directory, starts none. At every directory
+root, and stops at the first `.pickcheck.json` that is a file. The session
+gate checks only changed entries that are files, and only they start a
+lookup. Git lists an untracked nested repository or work tree as its
+directory, and a submodule, a dangling link, and a link to a directory are
+no files either, so such an entry is neither checked nor starts a lookup. At every directory
 that it reaches, the hook compares what the lookup would read there, through
 a link too, with the file at the same path in the base commit, read through
 links that stay inside the base tree. A config on one side only, or content

@@ -385,6 +385,85 @@ fn an_untracked_nested_repository_starts_no_config_lookup() {
     assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
 }
 
+/// A changed entry that is not a file, such as a nested repository, a work
+/// tree, a dangling link, a link to a directory, or a bumped submodule, is
+/// neither scanned nor a config lookup, so the session gate keeps the base
+/// config. With old debt only, it does not make the plain gate block.
+#[test]
+fn changed_entries_that_are_not_files_keep_the_session_gate() {
+    let module = tempfile::tempdir().unwrap();
+    init_repo(module.path());
+    fs::write(module.path().join("m.txt"), "m\n").unwrap();
+    commit_all(module.path(), "module");
+    let module = module.path().to_str().unwrap().to_owned();
+    let mut cases: Vec<Case> = vec![
+        ("nested", |root| {
+            fs::create_dir(root.join("nested")).unwrap();
+            git(&root.join("nested"), &["init", "-q"]);
+            fs::write(root.join("nested/n.js"), simple("n")).unwrap();
+        }),
+        ("worktree", |root| {
+            git(root, &["worktree", "add", "-q", ".wt/x", "-b", "side"]);
+        }),
+        ("submodule", |root| {
+            fs::write(root.join("sub/m.txt"), "bumped\n").unwrap();
+            git(&root.join("sub"), &["commit", "-qam", "bump"]);
+        }),
+    ];
+    #[cfg(unix)]
+    cases.extend::<[Case; 2]>([
+        ("dangling", |root| {
+            std::os::unix::fs::symlink("nowhere", root.join("dangle.js")).unwrap();
+        }),
+        ("directory link", |root| {
+            std::os::unix::fs::symlink("sub", root.join("dl")).unwrap();
+        }),
+    ]);
+    let strict = r#"{"limits":{"params":6}}"#;
+    let unavailable = "note: hook session state unavailable";
+    for (session, entry) in cases {
+        let (dir, state) = repo(&[(".pickcheck.json", strict), ("a.js", &params("old", 7))]);
+        let root = dir.path();
+        let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+        git(root, &[&add[..], &[module.as_str(), "sub"]].concat());
+        commit_all(root, "submodule");
+        start(&state, root, session);
+
+        // Old debt that the session leaves as it was, and a config that
+        // differs: no block, also not from the plain gate.
+        fs::write(root.join("a.js"), params("old", 7).replace("p0;", "p1;")).unwrap();
+        fs::write(
+            root.join(".pickcheck.json"),
+            r#"{"limits":{"params":6},"hook":{"max_blocks":5}}"#,
+        )
+        .unwrap();
+        entry(root);
+        let output = stop(&state, root, session);
+        assert!(
+            output.stdout.is_empty(),
+            "{session}: {}",
+            text(&output.stdout)
+        );
+        assert!(!text(&output.stderr).contains(unavailable), "{session}");
+
+        // A committed violation blocks with the base config.
+        fs::write(root.join("b.js"), params("bad", 7)).unwrap();
+        edit(&state, root, session, "b.js");
+        git(root, &["add", "a.js", "b.js"]);
+        git(root, &["commit", "-qm", "violation"]);
+        fs::write(root.join(".pickcheck.json"), r#"{"limits":{"params":20}}"#).unwrap();
+        let output = stop(&state, root, session);
+        assert!(!text(&output.stderr).contains(unavailable), "{session}");
+        let reason = block_reason(&output);
+        let note = "note: .pickcheck.json changed in this diff; the config comes from";
+        assert!(reason.starts_with(note), "{session}: {reason}");
+        assert!(
+            reason.contains("FAIL b.js  1 function"),
+            "{session}: {reason}"
+        );
+    }
+}
+
 /// A config link reads through its target, at the base as in the working
 /// tree. A base link that leaves the repository is the state note.
 #[cfg(unix)]

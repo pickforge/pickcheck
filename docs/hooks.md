@@ -64,7 +64,8 @@ is compared with the base, because Git can hide a change, as a clean filter
 does. This covers ignored files, files of nested repositories and
 submodules, skip-worktree entries, and links. A changed link in the diff is
 also checked whole with no base, a pure rename included, because Git diffs
-the link text and not its target. Files outside the diff that the
+the link text and not its target. A changed entry that is no file, such as
+a nested repository, a submodule, or a dangling link, is not checked. Files outside the diff that the
 session does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 A post-edit or `Stop` event with one violating file runs at most 9 Git
