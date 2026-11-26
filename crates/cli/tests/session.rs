@@ -1389,6 +1389,21 @@ fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
                  function foo(list) {{\n  return bar(list);\n}}\n"
             ),
         ),
+        // The session also edits the closure of the other owner, which has
+        // the same text.
+        (
+            "peer",
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\
+                 function foo(list) {{\n  return list.map({old});\n}}\n"
+            ),
+            format!(
+                "function baz(list) {{\n  return list.map({});\n}}\n\
+                 function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return bar(list);\n}}\n",
+                old.replace("return p0", "return p1")
+            ),
+        ),
     ];
     for (session, base, current) in cases {
         let (dir, state) = repo(&[("a.js", &base)]);
@@ -1408,28 +1423,81 @@ fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
 /// A closure in lines that a hunk only adds is no edit of a base closure. It
 /// is new also when the owner loses another closure, so that the owner has
 /// as many closures as before, and also when it is a copy of a closure that
-/// the session edits. A closure that moves with its text is not new.
+/// the session edits. A closure that moves with its text is not new, unless
+/// the hunk that removes its old lines also adds lines.
 #[test]
 fn an_added_closure_blocks_also_when_another_closure_is_removed() {
     let on = |event: &str, result: &str| {
         format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g) => {result});\n")
     };
-    let file = |lines: &[String]| format!("function bind(worker) {{\n{}}}\n", lines.concat());
+    let named = |name: &str, lines: &[String]| {
+        format!("function {name}(worker) {{\n{}}}\n", lines.concat())
+    };
+    let file = |lines: &[String]| named("bind", lines);
     let base = file(&[on("data", "a"), on("close", "b")]);
-    // The content after the session's edit, and whether it blocks.
     let one = "  worker.on(\"data\", (a) => a);\n".to_owned();
+    let flush = "  worker.flush();\n".to_owned();
+    let eight = |event: &str| format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g, h) => a);\n");
+    // The base content, the content after the session's edit, and the
+    // number of violations that block.
     let cases = [
-        ("swap", file(&[on("ready", "a"), on("data", "a")]), true),
-        ("move", file(&[on("close", "b"), on("data", "a")]), false),
+        (
+            "swap",
+            base.clone(),
+            file(&[on("ready", "a"), on("data", "a")]),
+            1,
+        ),
+        (
+            "move",
+            base.clone(),
+            file(&[on("close", "b"), on("data", "a")]),
+            0,
+        ),
         // The old closure is cut to one parameter, and a copy of it is
         // added after the other closure.
         (
             "copy",
-            file(&[one, on("close", "b"), on("data", "a")]),
-            true,
+            base.clone(),
+            file(&[one.clone(), on("close", "b"), on("data", "a")]),
+            1,
+        ),
+        // The old closure gains a parameter, a closure with its old text is
+        // added, and a closure with eight parameters is removed.
+        (
+            "gain",
+            file(&[
+                on("data", "a"),
+                flush.clone(),
+                eight("close"),
+                flush.clone(),
+            ]),
+            file(&[
+                eight("data"),
+                flush.clone(),
+                flush.clone(),
+                on("ready", "a"),
+            ]),
+            2,
+        ),
+        // The copy goes to another owner, which loses its own closure.
+        (
+            "owner",
+            named("input", &[on("data", "a")])
+                + &named("output", &[on("close", "b"), flush.clone()]),
+            named("input", &[one]) + &named("output", &[flush, on("data", "a")]),
+            1,
+        ),
+        // A closure moves with its text, and the session edits the closure
+        // next to its old lines. Git shows both in one hunk that adds a
+        // line, so the moved closure is new and the edited one unmatched.
+        (
+            "beside",
+            file(&[on("data", "a"), on("close", "b"), on("end", "c")]),
+            file(&[on("close", "b + 1"), on("end", "c"), on("data", "a")]),
+            2,
         ),
     ];
-    for (session, current, blocks) in cases {
+    for (session, base, current, violations) in cases {
         let (dir, state) = repo(&[("a.js", &base)]);
         let root = dir.path();
         start(&state, root, session);
@@ -1438,13 +1506,13 @@ fn an_added_closure_blocks_also_when_another_closure_is_removed() {
             edit(&state, root, session, "a.js"),
             stop(&state, root, session),
         ];
+        let plural = if violations == 1 { "" } else { "s" };
+        let fail =
+            format!("FAIL a.js  {violations} function{plural}, {violations} violation{plural}");
         for output in outputs {
-            if blocks {
+            if violations > 0 {
                 let reason = block_reason(&output);
-                assert!(
-                    reason.contains("FAIL a.js  1 function, 1 violation"),
-                    "{reason}"
-                );
+                assert!(reason.contains(&fail), "{session}: {reason}");
             } else {
                 assert!(
                     output.stdout.is_empty(),

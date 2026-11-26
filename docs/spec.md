@@ -1098,12 +1098,13 @@ its owner.
 A unit that lies wholly in the lines of one hunk that removes no line is an
 added unit. It is no edit of a base unit. An added unit takes only a base
 unit of the same text whose lines one hunk removes wholly while it adds no
-line: then the unit moved with its text. A copy of a unit that stays or that the session edits
-therefore takes no base unit. After the units that no hunk touches, an
-added unit looks among the base units of its name or owner. An added
-`<anonymous>` unit that takes none does not pair by position and does not
-count among the `<anonymous>` units of its owner. It is `new` unless the
-last step gives it a base unit.
+line: then the unit moved with its text. So an added unit never takes, by
+its text, the base unit of a unit that stays or that the session edits where
+it is. After the units that no hunk touches, an added unit looks among the
+base units of its name or owner. An added `<anonymous>` unit that takes none
+does not pair by position and does not count among the `<anonymous>` units
+of its owner. It is `new` unless the last step gives it a base unit. An
+added unit with a name that takes none still pairs by name and order.
 
 The units that are left pair as under `--base`, with the base units that
 are left. So a unit that the session adds before an old unit is the new
@@ -1186,9 +1187,13 @@ event; the next event sees the change. Pruning a session that has been idle
 for 30 days can race with that session's next event, which then starts the
 session with a new anchor. A unit whose text a checkout rewrites, as the
 `ident` attribute does, finds no base unit by its text; it then pairs as
-under `--base`. Git decides which lines a hunk adds. When a unit with the
-old text of an edited unit stays elsewhere in the file, Git can show the
-edited unit as added lines, and an edited `<anonymous>` unit is then `new`.
+under `--base`. Git decides which lines a hunk adds and removes. When a
+unit with the old text of an edited unit stays elsewhere in the file, Git
+can show the edited unit as added lines, and an edited `<anonymous>` unit is
+then `new`. A unit that moves with its text is `new` when the hunk that
+removes its old lines also adds lines, as when the session edits the unit
+beside those lines or puts another unit in their place. The `<anonymous>`
+units of that hunk can then be `unmatched`.
 
 ### `init`
 
