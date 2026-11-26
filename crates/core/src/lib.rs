@@ -4,19 +4,22 @@ pub mod baseline;
 mod cognitive;
 pub mod config;
 pub mod diff;
+pub mod explain;
 pub mod language;
 mod metric;
 pub mod scan;
 
 pub use baseline::{MetricValues, Pairing, Status, pair_units};
+pub use cognitive::Increment;
 pub use config::{Config, ConfigResolution, Limits, load_config};
 pub use diff::{
     BaseBlob, ChangedFiles, LineRange, base_blob, changed_files, changed_files_since,
     parse_diff_hunks, physical,
 };
+pub use explain::{LeftOutLines, SourceTrace, UnitTrace, trace_source};
 pub use language::{
     FunctionMetrics, Language, LeftOut, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured,
     coverage_unknowns, grammar_inventory, on_measurement_stack, parse_source,
 };
 pub use metric::Metric;
-pub use scan::{Baseline, ScanOptions, ScanResult, Unverified, Violation, scan};
+pub use scan::{Baseline, FileLimits, ScanOptions, ScanResult, Unverified, Violation, scan};

@@ -419,6 +419,53 @@ fn applies(file: &FileContext<'_>, function: &FunctionMetrics, metric: Metric) -
     !file.test_exempt(metric) && metric.applies_to(function)
 }
 
+/// The effective limits of one file's units, resolved as `scan` resolves
+/// them: the file's config chain (or `explicit_config`), its language
+/// overrides, and test-file exemptions.
+pub struct FileLimits {
+    language: Language,
+    config: Config,
+    test_file: bool,
+}
+
+impl FileLimits {
+    pub fn resolve(
+        cwd: &Path,
+        path: &Path,
+        language: Language,
+        explicit_config: Option<&Path>,
+    ) -> Result<Self> {
+        let file = absolute(cwd, path);
+        let roots = std::slice::from_ref(&file);
+        let options = ScanOptions {
+            cwd,
+            paths: roots,
+            explicit_config,
+            changed: None,
+        };
+        let matched = relative(&match_base(&options, roots)?, &file);
+        let config = load_config(&file, explicit_config)?.config;
+        let test_file = Config::matcher(&config.tests.patterns)?.is_match(&matched);
+        Ok(Self {
+            language,
+            config,
+            test_file,
+        })
+    }
+
+    /// `None` where a check is off or does not apply to `unit`.
+    pub fn for_unit(&self, unit: &FunctionMetrics) -> Limits {
+        let file = FileContext {
+            display: Path::new(""),
+            matched: Path::new(""),
+            language: self.language,
+            config: &self.config,
+            test_file: self.test_file,
+        };
+        effective_limits(&file, unit)
+    }
+}
+
 fn changed_spans<'a>(path: &Path, changed: Option<&'a ChangedFiles>) -> Option<&'a [LineRange]> {
     let changed = changed?;
     if changed.fallback || changed.untracked.iter().any(|item| item == path) {

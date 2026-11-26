@@ -3,11 +3,59 @@
 //! one in `language.rs`: the two count different things and must not share
 //! classification.
 
+use serde::Serialize;
 use tree_sitter::{Node, Parser};
 
 use crate::language::{
-    Language, Wrapper, exceeds_depth_limit, has_operator, is_dart_handler, is_function, node_text,
+    Language, Wrapper, exceeds_depth_limit, is_dart_handler, is_function, node_text,
 };
+
+/// One cognitive increment: where it sits in the file (1-based line, and
+/// 1-based column in bytes), how much it adds, the construct that adds it, and
+/// the nesting level it paid for (`None` for flat increments).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Increment {
+    pub line: usize,
+    pub column: usize,
+    pub add: usize,
+    pub construct: &'static str,
+    pub nesting: Option<usize>,
+}
+
+/// Where the text a walk parses starts in the file, so that every increment
+/// gets its file position. `skip` is the length of the wrapper prefix that a
+/// template text is parsed behind. The prefix holds no line break, so it
+/// shifts only the columns of the text's first row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Origin {
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) skip: usize,
+}
+
+impl Origin {
+    fn increment(
+        self,
+        node: Node<'_>,
+        add: usize,
+        construct: &'static str,
+        nesting: Option<usize>,
+    ) -> Increment {
+        let point = node.start_position();
+        let column = if point.row == 0 {
+            self.column + point.column.saturating_sub(self.skip)
+        } else {
+            point.column
+        };
+        Increment {
+            line: self.row + point.row + 1,
+            column: column + 1,
+            add,
+            construct,
+            nesting,
+        }
+    }
+}
 
 /// Header fields stay at the construct's own nesting level; every other part
 /// of a structural construct sits one level deeper.
@@ -26,29 +74,45 @@ const HEADER_FIELDS: &[&str] = &[
     "parameter",
 ];
 
+/// Each variant carries the construct label `explain` prints; a sequence
+/// carries its operator.
 enum Kind {
-    Structural,
+    Structural(&'static str),
     If,
     /// Python comprehension clauses: `1 + nesting`, but they raise nesting for
     /// nothing.
-    FlatStructural,
-    Flat,
+    FlatStructural(&'static str),
+    Flat(&'static str),
     Sequence(&'static str),
+    /// A logical assignment (`&&=`, `||=`, `??=`): a flat increment at its
+    /// operator.
+    Assignment(&'static str),
 }
 
-pub(crate) fn measure_function(node: Node<'_>, language: Language, source: &str) -> usize {
+/// Scores one function. `origin` is where `source` starts in the file (a
+/// Svelte `<script>` block is parsed on its own). With `trace`, every
+/// increment is also pushed there, with its file position.
+pub(crate) fn measure_function(
+    node: Node<'_>,
+    language: Language,
+    source: &str,
+    origin: Origin,
+    trace: Option<&mut Vec<Increment>>,
+) -> usize {
     let mut walk = Walk {
         language,
         source,
         root_id: node.id(),
         template: false,
         score: 0,
+        trace,
+        origin,
     };
     walk.visit(node.child_by_field_name("body").unwrap_or(node), 0);
     walk.score
 }
 
-struct Walk<'s> {
+struct Walk<'s, 't> {
     language: Language,
     source: &'s str,
     root_id: usize,
@@ -56,9 +120,22 @@ struct Walk<'s> {
     /// subtrees add nothing.
     template: bool,
     score: usize,
+    /// Present only when the caller asks for the increments.
+    trace: Option<&'t mut Vec<Increment>>,
+    /// Where `source` starts in the file.
+    origin: Origin,
 }
 
-impl Walk<'_> {
+impl Walk<'_, '_> {
+    /// The only place the score grows, so the score is the sum of the
+    /// recorded increments.
+    fn add(&mut self, node: Node<'_>, add: usize, construct: &'static str, nesting: Option<usize>) {
+        self.score += add;
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.push(self.origin.increment(node, add, construct, nesting));
+        }
+    }
+
     fn visit(&mut self, node: Node<'_>, level: usize) {
         if node.id() != self.root_id && is_function(self.language, node.kind()) && !self.template {
             return;
@@ -68,26 +145,42 @@ impl Walk<'_> {
         }
         match self.kind(node) {
             Some(Kind::If) => {
-                self.score += 1 + level;
+                self.add(node, 1 + level, "if", Some(level));
                 self.visit_if(node, level);
             }
-            Some(Kind::Structural) => {
-                self.score += 1 + level;
+            Some(Kind::Structural(construct)) => {
+                self.add(node, 1 + level, construct, Some(level));
                 self.visit_parts(node, level);
             }
-            Some(Kind::FlatStructural) => {
-                self.score += 1 + level;
+            Some(Kind::FlatStructural(construct)) => {
+                self.add(node, 1 + level, construct, Some(level));
                 self.visit_children(node, level);
             }
-            Some(Kind::Flat) => {
-                self.score += 1;
+            Some(Kind::Flat(construct)) => {
+                self.add(node, 1, construct, None);
                 self.visit_children(node, level);
             }
             Some(Kind::Sequence(operator)) => {
-                self.score += usize::from(!self.continues_sequence(node, operator));
+                if !self.continues_sequence(node, operator) {
+                    self.add(self.operator(node), 1, sequence_label(operator), None);
+                }
+                self.visit_children(node, level);
+            }
+            Some(Kind::Assignment(construct)) => {
+                self.add(self.operator(node), 1, construct, None);
                 self.visit_children(node, level);
             }
             None => self.visit_children(node, level),
+        }
+    }
+
+    /// Where the increment of a sequence or logical assignment sits. Only a
+    /// trace needs the position, so the score alone looks up no token.
+    fn operator<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
+        if self.trace.is_some() {
+            operator_token(node)
+        } else {
+            node
         }
     }
 
@@ -162,10 +255,20 @@ impl Walk<'_> {
     }
 
     fn visit_alternative(&mut self, owner: Node<'_>, alternative: Node<'_>, level: usize) {
-        self.score += 1;
+        // Where the `else` is: the clause, or else the owner's `else` token.
+        // Only a trace needs the token.
+        let position = if alternative.kind() == "else_clause" || self.trace.is_none() {
+            alternative
+        } else {
+            anonymous_child(owner, &["else"]).unwrap_or(alternative)
+        };
         match alternative.kind() {
-            "elif_clause" => return self.visit_if(alternative, level),
+            "elif_clause" => {
+                self.add(alternative, 1, "else if", None);
+                return self.visit_if(alternative, level);
+            }
             "else_clause" if self.language == Language::Python => {
+                self.add(alternative, 1, "else", None);
                 return self.visit_children(alternative, level + 1);
             }
             _ => {}
@@ -176,8 +279,14 @@ impl Walk<'_> {
             Some(alternative)
         };
         match inner {
-            Some(inner) if inner.kind() == owner.kind() => self.visit_if(inner, level),
-            _ => self.visit(alternative, level + 1),
+            Some(inner) if inner.kind() == owner.kind() => {
+                self.add(position, 1, "else if", None);
+                self.visit_if(inner, level);
+            }
+            _ => {
+                self.add(position, 1, "else", None);
+                self.visit(alternative, level + 1);
+            }
         }
     }
 
@@ -204,6 +313,20 @@ impl Walk<'_> {
     }
 }
 
+/// The operator of a sequence or logical assignment: its `operator` field,
+/// or else its first anonymous operator token (Dart, the Rust `let_chain`).
+fn operator_token(node: Node<'_>) -> Node<'_> {
+    node.child_by_field_name("operator")
+        .or_else(|| anonymous_child(node, &["&&", "||", "??", "&&=", "||=", "??="]))
+        .unwrap_or(node)
+}
+
+fn anonymous_child<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| !child.is_named() && kinds.contains(&child.kind()))
+}
+
 fn first_code_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -218,17 +341,63 @@ fn sequence_operator(node: Node<'_>, source: &str, wanted: &[&'static str]) -> O
         .map(|item| Kind::Sequence(item))
 }
 
+/// A logical assignment (`&&=`, `||=`, `??=`): a sequence increment that
+/// never continues a run. The operator is the `operator` field, or else an
+/// anonymous token child.
+fn assignment_sequence(node: Node<'_>, source: &str, wanted: &[&'static str]) -> Option<Kind> {
+    let matches = |child: Node<'_>| {
+        wanted
+            .iter()
+            .find(|item| **item == node_text(child, source))
+            .map(|item| Kind::Assignment(sequence_label(item)))
+    };
+    if let Some(operator) = node.child_by_field_name("operator") {
+        return matches(operator);
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| !child.is_named())
+        .find_map(matches)
+}
+
+fn sequence_label(operator: &str) -> &'static str {
+    match operator {
+        "&&" => "sequence &&",
+        "||" => "sequence ||",
+        "??" => "sequence ??",
+        "and" => "sequence and",
+        "or" => "sequence or",
+        "&&=" => "sequence &&=",
+        "||=" => "sequence ||=",
+        "??=" => "sequence ??=",
+        _ => "sequence",
+    }
+}
+
+/// A labeled `break` or `continue`, by node kind.
+fn labeled_jump(node: Node<'_>, labeled: bool) -> Option<Kind> {
+    let construct = match node.kind() {
+        "break_statement" | "break_expression" => "labeled break",
+        _ => "labeled continue",
+    };
+    labeled.then_some(Kind::Flat(construct))
+}
+
 fn js_kind(node: Node<'_>, source: &str) -> Option<Kind> {
     match node.kind() {
         "if_statement" => Some(Kind::If),
-        "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
-        | "switch_statement" | "catch_clause" | "ternary_expression" => Some(Kind::Structural),
+        "for_statement" | "for_in_statement" => Some(Kind::Structural("for")),
+        "while_statement" => Some(Kind::Structural("while")),
+        "do_statement" => Some(Kind::Structural("do")),
+        "switch_statement" => Some(Kind::Structural("switch")),
+        "catch_clause" => Some(Kind::Structural("catch")),
+        "ternary_expression" => Some(Kind::Structural("ternary")),
         "break_statement" | "continue_statement" => {
-            node.child_by_field_name("label").map(|_| Kind::Flat)
+            labeled_jump(node, node.child_by_field_name("label").is_some())
         }
         "binary_expression" => sequence_operator(node, source, &["&&", "||", "??"]),
         "augmented_assignment_expression" => {
-            has_operator(node, source, &["&&=", "||=", "??="]).then_some(Kind::Flat)
+            assignment_sequence(node, source, &["&&=", "||=", "??="])
         }
         _ => None,
     }
@@ -237,21 +406,19 @@ fn js_kind(node: Node<'_>, source: &str) -> Option<Kind> {
 fn dart_kind(node: Node<'_>, source: &str) -> Option<Kind> {
     match node.kind() {
         "if_statement" | "if_element" => Some(Kind::If),
-        "for_statement"
-        | "for_element"
-        | "while_statement"
-        | "do_statement"
-        | "switch_statement"
-        | "switch_expression"
-        | "conditional_expression" => Some(Kind::Structural),
-        "block" if is_dart_handler(node) => Some(Kind::Structural),
+        "for_statement" | "for_element" => Some(Kind::Structural("for")),
+        "while_statement" => Some(Kind::Structural("while")),
+        "do_statement" => Some(Kind::Structural("do")),
+        "switch_statement" | "switch_expression" => Some(Kind::Structural("switch")),
+        "conditional_expression" => Some(Kind::Structural("ternary")),
+        "block" if is_dart_handler(node) => Some(Kind::Structural("catch")),
         "break_statement" | "continue_statement" => {
-            has_named_child(node, "identifier").then_some(Kind::Flat)
+            labeled_jump(node, has_named_child(node, "identifier"))
         }
         "logical_and_expression" => Some(Kind::Sequence("&&")),
         "logical_or_expression" => Some(Kind::Sequence("||")),
         "if_null_expression" => Some(Kind::Sequence("??")),
-        "assignment_expression" => has_operator(node, source, &["??="]).then_some(Kind::Flat),
+        "assignment_expression" => assignment_sequence(node, source, &["??="]),
         _ => None,
     }
 }
@@ -259,14 +426,15 @@ fn dart_kind(node: Node<'_>, source: &str) -> Option<Kind> {
 fn rust_kind(node: Node<'_>, source: &str) -> Option<Kind> {
     match node.kind() {
         "if_expression" => Some(Kind::If),
-        "for_expression" | "while_expression" | "loop_expression" | "match_expression" => {
-            Some(Kind::Structural)
-        }
+        "for_expression" => Some(Kind::Structural("for")),
+        "while_expression" => Some(Kind::Structural("while")),
+        "loop_expression" => Some(Kind::Structural("loop")),
+        "match_expression" => Some(Kind::Structural("match")),
         "let_declaration" => node
             .child_by_field_name("alternative")
-            .map(|_| Kind::Structural),
+            .map(|_| Kind::Structural("let else")),
         "break_expression" | "continue_expression" => {
-            has_named_child(node, "label").then_some(Kind::Flat)
+            labeled_jump(node, has_named_child(node, "label"))
         }
         "binary_expression" => sequence_operator(node, source, &["&&", "||"]),
         "let_chain" => Some(Kind::Sequence("&&")),
@@ -277,18 +445,18 @@ fn rust_kind(node: Node<'_>, source: &str) -> Option<Kind> {
 fn python_kind(node: Node<'_>, source: &str) -> Option<Kind> {
     match node.kind() {
         "if_statement" => Some(Kind::If),
-        "for_statement"
-        | "while_statement"
-        | "match_statement"
-        | "except_clause"
-        | "conditional_expression" => Some(Kind::Structural),
-        "for_in_clause" => Some(Kind::FlatStructural),
+        "for_statement" => Some(Kind::Structural("for")),
+        "while_statement" => Some(Kind::Structural("while")),
+        "match_statement" => Some(Kind::Structural("match")),
+        "except_clause" => Some(Kind::Structural("catch")),
+        "conditional_expression" => Some(Kind::Structural("ternary")),
+        "for_in_clause" => Some(Kind::FlatStructural("comprehension for")),
         "if_clause"
             if node
                 .parent()
                 .is_none_or(|parent| parent.kind() != "case_clause") =>
         {
-            Some(Kind::FlatStructural)
+            Some(Kind::FlatStructural("comprehension if"))
         }
         "boolean_operator" => sequence_operator(node, source, &["and", "or"]),
         _ => None,
@@ -298,14 +466,13 @@ fn python_kind(node: Node<'_>, source: &str) -> Option<Kind> {
 fn go_kind(node: Node<'_>, source: &str) -> Option<Kind> {
     match node.kind() {
         "if_statement" => Some(Kind::If),
-        "for_statement"
-        | "expression_switch_statement"
-        | "type_switch_statement"
-        | "select_statement" => Some(Kind::Structural),
+        "for_statement" => Some(Kind::Structural("for")),
+        "expression_switch_statement" | "type_switch_statement" => Some(Kind::Structural("switch")),
+        "select_statement" => Some(Kind::Structural("select")),
         "break_statement" | "continue_statement" => {
-            has_named_child(node, "label_name").then_some(Kind::Flat)
+            labeled_jump(node, has_named_child(node, "label_name"))
         }
-        "goto_statement" => Some(Kind::Flat),
+        "goto_statement" => Some(Kind::Flat("goto")),
         "binary_expression" => sequence_operator(node, source, &["&&", "||"]),
         _ => None,
     }
@@ -321,12 +488,14 @@ fn has_named_child(node: Node<'_>, kind: &str) -> bool {
 /// top-level block, a snippet, or, with `root`, the document, whose score
 /// leaves out every block and snippet that forms its own unit. `script` is the
 /// grammar the component's `<script>` uses, which also parses template
-/// expressions.
+/// expressions. With `trace`, every increment is also pushed there, with its
+/// file position.
 pub(crate) fn measure_template_unit(
     unit: Node<'_>,
     source: &str,
     script: Language,
     root: bool,
+    trace: Option<&mut Vec<Increment>>,
 ) -> usize {
     let mut template = Template {
         source,
@@ -334,34 +503,45 @@ pub(crate) fn measure_template_unit(
         unit_id: unit.id(),
         root,
         score: 0,
+        trace,
     };
     template.visit(unit, 0);
     template.score
 }
 
-struct Template<'s> {
+struct Template<'s, 't> {
     source: &'s str,
     script: Language,
     unit_id: usize,
     root: bool,
     score: usize,
+    trace: Option<&'t mut Vec<Increment>>,
 }
 
-impl Template<'_> {
+impl Template<'_, '_> {
+    /// The only place the score grows outside template expressions, which
+    /// record through their own walk.
+    fn add(&mut self, node: Node<'_>, add: usize, construct: &'static str, nesting: Option<usize>) {
+        self.score += add;
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.push(Origin::default().increment(node, add, construct, nesting));
+        }
+    }
+
     fn visit(&mut self, node: Node<'_>, level: usize) {
         match node.kind() {
             "script_element" | "style_element" => {}
             "snippet_statement" if node.id() != self.unit_id => {}
             "if_statement" | "each_statement" | "await_statement" if self.root => {}
             "if_statement" | "each_statement" | "await_statement" => {
-                self.score += 1 + level;
+                self.add(node, 1 + level, block_label(node.kind()), Some(level));
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     self.visit_block_part(child, level);
                 }
             }
             "svelte_raw_text" if scored_raw_text(node) => {
-                self.score += self.expression(node_text(node, self.source), level);
+                self.score += self.expression(node, level);
             }
             _ => self.visit_children(node, level),
         }
@@ -371,7 +551,12 @@ impl Template<'_> {
         match part.kind() {
             "if_start" | "each_start" | "await_start" => self.visit(part, level),
             "else_if_block" | "else_block" => {
-                self.score += 1;
+                let construct = if part.kind() == "else_if_block" {
+                    "{:else if}"
+                } else {
+                    "{:else}"
+                };
+                self.add(part, 1, construct, None);
                 let mut cursor = part.walk();
                 for child in part.named_children(&mut cursor) {
                     let tag = matches!(child.kind(), "else_if_start" | "else_start");
@@ -389,8 +574,16 @@ impl Template<'_> {
         }
     }
 
-    fn expression(&self, text: &str, level: usize) -> usize {
-        let (wrapped, range) = Wrapper::Expression.wrap(text);
+    /// Scores the text of one `svelte_raw_text` node, parsed behind the
+    /// expression wrapper.
+    fn expression(&mut self, node: Node<'_>, level: usize) -> usize {
+        let (wrapped, range) = Wrapper::Expression.wrap(node_text(node, self.source));
+        let start = node.start_position();
+        let origin = Origin {
+            row: start.row,
+            column: start.column,
+            skip: range.start,
+        };
         let mut parser = Parser::new();
         if parser.set_language(&self.script.grammar()).is_err() {
             return 0;
@@ -410,12 +603,22 @@ impl Template<'_> {
             root_id: function.id(),
             template: true,
             score: 0,
+            trace: self.trace.as_deref_mut(),
+            origin,
         };
         walk.visit(
             function.child_by_field_name("body").unwrap_or(function),
             level,
         );
         walk.score
+    }
+}
+
+fn block_label(kind: &str) -> &'static str {
+    match kind {
+        "if_statement" => "{#if}",
+        "each_statement" => "{#each}",
+        _ => "{#await}",
     }
 }
 

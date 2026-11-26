@@ -517,6 +517,7 @@ Binary: `pickcheck`.
 
 ```
 pickcheck check [--changed] [--base <ref> [--fail-on <statuses>]] [--verbose|--summary] [--format text|json] [--config <path>] [paths…]
+pickcheck explain <file>[:<line>] [--function <name>] [--format text|json] [--config <path>]
 pickcheck hook claude
 pickcheck hook codex
 pickcheck hook cursor
@@ -580,6 +581,11 @@ FAIL src/auth.ts:42 authenticate  complexity 18 > 15
 FAIL src/auth.ts:42 authenticate  depth 5 > 4
 UNVERIFIED src/Foo.kt  no grammar for .kt
 ```
+
+  When at least one listed violation has metric `cognitive`, the detailed
+  output ends with the line `EXPLAIN pickcheck explain <file>:<line>`, with
+  those literal placeholders (see `explain`). The summary and JSON outputs
+  never print it.
 
 - Text output for `--changed` is summarized by default. `--summary` requests the
   same output for explicit paths. It reports total failing files, functions,
@@ -759,6 +765,115 @@ unchanged. An excerpt:
   ]
 }
 ```
+
+### `explain`
+
+`explain` prints where a unit's `cognitive` score comes from: one line per
+increment, recorded by the same walk that produces the score, so the
+increments always sum to `cognitive`. It reports and never gates.
+
+Selection:
+
+- `<file>:<line>` selects every unit that starts at that line, or else the
+  innermost unit (smallest byte span) whose lines contain it.
+- `--function <name>` selects every unit with that reported name, in source
+  order.
+- Units are always printed in source order (start byte), also when several
+  start on one line.
+- When a line or name matches measured units and also units `check` left out,
+  it explains the measured units; the `note:` line names the units left out.
+- A line inside a measured unit that sits inside a unit left out selects the
+  measured unit. A line where only a unit left out starts selects no unit.
+- Giving both is a usage error.
+- With neither, it selects every unit whose `cognitive` exceeds its effective
+  limit. When none does, the text output prints
+  `no unit in <file> exceeds the cognitive limit` to stderr, the JSON output
+  prints its document with `"units": []`, and both exit 0.
+- When the whole argument names an existing file, it is the file, even when it
+  ends in `:<digits>`. Otherwise the text after the last `:` is the line. An
+  editor position `<file>:<line>:<column>` is also accepted when
+  `<file>:<line>` names no existing file; the column is ignored.
+- In a Svelte file, a line of a top-level `<script>` or `<style>` element that
+  no function contains selects no unit.
+
+Effective limits come from the same config resolution `check` uses for that
+file, including `--config`, the language override, and test-file exemptions.
+
+Text output, per unit, a header and then the increments in source order. Units
+are separated by a blank line, and columns are aligned:
+
+```
+src/auth.ts:42 authenticate  cognitive 12 <= 15
+  43  +1  for          nesting 0
+  44  +2  if           nesting 1
+  44  +1  sequence &&
+  46  +1  else if
+  47  +3  catch        nesting 2
+  48  +4  ternary      nesting 3
+```
+
+The header reads `cognitive <value> > <limit>` when over the limit,
+`cognitive <value> <= <limit>` when within it, and `cognitive <value>` when the
+limit is off. Each row gives the file line, the amount added, the construct,
+and, for increments that depend on nesting, the nesting level they paid for.
+Lines are real file lines, also in Svelte `<script>` blocks and in template
+expressions.
+
+Constructs are a fixed vocabulary chosen from node kinds (see Rule tables):
+`if`, `else if`, `else`, `for`, `while`, `do`, `loop`, `switch`, `match`,
+`select`, `catch`, `ternary`, `let else`, `comprehension for`,
+`comprehension if`, `labeled break`, `labeled continue`, `goto`, `sequence`
+followed by its operator (`sequence &&`, `sequence ||`, `sequence ??`,
+`sequence and`, `sequence or`, `sequence &&=`, `sequence ||=`,
+`sequence ??=`), and for Svelte templates `{#if}`, `{:else if}`, `{:else}`,
+`{#each}`, `{#await}`. Every catch handler, including a Dart `on T` block and
+a Python `except`, is `catch`; every conditional expression is `ternary`; a
+Dart collection `if` / `for` is `if` / `for`.
+
+Output `json`; `metrics` and `limits` use the same shapes as `base_metrics`
+and `limits` under `--base`. Each increment adds `column`, the 1-based byte
+column where its node starts in the file, also in Svelte `<script>` blocks and
+template expressions. A sequence starts at its operator token, and an `else` or
+`else if` at its `else` keyword. `nesting` is `null` for flat increments:
+
+```json
+{
+  "version": "0.4.0",
+  "file": "src/auth.ts",
+  "units": [
+    {"function": "authenticate", "line": 42, "cognitive": 12, "limit": 15,
+     "metrics": {"complexity": 7, "cognitive": 12, "depth": 3, "lines": 11,
+                 "params": 1, "bool_ops": 1, "widget_depth": 0},
+     "limits": {"complexity": null, "cognitive": 15, "depth": 4, "lines": 100,
+                "params": 6, "bool_ops": 3, "widget_depth": null},
+     "increments": [
+       {"line": 43, "column": 3, "add": 1, "construct": "for", "nesting": 0},
+       {"line": 44, "column": 5, "add": 2, "construct": "if", "nesting": 1},
+       {"line": 44, "column": 13, "add": 1, "construct": "sequence &&",
+        "nesting": null},
+       {"line": 46, "column": 7, "add": 1, "construct": "else if",
+        "nesting": null},
+       {"line": 47, "column": 24, "add": 3, "construct": "catch", "nesting": 2},
+       {"line": 48, "column": 13, "add": 4, "construct": "ternary", "nesting": 3}
+     ]}
+  ]
+}
+```
+
+Exit codes: `0` whenever it explains, whatever the scores. `2` with a one-line
+`error:` for a missing or unreadable file, a file with no grammar, a line or
+name that matches no unit, a malformed `<file>:<line>` (an empty, non-numeric,
+or zero line after an existing file), both a line and `--function`, a line or
+name that selects only a unit `check` left out (deeper than 3,000 levels), and a
+file whose units `check` all left out, with the `UNVERIFIED` reason. A unit
+that is not measured has no increments.
+
+`explain` traces every unit that `check` measures, also in a file that `check`
+reports `UNVERIFIED`. For such a file it writes one line to stderr,
+`note: <file> is UNVERIFIED: <reason>`, followed by
+`, left out <name> at line <line>` for each unit left out, and exits 0. The
+reason is the one `check` gives: syntax nesting too deep to measure, or a
+Svelte script block that could not be parsed.
 
 ### `hook claude`
 

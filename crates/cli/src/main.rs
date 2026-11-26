@@ -1,5 +1,6 @@
 #![deny(clippy::cognitive_complexity, clippy::too_many_lines)]
 
+mod explain;
 mod hooks;
 mod report;
 
@@ -42,6 +43,18 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
         paths: Vec<PathBuf>,
+    },
+    /// Show where each unit's cognitive score comes from.
+    Explain {
+        /// `<file>` or `<file>:<line>`.
+        #[arg(value_name = "FILE[:LINE]")]
+        target: String,
+        #[arg(long, value_name = "NAME")]
+        function: Option<String>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Hook {
         #[command(subcommand)]
@@ -98,7 +111,7 @@ impl Scope<'_> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Format {
+pub(crate) enum Format {
     Text,
     Json,
 }
@@ -148,6 +161,12 @@ fn run(cli: Cli) -> Result<u8> {
             };
             run_check(scope, verbose, summary, format, config.as_deref(), &paths)
         }
+        Command::Explain {
+            target,
+            function,
+            format,
+            config,
+        } => explain::run(&target, function.as_deref(), format, config.as_deref()),
         Command::Hook { harness } => hooks::run(match harness {
             Harness::Claude => hooks::Harness::Claude,
             Harness::Codex => hooks::Harness::Codex,
