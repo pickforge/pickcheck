@@ -35,7 +35,7 @@ fn golden_increments_sum_to_cognitive() {
             let source = fs::read_to_string(&path).unwrap();
             let parsed = parse_source(language, &source).unwrap();
             assert!(parsed.left_out.is_empty(), "{}", path.display());
-            let traces = trace_source(language, &source).unwrap();
+            let traces = trace_source(language, &source).unwrap().units;
             assert_eq!(traces.len(), parsed.functions.len(), "{}", path.display());
             assert_eq!(traces.len(), expected.len(), "{}", path.display());
             let units = parsed.functions.iter().zip(&expected);
@@ -81,7 +81,7 @@ fn svelte_role_wrapper_units_trace_at_their_tags() {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/svelte/fixture.svelte");
     let source = fs::read_to_string(path).unwrap();
-    let traces = trace_source(Language::Svelte, &source).unwrap();
+    let traces = trace_source(Language::Svelte, &source).unwrap().units;
     let rows = traces
         .iter()
         .filter(|trace| (272..=277).contains(&trace.metrics.line))

@@ -170,16 +170,17 @@ fn errors_exit_2_with_one_line() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("visit.js"), VISIT).unwrap();
     fs::write(dir.path().join("Main.kt"), "fun main() {}\n").unwrap();
-    let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
-    fs::write(dir.path().join("deep.js"), deep).unwrap();
+    fs::write(dir.path().join("bin.png"), [0x89, 0x50, 0xff, 0xfe]).unwrap();
     fs::write(
-        dir.path().join("case.svelte"),
-        "<script>const text = \"</scripture>\"; function bad(a) { return a; }</script>\n",
+        dir.path().join("E.svelte"),
+        "<script>\n  function g(a) { return a ? 1 : 2; }\n  let y = a && b;\n</script>\n{#if y}<p>a</p>{/if}\n",
     )
     .unwrap();
     let cases: [(&[&str], &str); 9] = [
         (&["missing.js"], "cannot read missing.js"),
         (&["Main.kt"], "no grammar for Main.kt"),
+        (&["bin.png"], "no grammar for bin.png"),
+        (&["E.svelte:3"], "no unit in E.svelte contains line 3"),
         (&["visit.js:40"], "no unit in visit.js contains line 40"),
         (
             &["visit.js", "--function", "nope"],
@@ -188,14 +189,6 @@ fn errors_exit_2_with_one_line() {
         (&["visit.js:"], "malformed target 'visit.js:'"),
         (&["visit.js:0"], "malformed target 'visit.js:0'"),
         (&["visit.js:3", "--function", "visit"], "not both"),
-        (
-            &["deep.js"],
-            "cannot explain deep.js: syntax nesting too deep to measure",
-        ),
-        (
-            &["case.svelte"],
-            "cannot explain case.svelte: script block could not be parsed",
-        ),
     ];
     for (args, message) in cases {
         let output = run(dir.path(), args);
@@ -275,4 +268,88 @@ fn detailed_check_points_to_explain_for_cognitive_only() {
     assert!(!stdout(&output).contains("EXPLAIN"));
     let output = check(&["check", "--format", "json", "bad.js"]);
     assert!(!stdout(&output).contains("EXPLAIN"));
+}
+
+#[test]
+fn an_unverified_file_explains_the_units_it_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = format!("function deep(a) {{ return {}a; }}\n", "a+".repeat(20_000));
+    fs::write(
+        dir.path().join("deep.js"),
+        format!("{}{deep}", over_limit()),
+    )
+    .unwrap();
+    fs::write(dir.path().join("only.js"), &deep).unwrap();
+    fs::write(
+        dir.path().join("case.svelte"),
+        "<script>const text = \"</scripture>\"; function bad(a) { return a; }</script>\n{#if a}<p>b</p>{/if}\n",
+    )
+    .unwrap();
+    let note = "note: deep.js is UNVERIFIED: syntax nesting too deep to measure, \
+                left out deep at line 20\n";
+    for args in [
+        &["deep.js"][..],
+        &["deep.js:1"],
+        &["deep.js", "--function", "bad"],
+    ] {
+        let output = run(dir.path(), args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(stdout(&output).starts_with("deep.js:1 bad  cognitive 16 > 15\n"));
+        assert_eq!(stderr(&output), note, "{args:?}");
+    }
+    let output = run(dir.path(), &["case.svelte:2"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "case.svelte:2 {#if}  cognitive 1 <= 15\n  2  +1  {#if}  nesting 0\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "note: case.svelte is UNVERIFIED: script block could not be parsed\n"
+    );
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &["deep.js:20"],
+            "cannot explain deep.js:20: deep at line 20 is left out: \
+             syntax nesting too deep to measure",
+        ),
+        (
+            &["deep.js", "--function", "deep"],
+            "cannot explain deep in deep.js: syntax nesting too deep to measure",
+        ),
+        (
+            &["only.js"],
+            "cannot explain only.js: syntax nesting too deep to measure",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = run(dir.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(stderr(&output), format!("error: {message}\n"), "{args:?}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn json_without_a_unit_over_the_limit_prints_an_empty_list() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("visit.js"), VISIT).unwrap();
+    let output = run(dir.path(), &["visit.js", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["file"], "visit.js");
+    assert_eq!(report["units"], serde_json::json!([]));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn an_editor_position_ignores_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("visit.js"), VISIT).unwrap();
+    let output = run(dir.path(), &["visit.js:3:9"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), VISIT_TEXT);
+    fs::write(dir.path().join("odd:3"), VISIT).unwrap();
+    let output = run(dir.path(), &["odd:3:1"]);
+    assert_eq!(stderr(&output), "error: no grammar for odd:3\n");
 }

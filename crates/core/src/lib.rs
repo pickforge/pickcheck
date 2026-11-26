@@ -16,7 +16,7 @@ pub use diff::{
     BaseBlob, ChangedFiles, LineRange, base_blob, changed_files, changed_files_since,
     parse_diff_hunks, physical,
 };
-pub use explain::{UnitTrace, trace_source};
+pub use explain::{LeftOutLines, SourceTrace, UnitTrace, trace_source};
 pub use language::{
     FunctionMetrics, Language, LeftOut, MAX_SYNTAX_DEPTH, ParsedSource, Unmeasured,
     coverage_unknowns, grammar_inventory, on_measurement_stack, parse_source,

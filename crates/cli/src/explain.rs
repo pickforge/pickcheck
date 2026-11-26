@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use pickcheck_core::{
-    FileLimits, Increment, Language, Limits, MetricValues, UnitTrace, trace_source,
+    FileLimits, Increment, Language, Limits, MetricValues, SourceTrace, UnitTrace, Unmeasured,
+    trace_source,
 };
 use serde::Serialize;
 
@@ -32,21 +33,30 @@ pub(crate) fn run(
         anyhow::bail!("use <file>:<line> or --function, not both");
     }
     let file = cwd.join(&path);
-    let source =
-        fs::read_to_string(&file).with_context(|| format!("cannot read {}", path.display()))?;
     let language =
         Language::from_path(&file).with_context(|| format!("no grammar for {}", path.display()))?;
+    let source =
+        fs::read_to_string(&file).with_context(|| format!("cannot read {}", path.display()))?;
     let limits = FileLimits::resolve(&cwd, &path, language, config)?;
-    let units = trace_source(language, &source)
-        .with_context(|| format!("cannot explain {}", path.display()))?
+    let mut traced = trace_source(language, &source)
+        .with_context(|| format!("cannot explain {}", path.display()))?;
+    if let Some(reason) = &traced.reason
+        && traced.units.is_empty()
+    {
+        anyhow::bail!("cannot explain {}: {reason}", path.display());
+    }
+    let units = std::mem::take(&mut traced.units)
         .into_iter()
         .map(|trace| Explained {
             limits: limits.for_unit(&trace.metrics),
             trace,
         })
         .collect::<Vec<_>>();
-    let selected = select(&units, line, function, &path)?;
-    if selected.is_empty() {
+    let selected = select(&units, &traced, line, function, &path)?;
+    if let Some(note) = left_out_note(&traced, &path) {
+        eprintln!("{note}");
+    }
+    if selected.is_empty() && format == Format::Text {
         eprintln!("no unit in {} exceeds the cognitive limit", path.display());
         return Ok(0);
     }
@@ -57,17 +67,44 @@ pub(crate) fn run(
     Ok(0)
 }
 
-/// Splits `<file>[:<line>]`. An argument that names an existing file is the
-/// file, even when it ends in `:<digits>`.
+/// The one `note:` line for a file that `check` reports `UNVERIFIED`.
+fn left_out_note(traced: &SourceTrace, path: &Path) -> Option<String> {
+    let reason = traced.reason.as_ref()?;
+    let units = traced
+        .left_out
+        .iter()
+        .map(|unit| format!("{} at line {}", unit.function, unit.line))
+        .collect::<Vec<_>>();
+    let units = if units.is_empty() {
+        String::new()
+    } else {
+        format!(", left out {}", units.join(", "))
+    };
+    Some(format!(
+        "note: {} is UNVERIFIED: {reason}{units}",
+        path.display()
+    ))
+}
+
+/// Splits `<file>[:<line>[:<column>]]`; the column is ignored. An argument
+/// that names an existing file is the file, even when it ends in `:<digits>`.
 fn parse_target(target: &str, cwd: &Path) -> Result<(PathBuf, Option<usize>)> {
     let whole = || Ok((PathBuf::from(target), None));
     if cwd.join(target).is_file() {
         return whole();
     }
-    let Some((file, line)) = target.rsplit_once(':') else {
+    let Some((mut file, mut line)) = target.rsplit_once(':') else {
         return whole();
     };
-    let digits = !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit());
+    let is_digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let digits = is_digits(line);
+    if let Some((head, row)) = file.rsplit_once(':')
+        && digits
+        && is_digits(row)
+        && !cwd.join(file).is_file()
+    {
+        (file, line) = (head, row);
+    }
     if !digits && !cwd.join(file).is_file() {
         return whole();
     }
@@ -79,6 +116,7 @@ fn parse_target(target: &str, cwd: &Path) -> Result<(PathBuf, Option<usize>)> {
 
 fn select<'a>(
     units: &'a [Explained],
+    traced: &SourceTrace,
     line: Option<usize>,
     function: Option<&str>,
     path: &Path,
@@ -89,6 +127,13 @@ fn select<'a>(
             .filter(|unit| unit.trace.metrics.function == name)
             .collect::<Vec<_>>();
         if named.is_empty() {
+            if traced.left_out.iter().any(|unit| unit.function == name) {
+                anyhow::bail!(
+                    "cannot explain {name} in {}: {}",
+                    path.display(),
+                    Unmeasured::TooDeep
+                );
+            }
             anyhow::bail!("no unit named {name} in {}", path.display());
         }
         return Ok(named);
@@ -103,10 +148,37 @@ fn select<'a>(
     if !starting.is_empty() {
         return Ok(starting);
     }
-    units
+    let inner = units
         .iter()
         .filter(|unit| (unit.trace.metrics.line..=unit.trace.metrics.end_line).contains(&line))
-        .min_by_key(|unit| unit.trace.metrics.span.1 - unit.trace.metrics.span.0)
+        .min_by_key(|unit| unit.trace.metrics.span.1 - unit.trace.metrics.span.0);
+    let lines = |unit: &Explained| (unit.trace.metrics.line, unit.trace.metrics.end_line);
+    let within = |start: usize, end: usize| {
+        (start..=end).contains(&line)
+            && inner.is_none_or(|unit| lines(unit).0 <= start && end <= lines(unit).1)
+    };
+    if let Some(unit) = traced
+        .left_out
+        .iter()
+        .find(|unit| within(unit.line, unit.end_line))
+    {
+        anyhow::bail!(
+            "cannot explain {}:{line}: {} at line {} is left out: {}",
+            path.display(),
+            unit.function,
+            unit.line,
+            Unmeasured::TooDeep
+        );
+    }
+    // A Svelte `<script>` or `<style>` line belongs to no template unit.
+    let foreign = |unit: &&Explained| {
+        traced
+            .foreign
+            .iter()
+            .any(|&(start, end)| unit.trace.metrics.template && (start..=end).contains(&line))
+    };
+    inner
+        .filter(|unit| !foreign(unit))
         .map(|unit| vec![unit])
         .with_context(|| format!("no unit in {} contains line {line}", path.display()))
 }

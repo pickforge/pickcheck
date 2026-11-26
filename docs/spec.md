@@ -780,10 +780,15 @@ Selection:
   order.
 - Giving both is a usage error.
 - With neither, it selects every unit whose `cognitive` exceeds its effective
-  limit. When none does, it prints
-  `no unit in <file> exceeds the cognitive limit` to stderr and exits 0.
+  limit. When none does, the text output prints
+  `no unit in <file> exceeds the cognitive limit` to stderr, the JSON output
+  prints its document with `"units": []`, and both exit 0.
 - When the whole argument names an existing file, it is the file, even when it
-  ends in `:<digits>`. Otherwise the text after the last `:` is the line.
+  ends in `:<digits>`. Otherwise the text after the last `:` is the line. An
+  editor position `<file>:<line>:<column>` is also accepted when
+  `<file>:<line>` names no existing file; the column is ignored.
+- In a Svelte file, a line of a top-level `<script>` or `<style>` element that
+  no function contains selects no unit.
 
 Effective limits come from the same config resolution `check` uses for that
 file, including `--config`, the language override, and test-file exemptions.
@@ -846,11 +851,17 @@ template expressions. `nesting` is `null` for flat increments:
 Exit codes: `0` whenever it explains, whatever the scores. `2` with a one-line
 `error:` for a missing or unreadable file, a file with no grammar, a line or
 name that matches no unit, a malformed `<file>:<line>` (an empty, non-numeric,
-or zero line after an existing file), both a line and `--function`, and a
-file that `check` reports `UNVERIFIED` because it left units out: a unit
-deeper than 3,000 levels, or a Svelte script block that could not be parsed.
-A unit that is not measured has no increments, so `explain` does not explain
-the rest of such a file either; the error gives the `UNVERIFIED` reason.
+or zero line after an existing file), both a line and `--function`, a line or
+name that selects a unit `check` left out (deeper than 3,000 levels), and a
+file whose units `check` all left out, with the `UNVERIFIED` reason. A unit
+that is not measured has no increments.
+
+`explain` traces every unit that `check` measures, also in a file that `check`
+reports `UNVERIFIED`. For such a file it writes one line to stderr,
+`note: <file> is UNVERIFIED: <reason>`, followed by
+`, left out <name> at line <line>` for each unit left out, and exits 0. The
+reason is the one `check` gives: syntax nesting too deep to measure, or a
+Svelte script block that could not be parsed.
 
 ### `hook claude`
 

@@ -2,12 +2,12 @@
 //! same walk that produces the score, which pushes them into a sink that
 //! `trace_source` passes down.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::{
     FunctionMetrics, Language,
     cognitive::Increment,
-    language::{TracedUnit, parse_units},
+    language::{TracedUnit, parse_tree, parse_units},
 };
 
 /// One unit of a file with its metrics and its cognitive increments in
@@ -18,20 +18,49 @@ pub struct UnitTrace {
     pub increments: Vec<Increment>,
 }
 
-/// Every unit of `source`, as `parse_source` reports it, with its increments.
+/// A unit that `parse_source` left out, with its first and last file line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeftOutLines {
+    pub function: String,
+    pub line: usize,
+    pub end_line: usize,
+}
+
+/// The measured units of a file with their increments, and what `check`
+/// reports as `UNVERIFIED` about the rest.
+#[derive(Clone, Debug, Default)]
+pub struct SourceTrace {
+    pub units: Vec<UnitTrace>,
+    /// Units left out, in source order. A unit left out has no increments.
+    pub left_out: Vec<LeftOutLines>,
+    /// The `UNVERIFIED` reason, when units were left out or a Svelte script
+    /// block could not be parsed.
+    pub reason: Option<String>,
+    /// The first and last line of each top-level Svelte `<script>` and
+    /// `<style>` element, which no template unit measures.
+    pub foreign: Vec<(usize, usize)>,
+}
+
+/// Every unit of `source` that `parse_source` measures, with its increments.
 ///
 /// # Errors
 ///
-/// Fails as `parse_source` does, and when `parse_source` leaves a unit out
-/// (the reason `check` gives for an `UNVERIFIED` file), because a unit that
-/// is not measured has no increments.
-pub fn trace_source(language: Language, source: &str) -> Result<Vec<UnitTrace>> {
+/// Fails as `parse_source` does.
+pub fn trace_source(language: Language, source: &str) -> Result<SourceTrace> {
     let mut traced = Vec::new();
     let parsed = parse_units(language, source, Some(&mut traced))?;
-    if let Some(reason) = parsed.reason() {
-        bail!(reason);
-    }
-    parsed
+    let reason = parsed.reason();
+    let line_of = |byte: usize| source[..byte].matches('\n').count() + 1;
+    let left_out = parsed
+        .left_out
+        .iter()
+        .map(|unit| LeftOutLines {
+            function: unit.function.clone(),
+            line: line_of(unit.span.0),
+            end_line: line_of(unit.span.1),
+        })
+        .collect();
+    let units = parsed
         .functions
         .into_iter()
         .map(|metrics| {
@@ -51,7 +80,27 @@ pub fn trace_source(language: Language, source: &str) -> Result<Vec<UnitTrace>> 
                 increments,
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(SourceTrace {
+        units,
+        left_out,
+        reason,
+        foreign: foreign_lines(language, source)?,
+    })
+}
+
+fn foreign_lines(language: Language, source: &str) -> Result<Vec<(usize, usize)>> {
+    if language != Language::Svelte {
+        return Ok(Vec::new());
+    }
+    let tree = parse_tree(&tree_sitter_svelte_ng::LANGUAGE.into(), source)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    Ok(root
+        .named_children(&mut cursor)
+        .filter(|node| matches!(node.kind(), "script_element" | "style_element"))
+        .map(|node| (node.start_position().row + 1, node.end_position().row + 1))
+        .collect())
 }
 
 #[cfg(test)]
@@ -73,7 +122,7 @@ function visit(items) {
   }
 }
 ";
-        let units = trace_source(Language::JavaScript, source).unwrap();
+        let units = trace_source(Language::JavaScript, source).unwrap().units;
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].metrics.function, "visit");
         assert_eq!(units[0].metrics.cognitive, 12);
@@ -111,7 +160,7 @@ function visit(items) {
     y}</p>
 {/if}
 ";
-        let units = trace_source(Language::Svelte, source).unwrap();
+        let units = trace_source(Language::Svelte, source).unwrap().units;
         let find = |name: &str| {
             units
                 .iter()
@@ -153,7 +202,7 @@ function visit(items) {
     j ?? k}</p>
 {/if}
 ";
-        let units = trace_source(Language::Svelte, source).unwrap();
+        let units = trace_source(Language::Svelte, source).unwrap().units;
         let positions = |name: &str| {
             let unit = units
                 .iter()

@@ -443,7 +443,7 @@ pub fn on_measurement_stack<T: Send>(task: impl FnOnce() -> T + Send) -> std::io
     })
 }
 
-fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
+pub(crate) fn parse_tree(grammar: &TsLanguage, source: &str) -> Result<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(grammar)
