@@ -1,7 +1,11 @@
 use std::{
     collections::BTreeMap,
+    fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +18,19 @@ const REMOVED_GIT_ENV: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_COUNT",
+    // Pathspec magic such as `:(literal)` must keep its meaning.
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 ];
+
+/// The pathspec that matches every repository config.
+const REPO_CONFIGS: &str = ":(glob)**/.pickcheck.json";
+
+/// Repository roots already located, by the directory asked for. The root
+/// of a directory does not change while the process runs.
+static ROOTS: Mutex<BTreeMap<PathBuf, Option<PathBuf>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineRange {
@@ -42,10 +58,176 @@ pub struct ChangedFiles {
     /// every base read.
     pub base: Option<String>,
     pub fallback: bool,
+    /// When set, each base read is kept, so a second scan of this diff runs
+    /// no Git command twice.
+    pub base_reads: Option<BaseReads>,
+    /// Measure every unit of a file with a base, not only the units that
+    /// the hunks touch. A violation of a unit that no hunk touches is
+    /// dropped when its status is `unchanged` or `improved`. Hunks can miss
+    /// changed lines, so the hook session gate does not rely on them alone.
+    pub measure_untouched: bool,
+}
+
+/// The base reads of one diff, shared by its clones.
+#[derive(Clone, Debug, Default)]
+pub struct BaseReads(Arc<Mutex<BTreeMap<PathBuf, BaseBlob>>>);
+
+impl ChangedFiles {
+    /// `path` at `commit`, as `base_blob` reads it, from `base_reads` when
+    /// it holds the path.
+    pub fn base_blob(&self, commit: &str, path: &Path) -> BaseBlob {
+        let Some(BaseReads(reads)) = &self.base_reads else {
+            return base_blob(&self.repo_root, commit, path);
+        };
+        let mut reads = reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reads
+            .entry(path.to_path_buf())
+            .or_insert_with(|| base_blob(&self.repo_root, commit, path))
+            .clone()
+    }
+}
+
+/// The paths that `git diff --name-status` lists.
+#[derive(Clone, Debug, Default)]
+pub struct DiffStatus {
+    /// Renamed files, new path to old path.
+    pub renames: BTreeMap<PathBuf, PathBuf>,
+    /// Every path, old and new, including deletions, pure renames, and empty
+    /// files that have no hunks.
+    pub touched: Vec<PathBuf>,
+    /// Every path that has a post-image: each listed path except a deleted
+    /// one, and the new path of a rename or copy.
+    pub post_images: Vec<PathBuf>,
+}
+
+/// Limits a diff. No pathspec means the whole tree.
+#[derive(Clone, Copy, Debug)]
+pub enum Pathspec<'a> {
+    /// One path relative to the repository root, matched literally.
+    File(&'a Path),
+    /// Every `.pickcheck.json` in the tree.
+    RepoConfigs,
+}
+
+impl Pathspec<'_> {
+    fn arg(self) -> String {
+        match self {
+            Self::File(path) => format!(":(literal){}", slash_path(path)),
+            Self::RepoConfigs => REPO_CONFIGS.to_owned(),
+        }
+    }
+}
+
+/// The files in the Git directory that mark a merge, cherry-pick, revert,
+/// rebase, or `am` that stopped before its commit.
+const OPERATION_MARKERS: &[&str] = &[
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+];
+
+/// A Git work tree and the commit `HEAD` names.
+#[derive(Clone, Debug)]
+pub struct Repository {
+    /// The physical root.
+    pub root: PathBuf,
+    /// The Git directory of this work tree.
+    pub git_dir: PathBuf,
+    pub head: String,
+}
+
+impl Repository {
+    /// Whether a merge, cherry-pick, revert, or rebase is in progress.
+    pub fn operation_in_progress(&self) -> bool {
+        OPERATION_MARKERS
+            .iter()
+            .any(|marker| fs::symlink_metadata(self.git_dir.join(marker)).is_ok())
+    }
+}
+
+/// The repository around `cwd` with its Git directory and `HEAD` commit,
+/// from one Git command. `None` outside a repository and in one without
+/// commits.
+pub fn repository(cwd: &Path) -> Result<Option<Repository>> {
+    let lines = git_line(
+        cwd,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--verify",
+            "--quiet",
+            "HEAD^{commit}",
+        ],
+    )?;
+    let Some(repo) = lines.and_then(|text| parse_repository(&text, cwd)) else {
+        return Ok(None);
+    };
+    remember_root(cwd, Some(repo.root.clone()));
+    Ok(Some(repo))
+}
+
+/// Reads the root, the Git directory, and the `HEAD` commit that `rev-parse`
+/// prints on three lines. The commit is the last line. Both paths can hold
+/// a newline, so when the rest has several, the root is the longest
+/// candidate that contains `cwd` and leaves an absolute Git directory.
+fn parse_repository(text: &str, cwd: &Path) -> Option<Repository> {
+    #[cfg(windows)]
+    let text = &text.replace("\r\n", "\n");
+    let (paths, head) = text.rsplit_once('\n')?;
+    let splits = paths
+        .match_indices('\n')
+        .map(|(index, _)| (&paths[..index], &paths[index + 1..]))
+        .collect::<Vec<_>>();
+    let (root, git_dir) = match splits[..] {
+        [] => return None,
+        [only] => only,
+        _ => {
+            let cwd = physical(cwd);
+            splits.into_iter().rev().find(|(root, git_dir)| {
+                Path::new(git_dir).is_absolute() && cwd.starts_with(physical(Path::new(root)))
+            })?
+        }
+    };
+    Some(Repository {
+        root: physical(Path::new(root)),
+        git_dir: PathBuf::from(git_dir),
+        head: head.to_owned(),
+    })
+}
+
+/// The paths with unmerged index entries, each once.
+pub fn unmerged_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let output = git_command(repo_root)
+        .args(["ls-files", "--unmerged", "-z"])
+        .output()
+        .context("failed to list unmerged files")?;
+    if !output.status.success() {
+        bail!("git ls-files failed");
+    }
+    let mut paths = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| git_path(path)))
+        .collect::<Vec<_>>();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The merge base of `commit` and `HEAD`, or `None` when `commit` names no
+/// commit or the two share no history.
+pub fn merge_base_with_head(repo_root: &Path, commit: &str) -> Result<Option<String>> {
+    if commit.is_empty() || commit.starts_with('-') {
+        return Ok(None);
+    }
+    git_line(repo_root, &["merge-base", commit, "HEAD"])
 }
 
 /// A file's content at the merge base.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseBlob {
     /// The base commit has no file at that path.
     Missing,
@@ -82,20 +264,42 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
     }
     let base = base.map(|base| merge_base(&repo_root, base)).transpose()?;
     let from = base.clone().unwrap_or_else(|| "HEAD".to_owned());
-    let hunks = git_diff(&repo_root, &from, &["--unified=0"])?;
-    // Name-status lists deletions, pure renames, and empty files, which have
-    // no hunks, and it never quotes paths.
-    let (renames, touched) =
-        parse_name_status(&git_diff(&repo_root, &from, &["--name-status", "-z"])?);
+    let spans = diff_spans(&repo_root, &from, &[])?;
+    let DiffStatus {
+        renames, touched, ..
+    } = diff_status(&repo_root, &from, &[])?;
     Ok(ChangedFiles {
-        spans: parse_diff_hunks(&hunks),
-        untracked: untracked(&repo_root)?,
+        spans,
+        untracked: untracked_files(&repo_root)?,
         renames,
         touched,
         base,
         repo_root,
         fallback: false,
+        base_reads: None,
+        measure_untouched: false,
     })
+}
+
+/// The changed line ranges of each file from `from` to the working tree.
+/// Every file is diffed as text, so neither a `-diff` or `binary` attribute
+/// nor a NUL byte hides its hunks.
+pub fn diff_spans(
+    repo_root: &Path,
+    from: &str,
+    paths: &[Pathspec<'_>],
+) -> Result<BTreeMap<PathBuf, Vec<LineRange>>> {
+    let hunks = git_diff(repo_root, from, &["--unified=0", "--text"], paths)?;
+    Ok(parse_diff_hunks(&hunks))
+}
+
+/// The paths that differ from `from` to the working tree. Name-status lists
+/// deletions, pure renames, and empty files, which have no hunks, and it
+/// never quotes paths. A rename is found only when both paths are in
+/// `paths`.
+pub fn diff_status(repo_root: &Path, from: &str, paths: &[Pathspec<'_>]) -> Result<DiffStatus> {
+    let output = git_diff(repo_root, from, &["--name-status", "-z"], paths)?;
+    Ok(parse_name_status(&output))
 }
 
 /// Reads `path`, relative to the repository root, at `commit` without
@@ -112,29 +316,245 @@ pub fn base_blob(repo_root: &Path, commit: &str, path: &Path) -> BaseBlob {
         _ => return BaseBlob::Unreadable,
     };
     let listing = String::from_utf8_lossy(&listing);
-    let Some(meta) = listing.split('\0').find_map(|entry| {
-        entry
-            .split_once('\t')
-            .filter(|(_, name)| *name == path)
-            .map(|(meta, _)| meta)
-    }) else {
+    let Some(object) =
+        tree_entries(&listing).find_map(|(object, name)| (name == path).then_some(object))
+    else {
         return BaseBlob::Missing;
     };
-    // `<mode> <type> <object>`
-    let mut fields = meta.split(' ').skip(1);
-    let (Some("blob"), Some(object)) = (fields.next(), fields.next()) else {
-        return BaseBlob::Unreadable;
+    object
+        .and_then(|object| read_blob(repo_root, object))
+        .map_or(BaseBlob::Unreadable, BaseBlob::Content)
+}
+
+/// A path's content in the tree of a commit, read through links that stay
+/// inside the tree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TreeFile {
+    /// No file: no entry, a directory, or a path through a file.
+    Missing,
+    Content(Vec<u8>),
+    /// A link that leaves the tree, dangles, or loops, or a path that cannot
+    /// be asked for.
+    Unresolved,
+}
+
+/// One path of `files_at`: a line of the batch request, or an answer that
+/// needs no request.
+enum TreeRequest {
+    Batch(String),
+    Answer(TreeFile),
+}
+
+/// The content of each of `paths`, relative to the repository root, at
+/// `commit`, from one `cat-file --batch --follow-symlinks`, or none when no
+/// path needs it. The batch request is line-based, so a path with a newline
+/// is first resolved by one `ls-tree` that takes the paths as arguments.
+pub(crate) fn files_at(repo_root: &Path, commit: &str, paths: &[PathBuf]) -> Result<Vec<TreeFile>> {
+    let paths = paths
+        .iter()
+        .map(|path| slash_path(path))
+        .collect::<Vec<_>>();
+    let entries = newline_entries(repo_root, commit, &paths)?;
+    let requests = paths
+        .iter()
+        .map(|path| {
+            if path.contains('\n') {
+                newline_request(&entries, path)
+            } else {
+                TreeRequest::Batch(format!("{commit}:{path}\n"))
+            }
+        })
+        .collect::<Vec<_>>();
+    let input = requests
+        .iter()
+        .filter_map(|request| match request {
+            TreeRequest::Batch(line) => Some(line.as_str()),
+            TreeRequest::Answer(_) => None,
+        })
+        .collect::<String>();
+    let output = if input.is_empty() {
+        Vec::new()
+    } else {
+        batch(repo_root, input)?
     };
+    let mut rest = output.as_slice();
+    requests
+        .into_iter()
+        .map(|request| match request {
+            TreeRequest::Batch(_) => next_tree_file(&mut rest),
+            TreeRequest::Answer(answer) => Ok(answer),
+        })
+        .collect()
+}
+
+/// The output of `cat-file --batch --follow-symlinks` for `input`.
+fn batch(repo_root: &Path, input: String) -> Result<Vec<u8>> {
+    let mut child = git_command(repo_root)
+        .args(["cat-file", "--batch", "--follow-symlinks"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to execute git cat-file")?;
+    let mut stdin = child.stdin.take().context("cannot write to git cat-file")?;
+    // Written apart from the read, so a full output pipe cannot block it.
+    let writer = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output().context("git cat-file failed")?;
+    let written = writer.join();
+    if !output.status.success() || !matches!(written, Ok(Ok(()))) {
+        bail!(
+            "git cat-file failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// A tree entry that `ls-tree` lists: its mode, type, and object name.
+struct TreeEntry {
+    mode: String,
+    kind: String,
+    object: String,
+}
+
+/// The entries at `commit` of every path in `paths` that has a newline and
+/// of each of its directories, by path, from one `ls-tree -t`. No such path
+/// runs no command.
+fn newline_entries(
+    repo_root: &Path,
+    commit: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, TreeEntry>> {
+    let mut specs = std::collections::BTreeSet::new();
+    for path in paths.iter().filter(|path| path.contains('\n')) {
+        let mut end = 0;
+        for part in path.split('/') {
+            end += part.len();
+            specs.insert(&path[..end]);
+            end += 1;
+        }
+    }
+    if specs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let output = git_command(repo_root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-tree", "-z", "-t", commit, "--"])
+        .args(specs)
+        .output()
+        .context("failed to execute git ls-tree")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            let mut fields = meta.split(' ').map(str::to_owned);
+            let entry = TreeEntry {
+                mode: fields.next()?,
+                kind: fields.next()?,
+                object: fields.next()?,
+            };
+            Some((path.to_owned(), entry))
+        })
+        .collect())
+}
+
+/// The request for `path`, which has a newline, from its `ls-tree`
+/// entries: its blob by object name, or the answer when a directory on the
+/// way is missing or not a tree. A link on the way cannot be followed here,
+/// so it is unresolved.
+fn newline_request(entries: &BTreeMap<String, TreeEntry>, path: &str) -> TreeRequest {
+    let mut end = 0;
+    for part in path.split('/') {
+        end += part.len();
+        let entry = entries.get(&path[..end]);
+        let last = end == path.len();
+        end += 1;
+        match entry {
+            None => return TreeRequest::Answer(TreeFile::Missing),
+            Some(entry) if entry.mode == "120000" => {
+                return TreeRequest::Answer(TreeFile::Unresolved);
+            }
+            Some(entry) if last && entry.kind == "blob" => {
+                return TreeRequest::Batch(format!("{}\n", entry.object));
+            }
+            Some(entry) if last || entry.kind != "tree" => {
+                return TreeRequest::Answer(TreeFile::Missing);
+            }
+            Some(_) => {}
+        }
+    }
+    TreeRequest::Answer(TreeFile::Missing)
+}
+
+/// Reads one `cat-file --batch --follow-symlinks` answer from `rest`.
+fn next_tree_file(rest: &mut &[u8]) -> Result<TreeFile> {
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("truncated git cat-file output")?;
+    let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+    *rest = &rest[end + 1..];
+    if header.ends_with(" missing") {
+        return Ok(TreeFile::Missing);
+    }
+    let fields = header.split(' ').collect::<Vec<_>>();
+    let (kind, size) = match fields[..] {
+        [_, kind, size] | [kind, size] => (kind, size),
+        _ => bail!("unexpected git cat-file output {header}"),
+    };
+    let size = size
+        .parse::<usize>()
+        .with_context(|| format!("unexpected git cat-file output {header}"))?;
+    let body = rest
+        .get(..size)
+        .filter(|_| rest.get(size) == Some(&b'\n'))
+        .context("truncated git cat-file output")?;
+    *rest = &rest[size + 1..];
+    Ok(match (fields.len(), kind) {
+        (3, "blob") => TreeFile::Content(body.to_vec()),
+        (3, _) | (2, "notdir") => TreeFile::Missing,
+        _ => TreeFile::Unresolved,
+    })
+}
+
+/// `ls-tree -z` entries, `<mode> <type> <object>\t<path>`, as the object
+/// name of a blob (`None` for other types) and the path.
+fn tree_entries(listing: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
+    listing.split('\0').filter_map(|entry| {
+        let (meta, path) = entry.split_once('\t')?;
+        let mut fields = meta.split(' ').skip(1);
+        let object = match (fields.next(), fields.next()) {
+            (Some("blob"), Some(object)) => Some(object),
+            _ => None,
+        };
+        Some((object, path))
+    })
+}
+
+/// The content of blob `object`, or `None` when Git cannot read it.
+fn read_blob(repo_root: &Path, object: &str) -> Option<Vec<u8>> {
     match git_command(repo_root)
         .args(["cat-file", "blob", object])
         .output()
     {
-        Ok(output) if output.status.success() => BaseBlob::Content(output.stdout),
-        _ => BaseBlob::Unreadable,
+        Ok(output) if output.status.success() => Some(output.stdout),
+        _ => None,
     }
 }
 
-fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
+fn git_diff(
+    repo_root: &Path,
+    from: &str,
+    format: &[&str],
+    paths: &[Pathspec<'_>],
+) -> Result<String> {
     let output = git_command(repo_root)
         .args([
             "-c",
@@ -155,6 +575,7 @@ fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
         ])
         .args(format)
         .args([from, "--"])
+        .args(paths.iter().map(|path| path.arg()))
         .output()
         .context("failed to execute git diff")?;
     if !output.status.success() {
@@ -168,9 +589,10 @@ fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
 
 /// Reads `git diff --name-status -z` fields: a status, then one path, or the
 /// old and new paths for a rename or copy.
-fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>) {
+fn parse_name_status(output: &str) -> DiffStatus {
     let mut renames = BTreeMap::new();
     let mut touched = Vec::new();
+    let mut post_images = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
         let path = git_path(path);
@@ -180,23 +602,46 @@ fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>)
             if status.starts_with('R') {
                 renames.insert(new.clone(), path.clone());
             }
+            post_images.push(new.clone());
             touched.push(new);
+        } else if !status.starts_with('D') {
+            post_images.push(path.clone());
         }
         touched.push(path);
     }
-    (renames, touched)
+    DiffStatus {
+        renames,
+        touched,
+        post_images,
+    }
 }
 
 pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
+    if let Some(root) = lock_roots().get(cwd) {
+        return Ok(root.clone());
+    }
     let output = git_command(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("failed to locate Git repository root")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
-    Ok(Some(physical(Path::new(root.trim()))))
+    let root = if output.status.success() {
+        let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
+        Some(physical(Path::new(root.trim())))
+    } else {
+        None
+    };
+    remember_root(cwd, root.clone());
+    Ok(root)
+}
+
+fn remember_root(cwd: &Path, root: Option<PathBuf>) {
+    lock_roots().insert(cwd.to_path_buf(), root);
+}
+
+fn lock_roots() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Option<PathBuf>>> {
+    ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The physical spelling of an existing path: symbolic links and Windows
@@ -298,7 +743,34 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
-fn untracked(cwd: &Path) -> Result<Vec<PathBuf>> {
+/// Whether the index tracks `path`, relative to the repository root, as a
+/// regular file whose changes a diff shows: one stage-0 entry at exactly
+/// that path, with a file mode and the tag `H`, so neither a symbolic link
+/// nor a skip-worktree or assume-unchanged entry. A Git failure, such as a
+/// path inside a submodule, is `false`.
+pub fn is_plainly_tracked(repo_root: &Path, path: &Path) -> bool {
+    let path = slash_path(path);
+    let Ok(output) = git_command(repo_root)
+        .args(["ls-files", "--stage", "-v", "-z", "--"])
+        .arg(Pathspec::File(Path::new(&path)).arg())
+        .output()
+    else {
+        return false;
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut entries = listing.split('\0').filter(|entry| !entry.is_empty());
+    let entry = match (entries.next(), entries.next()) {
+        (Some(entry), None) if output.status.success() => entry,
+        _ => return false,
+    };
+    entry.split_once('\t').is_some_and(|(meta, name)| {
+        let fields = meta.split(' ').collect::<Vec<_>>();
+        name == path && matches!(fields[..], ["H", "100644" | "100755", _, "0"])
+    })
+}
+
+/// The untracked files that Git does not ignore.
+pub fn untracked_files(cwd: &Path) -> Result<Vec<PathBuf>> {
     let output = git_command(cwd)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()
@@ -314,10 +786,18 @@ fn untracked(cwd: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The post-image line ranges of each file in `git diff --unified=0`
+/// output. Each hunk body is read by the line counts of its header, so a
+/// changed line that looks like a file or hunk header is never read as one.
 pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
     let mut result = BTreeMap::new();
     let mut file = None;
-    for line in diff.lines() {
+    let mut lines = diff.lines();
+    while let Some(line) = lines.next() {
+        if line.starts_with("diff ") {
+            file = None;
+            continue;
+        }
         if let Some(path) = line.strip_prefix("+++ ") {
             file = diff_path(path);
             if let Some(path) = &file {
@@ -325,43 +805,101 @@ pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
             }
             continue;
         }
-        if !line.starts_with("@@") {
+        let Some((old, new)) = hunk_header(line) else {
             continue;
-        }
+        };
+        skip_hunk_body(&mut lines, old.1, new.1);
         let Some(path) = file.as_ref() else { continue };
-        if let Some(range) = post_image_range(line) {
+        if new.1 > 0 {
             result
                 .entry(path.clone())
                 .or_insert_with(Vec::new)
-                .push(range);
+                .push(LineRange {
+                    start: new.0,
+                    end: new.0 + new.1 - 1,
+                });
         }
     }
     result
 }
 
-fn diff_path(value: &str) -> Option<PathBuf> {
-    if value == "/dev/null" {
-        return None;
+/// The start and line count of the old and the new side of a hunk header
+/// `@@ -<start>[,<count>] +<start>[,<count>] @@`. A count left out is 1.
+fn hunk_header(line: &str) -> Option<((usize, usize), (usize, usize))> {
+    let mut sides = line.strip_prefix("@@ ")?.split(' ');
+    let side = |text: Option<&str>, sign: char| -> Option<(usize, usize)> {
+        let mut values = text?.strip_prefix(sign)?.split(',');
+        let start = values.next()?.parse().ok()?;
+        let count = values.next().map_or(Some(1), |count| count.parse().ok())?;
+        Some((start, count))
+    };
+    Some((side(sides.next(), '-')?, side(sides.next(), '+')?))
+}
+
+/// Consumes the body of a hunk with `old` removed and `new` added lines. A
+/// context line counts on both sides; a `\ No newline at end of file` line
+/// counts on neither.
+fn skip_hunk_body<'a>(lines: &mut impl Iterator<Item = &'a str>, mut old: usize, mut new: usize) {
+    while old > 0 || new > 0 {
+        let Some(line) = lines.next() else { return };
+        match line.as_bytes().first() {
+            Some(b'-') => old = old.saturating_sub(1),
+            Some(b'+') => new = new.saturating_sub(1),
+            Some(b'\\') => {}
+            _ => {
+                old = old.saturating_sub(1);
+                new = new.saturating_sub(1);
+            }
+        }
     }
-    let value = value.split('\t').next().unwrap_or(value);
+}
+
+/// The path of a `+++` header with its `b/` prefix removed, decoded when Git
+/// quotes it. `None` for `/dev/null`.
+fn diff_path(value: &str) -> Option<PathBuf> {
+    let value = match value.strip_prefix('"') {
+        Some(quoted) => unquote(quoted)?,
+        None if value == "/dev/null" => return None,
+        None => value.split('\t').next().unwrap_or(value).to_owned(),
+    };
     let path = value.strip_prefix("b/")?;
     Some(git_path(path))
 }
 
-fn post_image_range(header: &str) -> Option<LineRange> {
-    let plus = header
-        .split_whitespace()
-        .find(|part| part.starts_with('+'))?;
-    let mut values = plus.trim_start_matches('+').split(',');
-    let start = values.next()?.parse().ok()?;
-    let count = values
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1);
-    (count > 0).then_some(LineRange {
-        start,
-        end: start + count - 1,
-    })
+/// Decodes the C-style quoting that Git uses for a path with a `"`, a `\`,
+/// or a control character: the text after the opening quote, up to the
+/// closing one, with `\"`, `\\`, `\t`, `\n`, the other letter escapes, and
+/// three-digit octal byte escapes. `None` when the quote does not close.
+fn unquote(text: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut rest = text.bytes();
+    loop {
+        let byte = match rest.next()? {
+            b'"' => break,
+            b'\\' => match rest.next()? {
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b't' => b'\t',
+                b'n' => b'\n',
+                b'v' => 0x0b,
+                b'f' => 0x0c,
+                b'r' => b'\r',
+                digit @ b'0'..=b'3' => {
+                    let mut value = digit - b'0';
+                    for _ in 0..2 {
+                        let digit = rest.next().filter(|digit| (b'0'..=b'7').contains(digit))?;
+                        value = value * 8 + (digit - b'0');
+                    }
+                    value
+                }
+                quoted @ (b'"' | b'\\') => quoted,
+                _ => return None,
+            },
+            other => other,
+        };
+        bytes.push(byte);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -371,7 +909,11 @@ mod tests {
     #[test]
     fn name_status_maps_renames_and_lists_every_path() {
         let output = "M\0kept.js\0R087\0old dir/a.js\0new\tdir/a.js\0C100\0src.js\0copy.js\0D\0gone.js\0A\0added.js\0";
-        let (renames, touched) = parse_name_status(output);
+        let DiffStatus {
+            renames,
+            touched,
+            post_images,
+        } = parse_name_status(output);
         assert_eq!(
             renames,
             BTreeMap::from([(
@@ -392,6 +934,114 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+        assert_eq!(
+            post_images,
+            ["kept.js", "new\tdir/a.js", "copy.js", "added.js"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn batch_answers_follow_links_only_inside_the_tree() {
+        let output = concat!(
+            "0123 blob 2\n{}\n",
+            "c:x/.pickcheck.json missing\n",
+            "4567 tree 3\nabc\n",
+            "notdir 4\nc:ab\n",
+            "symlink 9\n../out.js\n",
+            "dangling 4\nc:ab\n",
+            "loop 4\nc:ab\n",
+        );
+        let mut rest = output.as_bytes();
+        let answers = (0..7)
+            .map(|_| next_tree_file(&mut rest).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rest.is_empty());
+        use TreeFile::{Content, Missing, Unresolved};
+        let expected = [Content(b"{}".to_vec()), Missing, Missing, Missing];
+        assert_eq!(answers[..4], expected);
+        assert_eq!(answers[4..], [Unresolved, Unresolved, Unresolved]);
+        for broken in ["0123 blob 5\n{}\n", "odd\n", "0123 blob x\n", "no newline"] {
+            assert!(next_tree_file(&mut broken.as_bytes()).is_err(), "{broken}");
+        }
+    }
+
+    /// A path with a newline cannot be asked for in a batch line; its
+    /// directories decide its answer from one `ls-tree`.
+    #[cfg(unix)]
+    #[test]
+    fn paths_with_a_newline_resolve_through_their_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = physical(dir.path());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        fs::create_dir_all(root.join("a\nb/sub")).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("a\nb/c.json"), "{}").unwrap();
+        fs::write(root.join("a\nb/file"), "").unwrap();
+        fs::write(root.join("real/c.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("real", root.join("l\nk")).unwrap();
+        std::os::unix::fs::symlink("c.json", root.join("a\nb/link.json")).unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e.x",
+            "commit",
+            "-qm",
+            "c",
+        ]);
+        let paths = [
+            "a\nb/c.json",
+            "a\nb/sub/c.json",
+            "a\nb/sub",
+            "a\nb/file/c.json",
+            "a\nb/link.json",
+            "l\nk/c.json",
+            "gone\n/c.json",
+            "real/c.json",
+        ]
+        .map(PathBuf::from);
+        use TreeFile::{Content, Missing, Unresolved};
+        assert_eq!(
+            files_at(&root, "HEAD", &paths).unwrap(),
+            [
+                Content(b"{}".to_vec()),
+                Missing,
+                Missing,
+                Missing,
+                Unresolved,
+                Unresolved,
+                Missing,
+                Content(b"{}".to_vec()),
+            ]
+        );
+        let only = files_at(&root, "HEAD", &[PathBuf::from("gone\n/c.json")]).unwrap();
+        assert_eq!(only, [Missing]);
+    }
+
+    /// The commit is the last line; the root is the candidate that holds
+    /// `cwd` and leaves an absolute Git directory.
+    #[cfg(unix)]
+    #[test]
+    fn rev_parse_paths_with_newlines_split_at_the_root_that_holds_cwd() {
+        let cwd = Path::new("/no-such/re\npo/sub");
+        let text = "/no-such/re\npo\n/no-such/re\npo/.git\nabc";
+        let repo = parse_repository(text, cwd).unwrap();
+        assert_eq!(repo.root, Path::new("/no-such/re\npo"));
+        assert_eq!(repo.git_dir, Path::new("/no-such/re\npo/.git"));
+        assert_eq!(repo.head, "abc");
+        let plain = parse_repository("/r\n/r/.git\nabc", cwd).unwrap();
+        assert_eq!(plain.root, Path::new("/r"));
+        assert!(parse_repository("/r\nabc", cwd).is_none());
+        assert!(parse_repository("/a\nb\nc\nabc", cwd).is_none());
     }
 
     #[test]
@@ -414,9 +1064,66 @@ mod tests {
         assert_eq!(physical(&physical(&dir)), physical(&dir));
     }
 
+    /// A body line is read by the counts of its hunk header, never as a
+    /// header, also next to `\ No newline at end of file` lines.
+    #[test]
+    fn hunk_bodies_are_read_by_their_line_counts() {
+        let diff = concat!(
+            "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n",
+            "@@ -0,0 +1,4 @@\n+/*\n+++ /dev/null\n+@@ -1 +100,9 @@\n+*/\n",
+            "@@ -5 +8,2 @@\n-x\n\\ No newline at end of file\n+-- y\n+z\n",
+            "\\ No newline at end of file\n",
+            "@@ -9,2 +12 @@ f\n--- a/b.js\n-- old\n++++ b/c.js\n",
+            "diff --git a/b.js b/b.js\n--- a/b.js\n+++ b/b.js\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let spans = parse_diff_hunks(diff);
+        let ranges = |pairs: &[(usize, usize)]| {
+            pairs
+                .iter()
+                .map(|&(start, end)| LineRange { start, end })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spans[Path::new("a.js")],
+            ranges(&[(1, 4), (8, 9), (12, 12)])
+        );
+        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1)]));
+        // Lines that only look like headers name no file.
+        assert_eq!(spans.len(), 2, "{spans:?}");
+    }
+
+    #[test]
+    fn quoted_paths_are_decoded_before_the_prefix_is_removed() {
+        for (header, path) in [
+            (r#""b/we\"ird.js""#, "we\"ird.js"),
+            (r#""b/a\tb.js""#, "a\tb.js"),
+            (r#""b/back\\slash\n.js""#, "back\\slash\n.js"),
+            (r#""b/caf\303\251.js""#, "caf\u{e9}.js"),
+            ("b/plain name.js\t", "plain name.js"),
+        ] {
+            assert_eq!(diff_path(header), Some(git_path(path)), "{header}");
+        }
+        for header in [
+            "/dev/null",
+            r#""b/open.js"#,
+            r#""a/b.js""#,
+            r#""b/bad\8xx.js""#,
+            "b.js",
+        ] {
+            assert_eq!(diff_path(header), None, "{header}");
+        }
+        let diff = "+++ \"b/a\\tb.js\"\n@@ -0,0 +1 @@\n+x\n";
+        assert!(parse_diff_hunks(diff).contains_key(&git_path("a\tb.js")));
+    }
+
     #[test]
     fn synthetic_hunks_use_post_image_and_skip_deletions() {
-        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\t\n@@ -2,2 +2,3 @@\n@@ -10,2 +11,0 @@\n@@ -20 +19 @@\n";
+        let diff = concat!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\t\n",
+            "@@ -2,2 +2,3 @@\n-a\n-b\n+a\n+b\n+c\n",
+            "@@ -10,2 +11,0 @@\n-d\n-e\n",
+            "@@ -20 +19 @@\n-f\n+g\n",
+        );
         let spans = parse_diff_hunks(diff);
         assert_eq!(
             spans[Path::new("a.rs")],

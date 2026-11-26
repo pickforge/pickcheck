@@ -1,15 +1,21 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use pickcheck_core::{ScanOptions, ScanResult, changed_files, load_config, physical, scan};
+use pickcheck_core::{
+    BaseReads, CONFIG_CHANGED_NOTE, ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange,
+    Pathspec, Repository, ScanOptions, ScanResult, config_changed, diff_spans, diff_status,
+    is_plainly_tracked, load_config, load_config_at, merge_base_with_head, physical, repository,
+    resolve_path, scan, unmerged_files, untracked_files,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::report;
+use crate::{Scope, report, session::Session};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
@@ -94,11 +100,15 @@ pub fn run(harness: Harness) -> Result<u8> {
 }
 
 fn handle(harness: Harness, input: &HookInput) -> Result<u8> {
+    let cwd = working_directory(input);
     match classify(harness, input) {
-        Event::Ignore => Ok(0),
-        Event::File(path) => report_post_edit(harness, input, &[path]),
-        Event::Changed => report_post_changed(harness, input),
-        Event::Stop => report_stop(harness, input),
+        Event::Ignore => {
+            record_only(input, &cwd);
+            Ok(0)
+        }
+        Event::File(path) => report_post_edit(harness, input, &cwd, path),
+        Event::Changed => report_changed(harness, input, &cwd, false),
+        Event::Stop => report_changed(harness, input, &cwd, true),
     }
 }
 
@@ -168,73 +178,238 @@ fn file_path(input: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Notes the unverified files of a run that does not block on stderr. A
-/// failed write is ignored, so it never changes the hook's result.
-fn note_unverified(result: &ScanResult) {
-    let notes = report::unverified_notes(result);
-    let _ = io::stderr().write_all(notes.as_bytes());
+type Spans = BTreeMap<PathBuf, Vec<LineRange>>;
+
+/// Recorded files that no longer exist, passed beyond this count, would make
+/// a post-edit diff command too long; the diff then covers the whole tree.
+const MAX_RENAME_SOURCES: usize = 100;
+
+/// What a hook measures.
+enum Mode {
+    /// The whole edited file, as outside a session.
+    Paths,
+    /// The diff against `HEAD`; every violation blocks.
+    Head(ChangedFiles),
+    /// The session's diff since `base`, compared with `base`, where only
+    /// `hook.fail_on` statuses block.
+    Session {
+        changes: ChangedFiles,
+        base: String,
+        /// Set when a `.pickcheck.json` differs from `base`: the gate then
+        /// scans with the configs of `base` and with those of the working
+        /// tree, and blocks when either scan blocks.
+        configs: Option<CommitConfigs>,
+    },
 }
 
-fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> Result<u8> {
-    let cwd = working_directory(input);
-    let result = scan(&ScanOptions {
-        cwd: &cwd,
-        paths,
-        explicit_config: None,
-        changed: None,
-    })?;
-    if result.violations.is_empty() {
-        note_unverified(&result);
-        return Ok(0);
+/// The configs of a scan: from the base commit when a session config
+/// differs from it, otherwise from the working tree, as without a session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Base,
+    WorkingTree,
+}
+
+/// The first note of a block reason from the working-tree configs.
+const WORKING_TREE_NOTE: &str =
+    ".pickcheck.json changed in this diff; the working-tree config also applies";
+
+struct Gate {
+    mode: Mode,
+    notes: Vec<String>,
+}
+
+impl Gate {
+    fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            notes: Vec::new(),
+        }
     }
-    emit_feedback(
-        harness,
-        &report::summary(&result, crate::Scope::Paths),
-        false,
-    )
+
+    fn scan(&self, cwd: &Path, paths: &[PathBuf], side: Side) -> Result<ScanResult> {
+        let (changed, commit_configs) = match &self.mode {
+            Mode::Paths => (None, None),
+            Mode::Head(changes) => (Some(changes), None),
+            Mode::Session {
+                changes, configs, ..
+            } => (
+                Some(changes),
+                configs.as_ref().filter(|_| side == Side::Base),
+            ),
+        };
+        scan(&ScanOptions {
+            cwd,
+            paths,
+            explicit_config: None,
+            changed,
+            commit_configs,
+        })
+    }
+
+    /// Whether a session config differs from the base, so the gate scans
+    /// with the configs of both sides.
+    fn compares_configs(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Session {
+                configs: Some(_),
+                ..
+            }
+        )
+    }
+
+    fn config(&self, cwd: &Path, side: Side) -> Result<Config> {
+        let resolution = match (&self.mode, side) {
+            (
+                Mode::Session {
+                    configs: Some(configs),
+                    ..
+                },
+                Side::Base,
+            ) => load_config_at(cwd, configs)?,
+            _ => load_config(cwd, None)?,
+        };
+        Ok(resolution.config)
+    }
+
+    /// The feedback for `result`, or `None` when no violation blocks.
+    fn feedback(&self, cwd: &Path, result: &ScanResult, side: Side) -> Result<Option<String>> {
+        if result.violations.is_empty() {
+            return Ok(None);
+        }
+        let fail_on = match self.mode {
+            Mode::Session { .. } => self.config(cwd, side)?.hook.fail_on,
+            _ => Vec::new(),
+        };
+        let (scope, scan_notes) = match &self.mode {
+            Mode::Paths => (Scope::Paths, &[][..]),
+            Mode::Head(_) => (Scope::Changed, &[][..]),
+            Mode::Session { base, .. } => (
+                Scope::Base {
+                    base,
+                    fail_on: Some(&fail_on),
+                },
+                result.notes.as_slice(),
+            ),
+        };
+        if !result.violations.iter().any(|item| scope.fails(item)) {
+            return Ok(None);
+        }
+        let working_tree = (side == Side::WorkingTree).then_some(WORKING_TREE_NOTE);
+        let scan_notes = scan_notes
+            .iter()
+            .map(String::as_str)
+            .filter(|note| working_tree.is_none() || *note != CONFIG_CHANGED_NOTE);
+        let notes = self.notes.iter().map(String::as_str).chain(working_tree);
+        let notes = notes
+            .chain(scan_notes)
+            .map(|note| format!("note: {note}\n"));
+        Ok(Some(
+            notes.collect::<String>() + &report::summary(result, scope),
+        ))
+    }
 }
 
-fn report_post_changed(harness: Harness, input: &HookInput) -> Result<u8> {
-    let cwd = working_directory(input);
-    let Some(changes) = repo_changes(&cwd)? else {
-        return Ok(0);
+/// The repository around `cwd` at this event: `HEAD`, and the files that are
+/// changed or untracked against it.
+#[derive(Clone)]
+struct Snapshot {
+    repo: Repository,
+    status: DiffStatus,
+    untracked: Vec<PathBuf>,
+}
+
+impl Snapshot {
+    fn read(repo: Repository) -> Result<Self> {
+        let status = diff_status(&repo.root, &repo.head, &[])?;
+        let untracked = untracked_files(&repo.root)?;
+        Ok(Self {
+            repo,
+            status,
+            untracked,
+        })
+    }
+
+    /// The `HEAD` diff, as outside a session.
+    fn head_changes(self) -> Result<ChangedFiles> {
+        let spans = diff_spans(&self.repo.root, &self.repo.head, &[])?;
+        Ok(self.changes(spans, None, None))
+    }
+
+    /// `status` replaces the names diff against `HEAD` when given.
+    fn changes(
+        self,
+        spans: Spans,
+        status: Option<DiffStatus>,
+        base: Option<String>,
+    ) -> ChangedFiles {
+        let status = status.unwrap_or(self.status);
+        ChangedFiles {
+            repo_root: self.repo.root,
+            spans,
+            untracked: self.untracked,
+            renames: status.renames,
+            touched: status.touched,
+            base,
+            fallback: false,
+            base_reads: None,
+            measure_untouched: false,
+        }
+    }
+}
+
+/// Records an event that the hook does not check. A failure is only a note.
+fn record_only(input: &HookInput, cwd: &Path) {
+    if input.session_id.is_empty() {
+        return;
+    }
+    let recorded = repository(cwd).and_then(|repo| {
+        let Some(repo) = repo else {
+            return Ok(());
+        };
+        let snapshot = Snapshot::read(repo)?;
+        open_session(input, &snapshot, None).map(drop)
+    });
+    if let Err(error) = recorded {
+        note_without_session(&error);
+    }
+}
+
+fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathBuf) -> Result<u8> {
+    let session = post_edit_gate(input, cwd, &path);
+    let paths = [path];
+    let plain = || Ok(Gate::new(Mode::Paths));
+    let outcome = Outcome::of(session, plain, cwd, &paths, false)?;
+    match outcome.report {
+        Some(report) => emit_feedback(harness, &report, false),
+        None => {
+            outcome.note_pass();
+            Ok(0)
+        }
+    }
+}
+
+/// `Stop`, and an edit event that names no file.
+fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -> Result<u8> {
+    let Some(repo) = repository(cwd)? else {
+        eprintln!(
+            "note: hook skipped: {} is not inside a Git repository with HEAD",
+            cwd.display()
+        );
+        return pass(input, stop);
     };
-    let result = scan(&ScanOptions {
-        cwd: &cwd,
-        paths: &[],
-        explicit_config: None,
-        changed: Some(&changes),
-    })?;
-    if result.violations.is_empty() {
-        note_unverified(&result);
-        return Ok(0);
-    }
-    emit_feedback(
-        harness,
-        &report::summary(&result, crate::Scope::Changed),
-        false,
-    )
-}
-
-fn report_stop(harness: Harness, input: &HookInput) -> Result<u8> {
-    let cwd = working_directory(input);
-    let Some(changes) = repo_changes(&cwd)? else {
-        reset_counter(&input.session_id)?;
-        return Ok(0);
+    let snapshot = Snapshot::read(repo)?;
+    let session = changed_gate(input, cwd, &snapshot);
+    let head = || Ok(Gate::new(Mode::Head(snapshot.clone().head_changes()?)));
+    let outcome = Outcome::of(session, head, cwd, &[], stop)?;
+    let Some(report) = &outcome.report else {
+        outcome.note_pass();
+        return pass(input, stop);
     };
-    let result = scan(&ScanOptions {
-        cwd: &cwd,
-        paths: &[],
-        explicit_config: None,
-        changed: Some(&changes),
-    })?;
-    if result.violations.is_empty() {
-        note_unverified(&result);
-        reset_counter(&input.session_id)?;
-        return Ok(0);
-    }
-    let report = report::summary(&result, crate::Scope::Changed);
-    let max = load_config(&cwd, None)?.config.hook.max_blocks;
+    let Some(max) = outcome.max_blocks.filter(|_| stop) else {
+        return emit_feedback(harness, report, false);
+    };
     if increment_counter(&input.session_id)? > max {
         eprintln!("UNRESOLVED\n{report}");
         return Ok(0);
@@ -246,19 +421,353 @@ fn report_stop(harness: Harness, input: &HookInput) -> Result<u8> {
     )
 }
 
-/// Hooks gate only the diff of the repository around `cwd`. Outside a Git
-/// repository (or with no `HEAD`) there is nothing to diff, so hooks pass
-/// without scanning the whole tree.
-fn repo_changes(cwd: &Path) -> Result<Option<pickcheck_core::ChangedFiles>> {
-    let changes = changed_files(cwd)?;
-    if changes.fallback {
-        eprintln!(
-            "note: hook skipped: {} is not inside a Git repository with HEAD",
-            cwd.display()
-        );
+/// Only a clean `Stop` resets the loop guard.
+fn pass(input: &HookInput, stop: bool) -> Result<u8> {
+    if stop {
+        reset_counter(&input.session_id)?;
+    }
+    Ok(0)
+}
+
+/// A scan and its block reason, `None` when no violation blocks.
+struct Outcome {
+    gate: Gate,
+    result: ScanResult,
+    report: Option<String>,
+    /// The loop guard limit of a `Stop` that blocks.
+    max_blocks: Option<usize>,
+}
+
+impl Outcome {
+    /// Scans with the session gate. Without one, or after a note when the
+    /// session gate or its scan fails, scans with the `plain` gate of the
+    /// hook without a session id. An error of the plain gate is returned
+    /// without the note, as the hook without a session id returns it.
+    /// For a `Stop`, a block also resolves `hook.max_blocks`, so a session
+    /// policy that does not load falls back too.
+    fn of(
+        session: Result<Option<Gate>>,
+        plain: impl FnOnce() -> Result<Gate>,
+        cwd: &Path,
+        paths: &[PathBuf],
+        stop: bool,
+    ) -> Result<Self> {
+        let scan = |gate| Self::scan(gate, cwd, paths, stop);
+        let session = session.and_then(|gate| gate.map(scan).transpose());
+        let failure = match session {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        let outcome = scan(plain()?)?;
+        if let Some(error) = failure {
+            note_without_session(&error);
+        }
+        Ok(outcome)
+    }
+
+    /// Writes the notes of a run that does not block to stderr: the gate's
+    /// own notes, which a block reason would start with, then the unverified
+    /// files.
+    fn note_pass(&self) {
+        for text in &self.gate.notes {
+            note(&format!("note: {text}\n"));
+        }
+        note_unverified(&self.result);
+    }
+
+    /// Scans with the gate's configs. When a session config differs from the
+    /// base and that scan does not block, scans again with the working-tree
+    /// configs, which then give the block reason.
+    fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf], stop: bool) -> Result<Self> {
+        let mut result = gate.scan(cwd, paths, Side::Base)?;
+        let mut report = gate.feedback(cwd, &result, Side::Base)?;
+        if report.is_none() && gate.compares_configs() {
+            let working = gate.scan(cwd, paths, Side::WorkingTree)?;
+            report = gate.feedback(cwd, &working, Side::WorkingTree)?;
+            for item in working.unverified {
+                if !result.unverified.contains(&item) {
+                    result.unverified.push(item);
+                }
+            }
+            result.unverified.sort_by(|a, b| a.file.cmp(&b.file));
+        }
+        // From the base when a config differs, so the working tree cannot lower it.
+        let max_blocks = match report {
+            Some(_) if stop => Some(gate.config(cwd, Side::Base)?.hook.max_blocks),
+            _ => None,
+        };
+        Ok(Self {
+            gate,
+            result,
+            report,
+            max_blocks,
+        })
+    }
+}
+
+/// The session gate for an edit of `path`: the session's changes in that
+/// file. `None` without a session id, outside a Git repository with
+/// `HEAD`, and for a file outside the repository. Every error, such as
+/// unusable session state, is the session's.
+fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Option<Gate>> {
+    if input.session_id.is_empty() {
         return Ok(None);
     }
-    Ok(Some(changes))
+    let Some(repo) = repository(cwd)? else {
+        return Ok(None);
+    };
+    let edited = resolve_path(cwd, path)
+        .strip_prefix(&repo.root)
+        .ok()
+        .map(Path::to_path_buf);
+    let snapshot = Snapshot::read(repo)?;
+    let session = open_session(input, &snapshot, edited.as_deref())?;
+    edited
+        .map(|edited| session_gate(cwd, snapshot, &session, Some(&edited)))
+        .transpose()
+}
+
+/// The session gate for `Stop` and for an edit event that names no file.
+/// `None` without a session id. Every error, such as unusable session
+/// state, is the session's.
+fn changed_gate(input: &HookInput, cwd: &Path, snapshot: &Snapshot) -> Result<Option<Gate>> {
+    if input.session_id.is_empty() {
+        return Ok(None);
+    }
+    let session = open_session(input, snapshot, None)?;
+    session_gate(cwd, snapshot.clone(), &session, None).map(Some)
+}
+
+/// The session's changes since its base, restricted to the files it
+/// recorded, or to `edited` for an edit. When the anchor is unusable the
+/// gate is the one outside a session, with a note.
+fn session_gate(
+    cwd: &Path,
+    snapshot: Snapshot,
+    session: &Session,
+    edited: Option<&Path>,
+) -> Result<Gate> {
+    let repo = &snapshot.repo;
+    let base = if session.anchor() == repo.head {
+        Some(repo.head.clone())
+    } else {
+        merge_base_with_head(&repo.root, session.anchor())?
+    };
+    let Some(base) = base else {
+        let mode = match edited {
+            Some(_) => Mode::Paths,
+            None => Mode::Head(snapshot.head_changes()?),
+        };
+        return Ok(Gate {
+            notes: vec![format!(
+                "session anchor {} does not resolve or has no merge base with HEAD; the hook checks the diff against HEAD",
+                session.anchor()
+            )],
+            ..Gate::new(mode)
+        });
+    };
+    let (mut spans, status) = session_diff(&snapshot, session, &base, edited)?;
+    // Hunks can miss changed lines, so every file that the names diff lists
+    // with a post-image is scanned, also when it has no hunk.
+    let names = status.as_ref().unwrap_or(&snapshot.status);
+    for path in &names.post_images {
+        spans.entry(path.clone()).or_default();
+    }
+    let mut changes = snapshot.changes(spans, status, Some(base.clone()));
+    changes.measure_untouched = true;
+    let renames = &changes.renames;
+    let kept = |path: &PathBuf| {
+        session.contains(path) || renames.get(path).is_some_and(|old| session.contains(old))
+    };
+    changes.spans.retain(|path, _| kept(path));
+    changes.untracked.retain(kept);
+    if let Some(edited) = edited {
+        add_edited_outside_diff(&mut changes, edited);
+    }
+    check_links_whole(&mut changes);
+    keep_only_files(&mut changes);
+    let configs = base_configs(cwd, &changes, &base, edited)?;
+    if configs.is_some() {
+        changes.base_reads = Some(BaseReads::default());
+    }
+    Ok(Gate::new(Mode::Session {
+        changes,
+        base,
+        configs,
+    }))
+}
+
+/// Moves every file with a post-image that is a symbolic link on disk to the
+/// untracked files. Git diffs the link text, not the target, so such a file
+/// is checked whole with no base.
+fn check_links_whole(changes: &mut ChangedFiles) {
+    let root = &changes.repo_root;
+    let links = changes
+        .spans
+        .keys()
+        .filter(|path| {
+            fs::symlink_metadata(root.join(path)).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for link in links {
+        changes.spans.remove(&link);
+        changes.untracked.push(link);
+    }
+}
+
+/// Keeps only the changed entries that are files. Git lists an untracked
+/// nested repository or work tree as its directory, and a submodule, a
+/// dangling link, or a link to a directory is no file either. Such an entry
+/// is neither scanned nor a start of a config lookup.
+fn keep_only_files(changes: &mut ChangedFiles) {
+    let root = &changes.repo_root;
+    let is_file = |path: &PathBuf| root.join(path).is_file();
+    changes.spans.retain(|path, _| is_file(path));
+    changes.untracked.retain(is_file);
+}
+
+/// The configs of `base` when the config of a checked file or of `cwd`
+/// differs from it, or when the diff changes any config. `None` also when
+/// no file is checked.
+fn base_configs(
+    cwd: &Path,
+    changes: &ChangedFiles,
+    base: &str,
+    edited: Option<&Path>,
+) -> Result<Option<CommitConfigs>> {
+    let root = &changes.repo_root;
+    let checked = match edited {
+        Some(edited) => vec![edited]
+            .into_iter()
+            .filter(|path| in_diff(changes, path))
+            .collect(),
+        None => changes
+            .spans
+            .keys()
+            .chain(&changes.untracked)
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>(),
+    };
+    // Every changed entry is a file (see `keep_only_files`).
+    let checked = checked
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+    if checked.is_empty() {
+        return Ok(None);
+    }
+    let mut starts = vec![cwd.to_path_buf()];
+    starts.extend(checked);
+    let configs = CommitConfigs::read(root, base, &starts)?;
+    let changed = config_changed(changes) || configs.differs_from_working_tree();
+    Ok(changed.then_some(configs))
+}
+
+/// Adds `edited` when it exists and is in no diff. A plainly tracked file is
+/// scanned with its base and no touched unit, so only `new`, `worsened`,
+/// and `unmatched` violations remain; Git can hide a change, for example
+/// through a clean filter. Any other such file, as an ignored file, a file of a nested
+/// repository or a submodule, a skip-worktree entry, or a link, is checked
+/// whole with no base, as an untracked file is.
+fn add_edited_outside_diff(changes: &mut ChangedFiles, edited: &Path) {
+    let root = &changes.repo_root;
+    if in_diff(changes, edited) || fs::symlink_metadata(root.join(edited)).is_err() {
+        return;
+    }
+    if is_plainly_tracked(root, edited) {
+        changes.spans.insert(edited.to_path_buf(), Vec::new());
+    } else {
+        changes.untracked.push(edited.to_path_buf());
+    }
+}
+
+/// Whether the diff has a post-image of `path` or lists it as untracked.
+fn in_diff(changes: &ChangedFiles, path: &Path) -> bool {
+    changes.spans.contains_key(path) || changes.untracked.iter().any(|item| item == path)
+}
+
+/// The diff from `base`, with the names diff when it differs from the one
+/// against `HEAD`. For an edit it covers only the edited file, its rename
+/// source, and the repository configs.
+fn session_diff(
+    snapshot: &Snapshot,
+    session: &Session,
+    base: &str,
+    edited: Option<&Path>,
+) -> Result<(Spans, Option<DiffStatus>)> {
+    let root = &snapshot.repo.root;
+    let candidates =
+        edited.map_or_else(Vec::new, |edited| rename_candidates(root, session, edited));
+    let status = if base == snapshot.repo.head {
+        None
+    } else {
+        Some(diff_status(root, base, &candidates)?)
+    };
+    let Some(edited) = edited else {
+        return Ok((diff_spans(root, base, &[])?, status));
+    };
+    let renames = &status.as_ref().unwrap_or(&snapshot.status).renames;
+    let mut paths = vec![Pathspec::File(edited)];
+    paths.extend(renames.get(edited).map(|old| Pathspec::File(old)));
+    Ok((diff_spans(root, base, &paths)?, status))
+}
+
+/// The edited file, the recorded files that no longer exist, among which a
+/// rename source would be, and the repository configs. Too many sources
+/// widen the diff to the whole tree.
+fn rename_candidates<'a>(root: &Path, session: &'a Session, edited: &'a Path) -> Vec<Pathspec<'a>> {
+    let gone = session
+        .files()
+        .filter(|path| fs::symlink_metadata(root.join(path)).is_err())
+        .map(|path| Pathspec::File(path))
+        .collect::<Vec<_>>();
+    if gone.len() > MAX_RENAME_SOURCES {
+        return Vec::new();
+    }
+    let mut paths = vec![Pathspec::File(edited), Pathspec::RepoConfigs];
+    paths.extend(gone);
+    paths
+}
+
+/// Opens the session and records the edited file and every file that is
+/// changed or untracked now. While a merge, cherry-pick, revert, or rebase
+/// is in progress, the changed files come from it, so only the edited file
+/// and the unmerged files are recorded.
+fn open_session(input: &HookInput, snapshot: &Snapshot, edited: Option<&Path>) -> Result<Session> {
+    let mut session = Session::open(
+        &state_dir()?,
+        &input.session_id,
+        &snapshot.repo.root,
+        &snapshot.repo.head,
+    )?;
+    let edited = edited.map(Path::to_path_buf);
+    if snapshot.repo.operation_in_progress() {
+        let unmerged = unmerged_files(&snapshot.repo.root)?;
+        session.record(edited.iter().chain(&unmerged))?;
+    } else {
+        let changed = snapshot.status.touched.iter().chain(&snapshot.untracked);
+        session.record(edited.iter().chain(changed))?;
+    }
+    Ok(session)
+}
+
+fn note_without_session(error: &anyhow::Error) {
+    note(&format!(
+        "note: hook session state unavailable, the hook runs without a session: {error:#}\n"
+    ));
+}
+
+/// Notes the unverified files of a run that does not block on stderr.
+fn note_unverified(result: &ScanResult) {
+    note(&report::unverified_notes(result));
+}
+
+/// Writes `text` to stderr. A failed write is ignored, so it never changes
+/// the hook's result.
+fn note(text: &str) {
+    let _ = io::stderr().write_all(text.as_bytes());
 }
 
 fn emit_feedback(harness: Harness, reason: &str, stop: bool) -> Result<u8> {
@@ -325,7 +834,7 @@ fn state_file(session_id: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{}.count", sanitized_session_id(session_id))))
 }
 
-fn sanitized_session_id(session_id: &str) -> String {
+pub(crate) fn sanitized_session_id(session_id: &str) -> String {
     let sanitized: String = session_id
         .chars()
         .map(|character| {

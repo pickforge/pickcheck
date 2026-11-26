@@ -80,8 +80,11 @@ block completion while changed functions exceed the limits. The npm installer
 configures them automatically. Native adapters are available through
 `pickcheck hook claude|codex|cursor|grok`; Pi and OMP use their extension
 API, and OpenCode uses its plugin API. A Stop is blocked at most
-`hook.max_blocks` times in a row (default 3). Field mappings and limitations are
-in [`docs/hooks.md`](docs/hooks.md).
+`hook.max_blocks` times in a row (default 3). Hooks compare the session's
+changes with the commit where the session started, so a commit does not hide
+a change, and only `new`, `worsened`, or `unmatched` violations block by
+default (`hook.fail_on`). Field mappings and limitations are in
+[`docs/hooks.md`](docs/hooks.md).
 
 <p align="center">
   <img src="docs/assets/branding/pickcheck-stop-hook-mock.svg" alt="PICKCHECK · STOP HOOK — a changed function over the complexity limit blocks the agent's Stop" width="900">
@@ -151,7 +154,7 @@ values win. Defaults and language overrides are documented in
 - Complexity checks run locally and do not need an external analysis service.
 - The npm installer downloads the release binary from GitHub and verifies its checksum.
 - Nothing is written into the checked repository, except by `init`.
-- Hook loop counters live in `~/.pickforge/pickcheck/`.
+- Hook loop counters and session state live in `~/.pickforge/pickcheck/`.
 - Git runs with external diff, textconv, fsmonitor, and hooks disabled.
 
 ## Development

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
@@ -9,12 +10,16 @@ use ignore::WalkBuilder;
 use serde::Serialize;
 
 use crate::{
-    BaseBlob, ChangedFiles, Config, FunctionMetrics, Language, Limits, LineRange, Metric,
-    ParsedSource, base_blob,
+    BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
+    Metric, ParsedSource,
     baseline::{self, MetricValues, Pairing, Status},
     diff::{physical, repository_root},
-    load_config, parse_source,
+    load_config, load_config_at, parse_source,
 };
+
+/// The scan note of a diff that changes a `.pickcheck.json`, when the
+/// configs come from the working tree.
+pub const CONFIG_CHANGED_NOTE: &str = ".pickcheck.json changed in this diff";
 
 const UNVERIFIED_SOURCE_EXTENSIONS: &[&str] = &[
     "kt", "java", "c", "cc", "cpp", "h", "hpp", "cs", "swift", "rb", "php", "scala", "lua", "zig",
@@ -64,6 +69,9 @@ pub struct ScanOptions<'a> {
     pub paths: &'a [PathBuf],
     pub explicit_config: Option<&'a Path>,
     pub changed: Option<&'a ChangedFiles>,
+    /// Read the repository config of each file from this commit instead of
+    /// the working tree.
+    pub commit_configs: Option<&'a CommitConfigs>,
 }
 
 struct ScanFile {
@@ -107,6 +115,7 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         paths: options.paths,
         explicit_config: options.explicit_config,
         changed: options.changed,
+        commit_configs: options.commit_configs,
     };
     let roots = scan_roots(options);
     let match_base = match_base(options, &roots)?;
@@ -117,10 +126,13 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         collect_files(&roots, &match_base, &base_config)?
     };
     let mut result = ScanResult::default();
-    if options.changed.is_some_and(config_changed) {
-        result
-            .notes
-            .push(".pickcheck.json changed in this diff".to_owned());
+    if let Some(configs) = options.commit_configs {
+        result.notes.push(format!(
+            ".pickcheck.json changed in this diff; the config comes from {}",
+            configs.commit()
+        ));
+    } else if options.changed.is_some_and(config_changed) {
+        result.notes.push(CONFIG_CHANGED_NOTE.to_owned());
     }
     for file in files {
         scan_file(&file, &match_base, options, &mut result)?;
@@ -142,7 +154,7 @@ fn scan_roots(options: &ScanOptions<'_>) -> Vec<PathBuf> {
         options
             .paths
             .iter()
-            .map(|path| absolute(options.cwd, path))
+            .map(|path| resolve_path(options.cwd, path))
             .collect()
     }
 }
@@ -187,7 +199,8 @@ fn nearest_project_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn config_changed(changed: &ChangedFiles) -> bool {
+/// Whether the diff adds, edits, deletes, or renames a `.pickcheck.json`.
+pub fn config_changed(changed: &ChangedFiles) -> bool {
     !changed.fallback
         && changed
             .touched
@@ -277,7 +290,7 @@ fn scan_file(
 ) -> Result<()> {
     let display = relative(options.cwd, &file.path);
     let matched_path = relative(match_base, &file.path);
-    let config = load_config(&file.path, options.explicit_config)?.config;
+    let config = file_config(&file.path, options)?;
     if Config::matcher(&config.ignore)?.is_match(&matched_path) {
         return Ok(());
     }
@@ -307,7 +320,6 @@ fn scan_file(
             reason,
         });
     }
-    let functions = &parsed.functions;
     let context = FileContext {
         display: &display,
         matched: &matched_path,
@@ -316,45 +328,154 @@ fn scan_file(
         test_file: Config::matcher(&config.tests.patterns)?.is_match(&matched_path),
     };
     let spans = changed_spans(&matched_path, options.changed);
+    let compared = options.changed.filter(|changed| changed.base.is_some());
+    let measure_untouched =
+        spans.is_some() && compared.is_some_and(|changed| changed.measure_untouched);
     let first = result.violations.len();
-    let mut units_of = Vec::new();
-    for (index, function) in functions.iter().enumerate() {
-        if spans.is_some_and(|ranges| !touches(function, ranges)) {
-            continue;
-        }
-        result.checked += 1;
-        add_violations(&context, function, result);
-        units_of.resize(result.violations.len() - first, index);
-        result.functions.push((display.clone(), function.clone()));
-    }
-    if let Some(changed) = options.changed.filter(|changed| changed.base.is_some())
-        && !units_of.is_empty()
+    let measured = measure_units(&context, &parsed, spans, measure_untouched, result);
+    if let Some(changed) = compared
+        && !measured.units_of.is_empty()
     {
-        compare_with_base(changed, &context, &parsed, &units_of, result)?;
+        let current = Current {
+            source: &source,
+            parsed: &parsed,
+            measured: &measured,
+        };
+        compare_with_base(changed, &context, &current, result)?;
+    }
+    if measure_untouched {
+        keep_untouched_changes(result, first, &measured, &context, &parsed);
     }
     Ok(())
 }
 
-/// Adds baseline fields to this file's violations, the last `units_of.len()`
-/// in `result`, where `units_of[i]` indexes the violating unit in
-/// `parsed.functions`.
+/// The units that a scan measured in one file.
+struct Measured {
+    /// The unit of each of the file's violations, by index.
+    units_of: Vec<usize>,
+    /// Whether each unit was measured although no hunk touches it.
+    untouched: Vec<bool>,
+}
+
+/// Adds the violations of the units in `spans`, every unit without spans,
+/// and with `measure_untouched` every other unit too. Only touched units
+/// count as checked here.
+fn measure_units(
+    file: &FileContext<'_>,
+    parsed: &ParsedSource,
+    spans: Option<&[LineRange]>,
+    measure_untouched: bool,
+    result: &mut ScanResult,
+) -> Measured {
+    let first = result.violations.len();
+    let mut measured = Measured {
+        units_of: Vec::new(),
+        untouched: vec![false; parsed.functions.len()],
+    };
+    for (index, function) in parsed.functions.iter().enumerate() {
+        let touched = spans.is_none_or(|ranges| touches(function, ranges));
+        if !touched && !measure_untouched {
+            continue;
+        }
+        add_violations(file, function, result);
+        measured
+            .units_of
+            .resize(result.violations.len() - first, index);
+        if touched {
+            result.checked += 1;
+            result
+                .functions
+                .push((file.display.to_path_buf(), function.clone()));
+        } else {
+            measured.untouched[index] = true;
+        }
+    }
+    measured
+}
+
+/// Drops each violation of a unit that no hunk touches when its status is
+/// `unchanged` or `improved`, and counts the untouched units that keep one.
+/// The file's violations start at `first` in `result`.
+fn keep_untouched_changes(
+    result: &mut ScanResult,
+    first: usize,
+    measured: &Measured,
+    file: &FileContext<'_>,
+    parsed: &ParsedSource,
+) {
+    let mut kept = BTreeSet::new();
+    let violations = result.violations.split_off(first);
+    for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
+        if measured.untouched[index] {
+            let status = violation.baseline.as_ref().map(|baseline| baseline.status);
+            if matches!(status, Some(Status::Unchanged | Status::Improved) | None) {
+                continue;
+            }
+            kept.insert(index);
+        }
+        result.violations.push(violation);
+    }
+    for index in kept {
+        result.checked += 1;
+        result
+            .functions
+            .push((file.display.to_path_buf(), parsed.functions[index].clone()));
+    }
+}
+
+fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {
+    let resolution = match options.commit_configs {
+        Some(configs) => load_config_at(path, configs)?,
+        None => load_config(path, options.explicit_config)?,
+    };
+    Ok(resolution.config)
+}
+
+/// The working-tree file whose violations are compared with the base.
+struct Current<'a> {
+    source: &'a str,
+    parsed: &'a ParsedSource,
+    measured: &'a Measured,
+}
+
+/// The file's text and units at the merge base.
+struct BaseUnits {
+    source: String,
+    parsed: ParsedSource,
+}
+
+/// Adds baseline fields to this file's violations, the last
+/// `measured.units_of.len()` in `result`, where `units_of[i]` indexes the
+/// violating unit in `parsed.functions`.
 fn compare_with_base(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
-    parsed: &ParsedSource,
-    units_of: &[usize],
+    current: &Current<'_>,
     result: &mut ScanResult,
 ) -> Result<()> {
-    let functions = &parsed.functions;
+    let functions = &current.parsed.functions;
+    let units_of = &current.measured.units_of;
     let base = base_units(changed, file, result)?;
     let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| baseline::pair_units(parsed, base),
+        |base| {
+            let current_text = baseline::Text {
+                source: current.source,
+                parsed: current.parsed,
+            };
+            let base_text = baseline::Text {
+                source: &base.source,
+                parsed: &base.parsed,
+            };
+            baseline::pair_units_by_text(current_text, base_text, &current.measured.untouched)
+        },
     );
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
         let base_unit = match pairing[index] {
-            Pairing::Paired(base_index) => base.as_ref().map(|units| &units.functions[base_index]),
+            Pairing::Paired(base_index) => base
+                .as_ref()
+                .map(|units| &units.parsed.functions[base_index]),
             Pairing::New | Pairing::Unmatched => None,
         };
         violation.baseline = Some(Baseline {
@@ -371,12 +492,13 @@ fn compare_with_base(
     Ok(())
 }
 
-/// The file's units at the merge base, or `None` when it has no base.
+/// The file's text and units at the merge base, or `None` when it has no
+/// base.
 fn base_units(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
     result: &mut ScanResult,
-) -> Result<Option<ParsedSource>> {
+) -> Result<Option<BaseUnits>> {
     let Some(commit) = changed.base.as_deref() else {
         return Ok(None);
     };
@@ -387,13 +509,15 @@ fn base_units(
         .renames
         .get(file.matched)
         .map_or(file.matched, PathBuf::as_path);
-    let content = match base_blob(&changed.repo_root, commit, path) {
+    let content = match changed.base_blob(commit, path) {
         BaseBlob::Missing => return Ok(None),
         BaseBlob::Unreadable => None,
         BaseBlob::Content(bytes) => String::from_utf8(bytes).ok(),
     };
     let units = content.and_then(|source| {
-        Language::from_path(path).and_then(|language| parse_source(language, &source).ok())
+        let language = Language::from_path(path)?;
+        let parsed = parse_source(language, &source).ok()?;
+        Some(BaseUnits { source, parsed })
     });
     if units.is_none() {
         result.notes.push(format!(
@@ -435,13 +559,14 @@ impl FileLimits {
         language: Language,
         explicit_config: Option<&Path>,
     ) -> Result<Self> {
-        let file = absolute(cwd, path);
+        let file = resolve_path(cwd, path);
         let roots = std::slice::from_ref(&file);
         let options = ScanOptions {
             cwd,
             paths: roots,
             explicit_config,
             changed: None,
+            commit_configs: None,
         };
         let matched = relative(&match_base(&options, roots)?, &file);
         let config = load_config(&file, explicit_config)?.config;
@@ -502,7 +627,7 @@ fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &m
 /// An explicit path as the file system resolves it: links in its directory
 /// part are followed before `..` applies. A path whose directory does not
 /// exist is normalized lexically first, then resolved the same way.
-fn absolute(cwd: &Path, path: &Path) -> PathBuf {
+pub fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     let path = cwd.join(path);
     resolved(&path).unwrap_or_else(|| {
         let lexical = normalize(&path);
@@ -598,7 +723,7 @@ mod tests {
             ("gone/../a.js", "/no-such-root/work/a.js"),
             ("./gone/./b.js", "/no-such-root/work/gone/b.js"),
         ] {
-            assert_eq!(absolute(cwd, Path::new(given)), Path::new(expected));
+            assert_eq!(resolve_path(cwd, Path::new(given)), Path::new(expected));
         }
         // `..` stops at the root, and stays when there is nothing to leave.
         for (given, expected) in [("/a/../../c.js", "/c.js"), ("../../d.js", "../../d.js")] {

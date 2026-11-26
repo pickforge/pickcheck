@@ -43,6 +43,85 @@ on stderr and do not reset the counter; only a clean Stop resets it. A missing
 ID uses the `unkeyed` counter. Working-directory fallbacks use each harness's
 workspace field or environment variable before the process directory.
 
+## Sessions
+
+Hooks scope the gate to the agent session, as "Hook sessions" in
+`docs/spec.md` defines. The first event of a session in a repository records
+`HEAD` as the anchor. Every event records the edited file and the files that
+are changed or untracked at that moment. During an unfinished merge,
+cherry-pick, revert, or rebase, an event records only the edited file and the
+unmerged files. `Stop` checks the diff from the merge
+base of the anchor and `HEAD` to the working tree, restricted to the recorded
+files. A post-edit event checks the edited file. Every file that the names
+diff lists with a post-image is checked, also when Git shows no changed
+line in it. Its units are compared with the base. A violation of a unit
+that the hunks do not touch counts only when it is new, worsened, or
+unmatched, so old debt that the session leaves as it was is never listed.
+An edit of a file
+outside the repository checks the whole file, as without a session. An edit
+of a file that is in no diff checks the whole file with no base, so its
+violations are new, unless the index tracks it as a plain file. Such a file
+is compared with the base, because Git can hide a change, as a clean filter
+does. This covers ignored files, files of nested repositories and
+submodules, skip-worktree entries, and links. A changed link in the diff is
+also checked whole with no base, a pure rename included, because Git diffs
+the link text and not its target. A changed entry that is no file, such as
+a nested repository, a submodule, or a dangling link, is not checked. Files outside the diff that the
+session does not edit are never checked. Commits made during the session stay in scope. Commits that a
+merge or rebase brings in count only where they touch a recorded file.
+A post-edit or `Stop` event with one violating file runs at most 9 Git
+commands, 10 when the edited file is in no diff, and 2 more for each other
+violating file. A config change adds 2
+only for each file that violates with the working-tree config alone. An
+unfinished merge, cherry-pick, revert, or rebase adds 1.
+
+Violations are compared with that base. `hook.fail_on` lists the statuses that
+block, by default `["new", "worsened", "unmatched"]`. A block reason lists the
+other violations as `WARN`; they never block alone. To block on every
+violation in scope, set:
+
+```json
+{"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}}
+```
+
+When a `.pickcheck.json` that a hook would read differs from the base, or the
+diff changes any `.pickcheck.json`, hooks scan twice: once with the configs of
+the base commit and once with the working-tree configs. The hook blocks when
+either scan blocks, and the block reason starts with a note that names the
+config side. Loosening a config therefore never empties the gate, and a
+stricter working-tree config still applies. `hook.max_blocks` comes from the
+base. The comparison reads content through links, so a config that Git
+ignores, a skip-worktree entry, or a changed link target counts too. It
+compares parsed JSON, so a line-ending conversion is no change.
+
+The state lives in `sessions/` under the state directory: one
+`<session>.<key hash>.anchor` file and one append-only
+`<session>.<key hash>.files` log per session and repository. The key hash
+covers the raw session ID and the repository root. The anchor is written to a
+temporary file and published with a hard link, so a reader never sees half of
+it. A hook that starts a session deletes the state files of other sessions
+that are older than 30 days, and no other file. An event refreshes the
+modification time of an anchor older than one day, so a session in use is
+not pruned.
+
+Session code never fails a hook. When the state directory cannot be written,
+the anchor or log is unusable, or another step of the session gate fails,
+such as a Git command or a base config that does not load, also for
+`hook.max_blocks` alone, the hook prints
+one `note:` line to stderr and works as without a session. A session run that does not block writes the
+same `note: UNVERIFIED` lines as a run outside a session. A failed write to
+stderr is ignored. A session started from a linked working directory and
+continued from the physical one keeps one anchor.
+
+Outside Git, without `HEAD`, or without a session ID, hooks work as before
+sessions. When the anchor no longer resolves or has no merge base with `HEAD`,
+they work as before, and the block reason starts with a note. A run that
+does not block writes that note to stderr.
+
+A file that a shell command changes and commits before the next hook event is
+not attributed to the session. An installer can close this gap by sending
+shell tool events to the hook, because every event records the changed files.
+
 Claude Code's `stop_hook_active` input field is intentionally ignored. The
 local counter is the loop guard for every harness, regardless of whether a
 Stop event was triggered by another Stop hook continuation.
