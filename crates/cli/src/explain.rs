@@ -154,13 +154,15 @@ fn select<'a>(
         .iter()
         .filter(|unit| (unit.trace.metrics.line..=unit.trace.metrics.end_line).contains(&line))
         .min_by_key(|unit| unit.trace.metrics.span.1 - unit.trace.metrics.span.0);
-    // A unit left out wins when it sits inside the innermost measured unit.
+    // A unit left out wins when it starts at the line, or when it contains
+    // the line and sits inside the innermost measured unit.
     let within = |unit: &&LeftOutLines| {
-        (unit.line..=unit.end_line).contains(&line)
-            && inner.is_none_or(|inner| {
-                let outer = inner.trace.metrics.span;
-                outer.0 <= unit.span.0 && unit.span.1 <= outer.1
-            })
+        let inside = |inner: &Explained| {
+            let outer = inner.trace.metrics.span;
+            outer.0 <= unit.span.0 && unit.span.1 <= outer.1
+        };
+        unit.line == line
+            || ((unit.line..=unit.end_line).contains(&line) && inner.is_none_or(inside))
     };
     if let Some(unit) = traced.left_out.iter().find(within) {
         anyhow::bail!(

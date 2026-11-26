@@ -783,7 +783,7 @@ Selection:
 - When a line or name matches measured units and also units `check` left out,
   it explains the measured units; the `note:` line names the units left out.
 - A line inside a measured unit that sits inside a unit left out selects the
-  measured unit.
+  measured unit. A line where only a unit left out starts selects no unit.
 - Giving both is a usage error.
 - With neither, it selects every unit whose `cognitive` exceeds its effective
   limit. When none does, the text output prints

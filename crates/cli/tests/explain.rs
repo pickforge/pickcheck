@@ -355,6 +355,30 @@ fn a_measured_unit_inside_a_unit_left_out_is_selected_by_line() {
 }
 
 #[test]
+fn a_line_where_only_a_unit_left_out_starts_selects_no_other_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = "a+".repeat(20_000);
+    fs::write(
+        dir.path().join("case.js"),
+        format!(
+            "function shallow(a) {{\n  return a && true;\n}} function deep(a) {{ return {chain}a; }}\n"
+        ),
+    )
+    .unwrap();
+    let output = run(dir.path(), &["case.js:3"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "error: cannot explain case.js:3: deep at line 3 is left out: \
+         syntax nesting too deep to measure\n"
+    );
+    assert!(output.stdout.is_empty());
+    let output = run(dir.path(), &["case.js:2"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).starts_with("case.js:1 shallow  cognitive 1 <= 15\n"));
+}
+
+#[test]
 fn units_that_start_on_one_line_keep_source_order() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
