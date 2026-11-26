@@ -385,6 +385,7 @@ fn measure(
         paths: &[],
         explicit_config: Some(config),
         changed: None,
+        commit_configs: None,
     })
     .unwrap_or_else(|error| panic!("scan of {} failed: {error:#}", entry.name));
 
