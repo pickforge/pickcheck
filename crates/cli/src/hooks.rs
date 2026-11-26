@@ -557,6 +557,7 @@ fn base_configs(
     base: &str,
     edited: Option<&Path>,
 ) -> Result<Option<CommitConfigs>> {
+    let root = &changes.repo_root;
     let checked = match edited {
         Some(edited) => vec![edited]
             .into_iter()
@@ -569,12 +570,18 @@ fn base_configs(
             .map(PathBuf::as_path)
             .collect::<Vec<_>>(),
     };
+    // Git lists an untracked nested repository as its directory, which is
+    // not a checked file and starts no lookup.
+    let checked = checked
+        .into_iter()
+        .map(|path| root.join(path))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
     if checked.is_empty() {
         return Ok(None);
     }
-    let root = &changes.repo_root;
     let mut starts = vec![cwd.to_path_buf()];
-    starts.extend(checked.into_iter().map(|path| root.join(path)));
+    starts.extend(checked);
     let configs = CommitConfigs::read(root, base, &starts)?;
     let changed = config_changed(changes) || configs.differs_from_working_tree();
     Ok(changed.then_some(configs))

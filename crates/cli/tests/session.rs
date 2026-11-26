@@ -227,6 +227,24 @@ fn a_config_in_no_diff_that_differs_from_the_base_keeps_the_base_limits() {
     assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
 }
 
+/// Git lists an untracked nested repository as its directory. That entry
+/// is no checked file, so its config is not compared with the base.
+#[test]
+fn an_untracked_nested_repository_starts_no_config_lookup() {
+    let strict = r#"{"hook":{"max_blocks":5}}"#;
+    let (dir, state) = repo(&[(".pickcheck.json", strict), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "nested");
+    fs::create_dir(root.join("nested")).unwrap();
+    git(&root.join("nested"), &["init", "-q"]);
+    let loose = r#"{"limits":{"params":20}}"#;
+    fs::write(root.join("nested/.pickcheck.json"), loose).unwrap();
+    fs::write(root.join("nested/n.js"), simple("n")).unwrap();
+    fs::write(root.join("a.js"), params("a", 7)).unwrap();
+    let reason = block_reason(&stop(&state, root, "nested"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+}
+
 /// A config link reads through its target, at the base as in the working
 /// tree. A base link that leaves the repository is the state note.
 #[cfg(unix)]

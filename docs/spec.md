@@ -957,7 +957,9 @@ fail set.
 Config. Hooks read the repository config from the base commit when a config
 that they would read differs from the base. The working-tree lookup walks
 from the directory of each checked file, and from `cwd`, up to the repository
-root, and stops at the first `.pickcheck.json` that is a file. At every directory
+root, and stops at the first `.pickcheck.json` that is a file. Only a checked
+entry that is a file starts a lookup, so an untracked nested repository, which
+Git lists as a directory, starts none. At every directory
 that it reaches, the hook compares what the lookup would read there, through
 a link too, with the file at the same path in the base commit, read through
 links that stay inside the base tree. A config on one side only, or content
