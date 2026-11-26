@@ -10,6 +10,9 @@ use std::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// A named change that a table test makes in a repository.
+type Case = (&'static str, fn(&Path));
+
 const ALL_STATUSES: &str =
     r#"{"hook":{"fail_on":["new","worsened","unmatched","improved","unchanged"]}}"#;
 
@@ -916,7 +919,7 @@ fn one_event_runs_each_git_command_once() {
 /// attribute and a NUL byte still give the hunks of a source file.
 #[test]
 fn a_file_that_git_treats_as_binary_still_shows_its_changes() {
-    let cases: [(&str, fn(&Path)); 3] = [
+    let cases: [Case; 3] = [
         ("attribute", |root| {
             fs::write(root.join(".gitattributes"), "*.js -diff\n").unwrap();
             fs::write(root.join("app.js"), params("a", 7)).unwrap();
@@ -1170,7 +1173,7 @@ fn a_link_in_the_diff_is_checked_whole_with_no_base() {
         .each_ref()
         .map(|(path, content)| (*path, content.as_str()));
     // The base has a link to a clean file, a plain file, or no file.
-    let cases: [(&str, fn(&Path)); 3] = [
+    let cases: [Case; 3] = [
         ("retarget", |_| {}),
         ("replace", |root| {
             fs::remove_file(root.join("link.js")).unwrap();
