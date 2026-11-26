@@ -1082,9 +1082,11 @@ attribute, so the hunks do not decide alone which units to check. In a file
 with a base, every unit is measured. A violation of a unit that a hunk
 touches keeps its status. A violation of a unit that no hunk touches is
 kept only when its status is `new` or `worsened`; with any other status it
-is dropped and not listed. Old debt that the session leaves as it was
-therefore neither blocks nor is listed, while a change that the hunks miss
-still counts. A file with no base, untracked or with no readable base
+is dropped and not listed. A unit that no hunk touches pairs first with a
+base unit of the same name and the same text, so a unit of that name that
+the session adds before it does not make it look new. Old debt that the
+session leaves as it was therefore neither blocks nor is listed, while a
+change that the hunks miss still counts. A file with no base, untracked or with no readable base
 content, is checked whole. The config key `hook.fail_on` lists the statuses that block, by
 default `new`, `worsened`, and `unmatched`. A block reason lists the other
 violations as `WARN`, but they never block alone. A run with only warnings

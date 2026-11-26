@@ -336,7 +336,12 @@ fn scan_file(
     if let Some(changed) = compared
         && !measured.units_of.is_empty()
     {
-        compare_with_base(changed, &context, &parsed, &measured.units_of, result)?;
+        let current = Current {
+            source: &source,
+            parsed: &parsed,
+            measured: &measured,
+        };
+        compare_with_base(changed, &context, &current, result)?;
     }
     if measure_untouched {
         keep_untouched_changes(result, first, &measured, &context, &parsed);
@@ -426,26 +431,44 @@ fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {
     Ok(resolution.config)
 }
 
-/// Adds baseline fields to this file's violations, the last `units_of.len()`
-/// in `result`, where `units_of[i]` indexes the violating unit in
-/// `parsed.functions`.
+/// The working-tree file whose violations are compared with the base.
+struct Current<'a> {
+    source: &'a str,
+    parsed: &'a ParsedSource,
+    measured: &'a Measured,
+}
+
+/// The file's text and units at the merge base.
+struct BaseUnits {
+    source: String,
+    parsed: ParsedSource,
+}
+
+/// Adds baseline fields to this file's violations, the last
+/// `measured.units_of.len()` in `result`, where `units_of[i]` indexes the
+/// violating unit in `parsed.functions`.
 fn compare_with_base(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
-    parsed: &ParsedSource,
-    units_of: &[usize],
+    current: &Current<'_>,
     result: &mut ScanResult,
 ) -> Result<()> {
-    let functions = &parsed.functions;
+    let functions = &current.parsed.functions;
+    let units_of = &current.measured.units_of;
     let base = base_units(changed, file, result)?;
-    let pairing = base.as_ref().map_or_else(
+    let mut pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| baseline::pair_units(parsed, base),
+        |base| baseline::pair_units(current.parsed, &base.parsed),
     );
+    if let Some(base) = &base {
+        pair_untouched_by_text(&mut pairing, current, base);
+    }
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
         let base_unit = match pairing[index] {
-            Pairing::Paired(base_index) => base.as_ref().map(|units| &units.functions[base_index]),
+            Pairing::Paired(base_index) => base
+                .as_ref()
+                .map(|units| &units.parsed.functions[base_index]),
             Pairing::New | Pairing::Unmatched => None,
         };
         violation.baseline = Some(Baseline {
@@ -462,12 +485,35 @@ fn compare_with_base(
     Ok(())
 }
 
-/// The file's units at the merge base, or `None` when it has no base.
+/// A unit that no hunk touches is old when the base has a unit with its name
+/// and its text. It pairs with that unit, whatever its position among the
+/// units of that name, so a unit of the same name that the session adds
+/// before it does not make it look new.
+fn pair_untouched_by_text(pairing: &mut [Pairing], current: &Current<'_>, base: &BaseUnits) {
+    for (index, unit) in current.parsed.functions.iter().enumerate() {
+        if !current.measured.untouched[index] {
+            continue;
+        }
+        let Some(text) = current.source.get(unit.span.0..unit.span.1) else {
+            continue;
+        };
+        let same = base.parsed.functions.iter().position(|candidate| {
+            candidate.function == unit.function
+                && base.source.get(candidate.span.0..candidate.span.1) == Some(text)
+        });
+        if let Some(base_index) = same {
+            pairing[index] = Pairing::Paired(base_index);
+        }
+    }
+}
+
+/// The file's text and units at the merge base, or `None` when it has no
+/// base.
 fn base_units(
     changed: &ChangedFiles,
     file: &FileContext<'_>,
     result: &mut ScanResult,
-) -> Result<Option<ParsedSource>> {
+) -> Result<Option<BaseUnits>> {
     let Some(commit) = changed.base.as_deref() else {
         return Ok(None);
     };
@@ -484,7 +530,9 @@ fn base_units(
         BaseBlob::Content(bytes) => String::from_utf8(bytes).ok(),
     };
     let units = content.and_then(|source| {
-        Language::from_path(path).and_then(|language| parse_source(language, &source).ok())
+        let language = Language::from_path(path)?;
+        let parsed = parse_source(language, &source).ok()?;
+        Some(BaseUnits { source, parsed })
     });
     if units.is_none() {
         result.notes.push(format!(

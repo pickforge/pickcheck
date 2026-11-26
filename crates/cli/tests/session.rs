@@ -1243,6 +1243,12 @@ fn old_debt_that_the_session_leaves_as_it_was_is_never_listed() {
             let content = fs::read_to_string(root.join("a.js")).unwrap();
             fs::write(root.join("a.js"), format!("{content}{}", params("old", 1))).unwrap();
         }),
+        // A unit of the same name before the old one shifts the pairing by
+        // source order; the old unit still pairs with its own base text.
+        ("same name before", |root| {
+            let content = fs::read_to_string(root.join("a.js")).unwrap();
+            fs::write(root.join("a.js"), format!("{}{content}", params("old", 1))).unwrap();
+        }),
         ("rename", |root| git(root, &["mv", "a.js", "b.js"])),
     ];
     #[cfg(unix)]
