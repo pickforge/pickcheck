@@ -80,9 +80,10 @@ temporary file and published with a hard link, so a reader never sees half of
 it. A hook that starts a session deletes the state files of other sessions
 that are older than 30 days, and no other file.
 
-Session state never fails a hook. When the state directory cannot be written,
-or the anchor or log is unusable, the hook prints one `note:` line to stderr
-and works as without a session. A session run that does not block writes the
+Session code never fails a hook. When the state directory cannot be written,
+the anchor or log is unusable, or another step of the session gate fails,
+such as a Git command or a base config that does not load, the hook prints
+one `note:` line to stderr and works as without a session. A session run that does not block writes the
 same `note: UNVERIFIED` lines as a run outside a session. A failed write to
 stderr is ignored. A session started from a linked working directory and
 continued from the physical one keeps one anchor.

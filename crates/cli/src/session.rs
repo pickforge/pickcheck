@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -148,8 +148,10 @@ fn open_log(path: &Path) -> Result<File> {
         .with_context(|| format!("cannot write state {}", path.display()))
 }
 
-/// Every complete record in the log. A truncated record does not parse and
-/// is skipped; duplicates collapse.
+/// Every complete record in the log that names a path inside the
+/// repository. A truncated record does not parse and is skipped, as is a
+/// path that is empty, has a NUL byte, or has a component other than a
+/// normal one, such as an absolute path or `..`. Duplicates collapse.
 fn read_log(path: &Path) -> Result<BTreeSet<PathBuf>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -161,8 +163,17 @@ fn read_log(path: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|line| serde_json::from_str::<String>(line).ok())
+        .filter(|path| is_relative_inside(path))
         .map(PathBuf::from)
         .collect())
+}
+
+fn is_relative_inside(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\0')
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Removes the files of every other session whose newest file is older than
@@ -271,10 +282,21 @@ mod tests {
     }
 
     #[test]
-    fn the_log_skips_truncated_records_and_duplicates() {
+    fn the_log_skips_truncated_and_unsafe_records_and_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("s.files");
-        fs::write(&log, "\n\"a.js\"\n\n\"b.js\"\n\n\"a.js\"\n\n\"src/c").unwrap();
+        let unsafe_records = [
+            "",
+            "../outside.js",
+            "/etc/x.js",
+            "src/../d.js",
+            "./c.js",
+            "a\0b.js",
+        ]
+        .map(|path| format!("\n{}\n", serde_json::to_string(path).unwrap()))
+        .concat();
+        let records = "\n\"a.js\"\n\n\"b.js\"\n\n\"a.js\"\n";
+        fs::write(&log, format!("{records}{unsafe_records}\n\"src/c")).unwrap();
         let files = read_log(&log).unwrap();
         assert_eq!(files, BTreeSet::from(["a.js", "b.js"].map(PathBuf::from)));
         // A record appended after a truncated one is still read.

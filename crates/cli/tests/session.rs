@@ -527,6 +527,75 @@ fn an_unwritable_state_directory_is_a_note() {
     fs::set_permissions(state.path(), fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Every error of the session gate is the state note and the hook without
+/// a session id: a base config that does not load, and a Git command that
+/// only the session runs. A log record outside the repository is skipped.
+#[test]
+fn session_gate_errors_are_a_note_and_the_hook_works_without_a_session() {
+    let note = "note: hook session state unavailable, the hook runs without a session: ";
+    let broken = r#"{"limits":{"bogus":1}}"#;
+    let (dir, state) = repo(&[(".pickcheck.json", broken), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "config");
+    fs::write(root.join(".pickcheck.json"), "{}").unwrap();
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    let output = edit(&state, root, "config", "a.js");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(note) && stderr.contains("bogus"),
+        "{stderr}"
+    );
+    assert!(block_reason(&output).starts_with("FAIL 1 file, 1 function"));
+    let output = stop(&state, root, "config");
+    assert!(text(&output.stderr).starts_with(note));
+    assert!(block_reason(&output).contains("--changed --verbose"));
+
+    // The tree of the anchor is gone after a later commit.
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "tree");
+    let tree = git_output(root, &["rev-parse", "HEAD^{tree}"]);
+    fs::write(root.join("b.js"), simple("b")).unwrap();
+    commit_all(root, "later");
+    let object = root.join(".git/objects").join(&tree[..2]).join(&tree[2..]);
+    let mut permissions = fs::metadata(&object).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&object, permissions).unwrap();
+    fs::remove_file(object).unwrap();
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    let output = edit(&state, root, "tree", "a.js");
+    assert!(
+        text(&output.stderr).starts_with(note),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(block_reason(&output).starts_with("FAIL 1 file, 1 function"));
+    let output = stop(&state, root, "tree");
+    assert!(text(&output.stderr).starts_with(note));
+    assert!(block_reason(&output).contains("--changed --verbose"));
+
+    // A record outside the repository never reaches Git.
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    let initial = head(root);
+    start(&state, root, "record");
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(session_file(&state, "anchor").with_extension("files"))
+        .unwrap();
+    log.write_all(b"\n\"../outside.js\"\n\n\"/abs.js\"\n")
+        .unwrap();
+    fs::write(root.join("b.js"), simple("b")).unwrap();
+    commit_all(root, "later");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    let output = edit(&state, root, "record", "a.js");
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    let reason = block_reason(&output);
+    assert!(reason.contains(&format!("--base {initial} ")), "{reason}");
+}
+
 /// Garbage in the log is skipped record by record; the session goes on.
 #[test]
 fn a_corrupt_log_keeps_its_readable_records() {

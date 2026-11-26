@@ -275,6 +275,7 @@ impl Gate {
 
 /// The repository around `cwd` at this event: `HEAD`, and the files that are
 /// changed or untracked against it.
+#[derive(Clone)]
 struct Snapshot {
     repo: Repository,
     status: DiffStatus,
@@ -336,12 +337,13 @@ fn record_only(input: &HookInput, cwd: &Path) {
 }
 
 fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathBuf) -> Result<u8> {
-    let gate = post_edit_gate(input, cwd, &path)?;
-    let result = gate.scan(cwd, &[path])?;
-    match gate.feedback(cwd, &result)? {
+    let session = post_edit_gate(input, cwd, &path);
+    let paths = [path];
+    let outcome = Outcome::of(session, || Ok(Gate::new(Mode::Paths)), cwd, &paths)?;
+    match outcome.report {
         Some(report) => emit_feedback(harness, &report, false),
         None => {
-            note_unverified(&result);
+            note_unverified(&outcome.result);
             Ok(0)
         }
     }
@@ -349,22 +351,25 @@ fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathB
 
 /// `Stop`, and an edit event that names no file.
 fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -> Result<u8> {
-    let Some(gate) = changed_gate(input, cwd)? else {
+    let Some(repo) = repository(cwd)? else {
         eprintln!(
             "note: hook skipped: {} is not inside a Git repository with HEAD",
             cwd.display()
         );
         return pass(input, stop);
     };
-    let result = gate.scan(cwd, &[])?;
-    let Some(report) = gate.feedback(cwd, &result)? else {
-        note_unverified(&result);
+    let snapshot = Snapshot::read(repo)?;
+    let session = changed_gate(input, &snapshot);
+    let head = || Ok(Gate::new(Mode::Head(snapshot.clone().head_changes()?)));
+    let outcome = Outcome::of(session, head, cwd, &[])?;
+    let Some(report) = outcome.report else {
+        note_unverified(&outcome.result);
         return pass(input, stop);
     };
     if !stop {
         return emit_feedback(harness, &report, false);
     }
-    let max = gate.config(cwd)?.hook.max_blocks;
+    let max = outcome.gate.config(cwd)?.hook.max_blocks;
     if increment_counter(&input.session_id)? > max {
         eprintln!("UNRESOLVED\n{report}");
         return Ok(0);
@@ -384,53 +389,84 @@ fn pass(input: &HookInput, stop: bool) -> Result<u8> {
     Ok(0)
 }
 
-/// The gate for an edit of `path`: the session's changes in that file, or
-/// the whole file outside a session and for a file outside the repository.
-fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Gate> {
-    let paths = Gate::new(Mode::Paths);
+/// A scan and its block reason, `None` when no violation blocks.
+struct Outcome {
+    gate: Gate,
+    result: ScanResult,
+    report: Option<String>,
+}
+
+impl Outcome {
+    /// Scans with the session gate. Without one, or after a note when the
+    /// session gate or its scan fails, scans with the `plain` gate of the
+    /// hook without a session id. An error of the plain gate is returned
+    /// without the note, as the hook without a session id returns it.
+    fn of(
+        session: Result<Option<Gate>>,
+        plain: impl FnOnce() -> Result<Gate>,
+        cwd: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self> {
+        let session =
+            session.and_then(|gate| gate.map(|gate| Self::scan(gate, cwd, paths)).transpose());
+        let failure = match session {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        let outcome = Self::scan(plain()?, cwd, paths)?;
+        if let Some(error) = failure {
+            note_without_session(&error);
+        }
+        Ok(outcome)
+    }
+
+    fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf]) -> Result<Self> {
+        let result = gate.scan(cwd, paths)?;
+        let report = gate.feedback(cwd, &result)?;
+        Ok(Self {
+            gate,
+            result,
+            report,
+        })
+    }
+}
+
+/// The session gate for an edit of `path`: the session's changes in that
+/// file. `None` without a session id, outside a Git repository with
+/// `HEAD`, for a file outside the repository, and after a note when the
+/// session state is unusable. Every error is the session's.
+fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Option<Gate>> {
     if input.session_id.is_empty() {
-        return Ok(paths);
+        return Ok(None);
     }
     let Some(repo) = repository(cwd)? else {
-        return Ok(paths);
+        return Ok(None);
     };
     let edited = resolve_path(cwd, path)
         .strip_prefix(&repo.root)
         .ok()
         .map(Path::to_path_buf);
-    let snapshot = match Snapshot::read(repo) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            note_without_session(&error);
-            return Ok(paths);
-        }
-    };
+    let snapshot = Snapshot::read(repo)?;
     let Some(session) = open_session_or_note(input, &snapshot, edited.as_deref()) else {
-        return Ok(paths);
-    };
-    match edited {
-        Some(edited) => session_gate(snapshot, &session, Some(&edited)),
-        None => Ok(paths),
-    }
-}
-
-/// The gate for `Stop` and for an edit event that names no file. `None`
-/// outside a Git repository with `HEAD`.
-fn changed_gate(input: &HookInput, cwd: &Path) -> Result<Option<Gate>> {
-    let Some(repo) = repository(cwd)? else {
         return Ok(None);
     };
-    let snapshot = Snapshot::read(repo)?;
-    let session = if input.session_id.is_empty() {
-        None
-    } else {
-        open_session_or_note(input, &snapshot, None)
+    edited
+        .map(|edited| session_gate(snapshot, &session, Some(&edited)))
+        .transpose()
+}
+
+/// The session gate for `Stop` and for an edit event that names no file.
+/// `None` without a session id and after a note when the session state is
+/// unusable.
+fn changed_gate(input: &HookInput, snapshot: &Snapshot) -> Result<Option<Gate>> {
+    if input.session_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(session) = open_session_or_note(input, snapshot, None) else {
+        return Ok(None);
     };
-    let gate = match session {
-        Some(session) => session_gate(snapshot, &session, None)?,
-        None => Gate::new(Mode::Head(snapshot.head_changes()?)),
-    };
-    Ok(Some(gate))
+    session_gate(snapshot.clone(), &session, None).map(Some)
 }
 
 /// The session's changes since its base, restricted to the files it

@@ -864,16 +864,20 @@ sanitizing leaves unchanged and a key hash of 16 lowercase hex digits. Pruning
 never deletes the files of the current session name, a directory, a link, the
 loop counters, or any file with another name.
 
-State failures. Session state is never a reason for a hook to fail. When the
+State failures. Session code is never a reason for a hook to fail. When the
 state directory cannot be created or written, the anchor names no full commit
 (40 or 64 lowercase hex digits), the log cannot be read, the file system has
-no hard links, or a Git command that only records fails, the hook writes one
-line to stderr that starts with `note: hook session state unavailable, the
-hook runs without a session:` and continues as it does without a session id
-(see Fallbacks). Its exit code and stdout are then those of the hook without a
-session, so an event that the hook does not check still exits 0 with no
-output. A record in the log that does not parse is skipped, not a failure.
-The loop guard keeps its own error behavior.
+no hard links, a Git command that only the session runs fails, or the scan of
+the session gate fails, such as on a base config that does not load, the hook
+writes one line to stderr that starts with `note: hook session state
+unavailable, the hook runs without a session:` and continues as it does
+without a session id (see Fallbacks). Its exit code and stdout are then those
+of the hook without a session, so an event that the hook does not check still
+exits 0 with no output. When the hook without a session id fails too, it
+returns its own error without the note. A record in the log that does not
+parse is skipped, not a failure. So is a record that is empty, has a NUL
+byte, or has a component other than a normal one, such as an absolute path
+or `..`. The loop guard keeps its own error behavior.
 
 Notes. Every stderr note that session code writes, the state note above and
 the `note: UNVERIFIED` lines, is one write whose failure is ignored, so a
