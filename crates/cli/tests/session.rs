@@ -706,10 +706,10 @@ fn an_edited_ignored_file_is_checked_whole_with_no_base() {
     fs::write(root.join("gen").join("new.js"), edited).unwrap();
     let input = edit_input(root, "ignored", &root.join("gen").join("new.js"));
     let (output, commands) = traced(&state, &input);
-    // Locate, names and untracked for the record, the hunks, and the ignore
-    // check; a file with no base reads none.
+    // Locate, names and untracked for the record, the hunks, and the index
+    // entry; a file with no base reads none.
     assert_eq!(commands.len(), 5, "{commands:#?}");
-    assert!(commands[4].starts_with("check-ignore"), "{commands:#?}");
+    assert!(commands[4].starts_with("ls-files --stage"), "{commands:#?}");
     let reason = block_reason(&output);
     assert!(
         reason.starts_with("FAIL 1 changed file, 1 function, 1 violation\n"),
@@ -728,6 +728,56 @@ fn an_edited_ignored_file_is_checked_whole_with_no_base() {
         text(&verbose.stdout).is_empty(),
         "ignored files are in no diff"
     );
+}
+
+/// Every edited file in no diff is checked whole with no base unless the
+/// index tracks it as a plain file: a file of a nested repository or a
+/// submodule, a skip-worktree entry, and a link all block as they do
+/// without a session. A plain tracked file in no diff has nothing to check.
+#[test]
+fn an_edited_file_in_no_diff_is_checked_whole_unless_plainly_tracked() {
+    let module = tempfile::tempdir().unwrap();
+    init_repo(module.path());
+    fs::write(module.path().join("m.js"), simple("m")).unwrap();
+    commit_all(module.path(), "module");
+    let files = [
+        ("ok.js", simple("ok")),
+        ("old.js", violating("old", 16)),
+        ("real.js", simple("real")),
+    ];
+    let files = files
+        .each_ref()
+        .map(|(path, content)| (*path, content.as_str()));
+    let (dir, state) = repo(&files);
+    let root = dir.path();
+    let module_path = module.path().to_str().unwrap();
+    let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+    git(root, &[&add[..], &[module_path, "sub"]].concat());
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.js", root.join("link.js")).unwrap();
+    commit_all(root, "submodule and link");
+    start(&state, root, "outside");
+
+    // An unchanged plain tracked file passes, old debt included.
+    assert!(edit(&state, root, "outside", "old.js").stdout.is_empty());
+    fs::create_dir(root.join("nested")).unwrap();
+    git(&root.join("nested"), &["init", "-q"]);
+    git(root, &["update-index", "--skip-worktree", "ok.js"]);
+    let mut cases = vec![("nested/a.js", "nested/a.js"), ("sub/m.js", "sub/m.js")];
+    cases.push(("ok.js", "ok.js"));
+    if cfg!(unix) {
+        cases.push(("link.js", "real.js"));
+    }
+    for (file, written) in cases {
+        fs::write(root.join(written), violating("grown", 16)).unwrap();
+        let reason = block_reason(&edit(&state, root, "outside", file));
+        assert!(
+            reason.starts_with("FAIL 1 changed file, 1 function, 1 violation\n"),
+            "{file}: {reason}"
+        );
+        let listed = native(&format!("FAIL {file}  "));
+        assert!(reason.contains(&listed), "{reason}");
+    }
 }
 
 /// The hook with stderr that cannot be written: `/dev/full` where it exists,

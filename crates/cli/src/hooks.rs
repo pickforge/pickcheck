@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, Result};
 use pickcheck_core::{
     ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange, Pathspec, Repository, ScanOptions,
-    ScanResult, config_changed, diff_spans, diff_status, is_ignored, load_config, load_config_at,
-    merge_base_with_head, physical, repository, resolve_path, scan, untracked_files,
+    ScanResult, config_changed, diff_spans, diff_status, is_plainly_tracked, load_config,
+    load_config_at, merge_base_with_head, physical, repository, resolve_path, scan,
+    untracked_files,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -467,7 +468,7 @@ fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) ->
         .then(|| CommitConfigs::read(&changes.repo_root, &base))
         .transpose()?;
     if let Some(edited) = edited
-        && edited_but_ignored(&changes, edited)?
+        && edited_outside_diff(&changes, edited)
     {
         changes.untracked.push(edited.to_path_buf());
     }
@@ -478,12 +479,16 @@ fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) ->
     }))
 }
 
-/// Whether `edited` is in no diff because Git ignores it. Such a file is
-/// checked as a whole file with no base, as an untracked file is.
-fn edited_but_ignored(changes: &ChangedFiles, edited: &Path) -> Result<bool> {
+/// Whether `edited` exists, is in no diff, and is not a plainly tracked
+/// file, as an ignored file, a file of a nested repository or a submodule, a
+/// skip-worktree entry, or a link is. Such a file is checked whole with no
+/// base, as an untracked file is. A plainly tracked file in no diff equals
+/// the base, so it has nothing to check.
+fn edited_outside_diff(changes: &ChangedFiles, edited: &Path) -> bool {
     let listed =
         changes.spans.contains_key(edited) || changes.untracked.iter().any(|path| path == edited);
-    Ok(!listed && is_ignored(&changes.repo_root, edited)?)
+    let root = &changes.repo_root;
+    !listed && fs::symlink_metadata(root.join(edited)).is_ok() && !is_plainly_tracked(root, edited)
 }
 
 /// The diff from `base`, with the names diff when it differs from the one

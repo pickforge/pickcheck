@@ -455,16 +455,30 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
-/// Whether Git ignores `path`, relative to the repository root: an untracked
-/// path that a `.gitignore` or exclude rule matches. A tracked path is never
-/// ignored.
-pub fn is_ignored(repo_root: &Path, path: &Path) -> Result<bool> {
-    let output = git_command(repo_root)
-        .args(["check-ignore", "-q", "--"])
-        .arg(slash_path(path))
+/// Whether the index tracks `path`, relative to the repository root, as a
+/// regular file whose changes a diff shows: one stage-0 entry at exactly
+/// that path, with a file mode and the tag `H`, so neither a symbolic link
+/// nor a skip-worktree or assume-unchanged entry. A Git failure, such as a
+/// path inside a submodule, is `false`.
+pub fn is_plainly_tracked(repo_root: &Path, path: &Path) -> bool {
+    let path = slash_path(path);
+    let Ok(output) = git_command(repo_root)
+        .args(["ls-files", "--stage", "-v", "-z", "--"])
+        .arg(Pathspec::File(Path::new(&path)).arg())
         .output()
-        .context("failed to execute git check-ignore")?;
-    Ok(output.status.success())
+    else {
+        return false;
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut entries = listing.split('\0').filter(|entry| !entry.is_empty());
+    let entry = match (entries.next(), entries.next()) {
+        (Some(entry), None) if output.status.success() => entry,
+        _ => return false,
+    };
+    entry.split_once('\t').is_some_and(|(meta, name)| {
+        let fields = meta.split(' ').collect::<Vec<_>>();
+        name == path && matches!(fields[..], ["H", "100644" | "100755", _, "0"])
+    })
 }
 
 /// The untracked files that Git does not ignore.

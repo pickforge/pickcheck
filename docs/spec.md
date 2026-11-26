@@ -899,11 +899,16 @@ diff from the base lists the edited file, every recorded file that no longer
 exists, and every `.pickcheck.json`. Past 100 such recorded files it covers the
 whole tree. An edit of a file outside the repository around `cwd` checks the
 whole file, exactly as without a session, because that file has no base. An
-edited file that is in no diff and that Git ignores (`git check-ignore`) is
-checked as a whole file with no base, as an untracked file is, so its
-violations are `new` and block with the default `hook.fail_on`. An ignored
-file that the event does not edit is never checked, and `Stop` does not check
-ignored files.
+edited file that exists and is in no diff is checked as a whole file with no
+base, as an untracked file is, so its violations are `new` and block with the
+default `hook.fail_on`. The exception is a plainly tracked file: `git ls-files
+--stage -v` lists exactly one stage-0 entry at that exact path, with the tag
+`H` and a regular file mode. Such a file in no diff equals the base and has
+nothing to check. A file that Git ignores, a file of a nested repository or a
+submodule, a skip-worktree or assume-unchanged entry, and a symbolic link are
+therefore checked whole. So is any file when that `ls-files` fails. A file
+outside the diff that the event does not edit is never checked, and `Stop`
+checks only the files in the diff.
 
 Git commands. One event runs no Git command twice with the same arguments.
 The repository root and `HEAD` come from one `rev-parse`. Recording runs one
@@ -914,8 +919,8 @@ hunks come from one `diff --unified=0` from the base. Each file with a
 violation then reads its base content with one `ls-tree` and one `cat-file`.
 When a `.pickcheck.json` changed, one `ls-tree -r` lists the configs of the
 base commit, and one `cat-file` reads each config that a lookup reaches. An
-edited file that is in no diff adds one `check-ignore`; it has no base to
-read. A post-edit or `Stop` event with one violating file therefore runs at most 8
+edited file that exists and is in no diff adds one `ls-files --stage`; it has
+no base to read. A post-edit or `Stop` event with one violating file therefore runs at most 8
 commands, and 2 more for each other violating file. A config change adds 1
 command, and 1 more for each config that is read.
 
