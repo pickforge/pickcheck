@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use pickcheck_core::{
     ChangedFiles, CommitConfigs, Config, DiffStatus, LineRange, Pathspec, Repository, ScanOptions,
     ScanResult, config_changed, diff_spans, diff_status, is_plainly_tracked, load_config,
-    load_config_at, merge_base_with_head, physical, repository, resolve_path, scan,
+    load_config_at, merge_base_with_head, physical, repository, resolve_path, scan, unmerged_files,
     untracked_files,
 };
 use serde::Deserialize;
@@ -611,7 +611,9 @@ fn rename_candidates<'a>(root: &Path, session: &'a Session, edited: &'a Path) ->
 }
 
 /// Opens the session and records the edited file and every file that is
-/// changed or untracked now.
+/// changed or untracked now. While a merge, cherry-pick, revert, or rebase
+/// is in progress, the changed files come from it, so only the edited file
+/// and the unmerged files are recorded.
 fn open_session(input: &HookInput, snapshot: &Snapshot, edited: Option<&Path>) -> Result<Session> {
     let mut session = Session::open(
         &state_dir()?,
@@ -620,12 +622,13 @@ fn open_session(input: &HookInput, snapshot: &Snapshot, edited: Option<&Path>) -
         &snapshot.repo.head,
     )?;
     let edited = edited.map(Path::to_path_buf);
-    session.record(
-        edited
-            .iter()
-            .chain(&snapshot.status.touched)
-            .chain(&snapshot.untracked),
-    )?;
+    if snapshot.repo.operation_in_progress() {
+        let unmerged = unmerged_files(&snapshot.repo.root)?;
+        session.record(edited.iter().chain(&unmerged))?;
+    } else {
+        let changed = snapshot.status.touched.iter().chain(&snapshot.untracked);
+        session.record(edited.iter().chain(changed))?;
+    }
     Ok(session)
 }
 

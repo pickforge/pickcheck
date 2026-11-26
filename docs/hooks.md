@@ -48,7 +48,9 @@ workspace field or environment variable before the process directory.
 Hooks scope the gate to the agent session, as "Hook sessions" in
 `docs/spec.md` defines. The first event of a session in a repository records
 `HEAD` as the anchor. Every event records the edited file and the files that
-are changed or untracked at that moment. `Stop` checks the diff from the merge
+are changed or untracked at that moment. During an unfinished merge,
+cherry-pick, revert, or rebase, an event records only the edited file and the
+unmerged files. `Stop` checks the diff from the merge
 base of the anchor and `HEAD` to the working tree, restricted to the recorded
 files. A post-edit event checks the functions that the session changed in the
 edited file. An edit of a file outside the repository checks the whole file,

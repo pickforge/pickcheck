@@ -83,6 +83,44 @@ fn commits_merged_or_rebased_in_block_only_through_session_files() {
     assert!(!reason.contains("other.js"), "{reason}");
 }
 
+/// While a merge stops on a conflict, an event records only the file it
+/// edits and the unmerged files, not the files that the merge stages.
+#[test]
+fn an_unfinished_merge_records_only_edited_and_unmerged_files() {
+    let (dir, state) = repo(&[("c.js", &simple("c")), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    git(root, &["checkout", "-qb", "upstream"]);
+    fs::write(root.join("up.js"), violating("up", 16)).unwrap();
+    fs::write(root.join("c.js"), simple("upstream")).unwrap();
+    commit_all(root, "upstream");
+    git(root, &["checkout", "-q", "main"]);
+    fs::write(root.join("c.js"), simple("main")).unwrap();
+    commit_all(root, "main");
+    start(&state, root, "merge");
+    let merge = Command::new("git")
+        .current_dir(root)
+        .args(["merge", "-q", "upstream"])
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge must stop on c.js");
+
+    let bash = json!({"hook_event_name":"PostToolUse", "session_id":"merge", "cwd":root,
+        "tool_name":"Bash", "tool_input":{"command":"git merge upstream"}});
+    assert!(hook(&state, "claude", &bash).status.success());
+    fs::write(root.join("a.js"), touched_simple("a")).unwrap();
+    edit(&state, root, "merge", "a.js");
+    let log = fs::read_to_string(session_file(&state, "files")).unwrap();
+    assert_eq!(log, "\n\"c.js\"\n\n\"a.js\"\n");
+
+    fs::write(root.join("c.js"), violating("resolved", 16)).unwrap();
+    git(root, &["add", "c.js", "a.js"]);
+    git(root, &["commit", "-q", "--no-edit"]);
+    let reason = block_reason(&stop(&state, root, "merge"));
+    assert!(reason.starts_with("FAIL 1 changed file,"), "{reason}");
+    assert!(reason.contains("FAIL c.js  1 function"), "{reason}");
+    assert!(!reason.contains("up.js"), "{reason}");
+}
+
 /// The config is created, edited, and deleted in the session; the limits stay
 /// those of the base.
 #[test]

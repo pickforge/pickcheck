@@ -833,7 +833,12 @@ that leaves it as it was. `check` does not use sessions.
 Session state. The first hook event of a session in a repository records the
 `HEAD` commit as the session anchor. Every event, including an event that a
 hook does not check, records the file it edits and every file that Git lists
-as changed or untracked against `HEAD` at that moment. Paths are relative to
+as changed or untracked against `HEAD` at that moment. While a merge,
+cherry-pick, revert, or rebase is in progress, an event records only the
+file it edits and the unmerged files, because the other changed files come
+from that operation. A `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+`rebase-merge`, or `rebase-apply` entry in the Git directory of the work
+tree marks such an operation. Paths are relative to
 the physical repository root, and the edited path is resolved as the file
 system resolves it before it is compared, so an event from a linked working
 directory and one from the physical directory share one session. The state lives in the `sessions` directory of
@@ -915,8 +920,10 @@ outside the diff that the event does not edit is never checked, and `Stop`
 checks only the files in the diff.
 
 Git commands. One event runs no Git command twice with the same arguments.
-The repository root and `HEAD` come from one `rev-parse`. Recording runs one
-`diff --name-status` against `HEAD` and one `ls-files --others`. When the base
+The repository root, the Git directory, and `HEAD` come from one
+`rev-parse`. Recording runs one `diff --name-status` against `HEAD` and one
+`ls-files --others`, and one `ls-files --unmerged` while an operation is in
+progress. When the base
 is `HEAD`, the names diff against `HEAD` serves as the names diff from the
 base. Otherwise one `merge-base` and one names diff from the base follow. The
 hunks come from one `diff --unified=0` from the base. Each file with a
@@ -927,7 +934,7 @@ has no base to read. When at least one file is checked, one `cat-file --batch
 file and from `cwd` up to the root, which serves both the comparison and the
 base config. A post-edit or `Stop` event with one violating file therefore
 runs at most 9 commands, and 2 more for each other violating file. A config
-change adds none.
+change adds none, and an operation in progress adds 1.
 
 Status. Every violation in the set is compared with the base, as under
 `--base`. The config key `hook.fail_on` lists the statuses that block, by

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -87,36 +88,80 @@ impl Pathspec<'_> {
     }
 }
 
+/// The files in the Git directory that mark a merge, cherry-pick, revert,
+/// rebase, or `am` that stopped before its commit.
+const OPERATION_MARKERS: &[&str] = &[
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+];
+
 /// A Git work tree and the commit `HEAD` names.
 #[derive(Clone, Debug)]
 pub struct Repository {
     /// The physical root.
     pub root: PathBuf,
+    /// The Git directory of this work tree.
+    pub git_dir: PathBuf,
     pub head: String,
 }
 
-/// The repository around `cwd` with its `HEAD` commit, from one Git command.
-/// `None` outside a repository and in one without commits.
+impl Repository {
+    /// Whether a merge, cherry-pick, revert, or rebase is in progress.
+    pub fn operation_in_progress(&self) -> bool {
+        OPERATION_MARKERS
+            .iter()
+            .any(|marker| fs::symlink_metadata(self.git_dir.join(marker)).is_ok())
+    }
+}
+
+/// The repository around `cwd` with its Git directory and `HEAD` commit,
+/// from one Git command. `None` outside a repository and in one without
+/// commits.
 pub fn repository(cwd: &Path) -> Result<Option<Repository>> {
     let lines = git_line(
         cwd,
         &[
             "rev-parse",
             "--show-toplevel",
+            "--absolute-git-dir",
             "--verify",
             "--quiet",
             "HEAD^{commit}",
         ],
     )?;
-    let Some((root, head)) = lines.as_deref().and_then(|text| text.split_once('\n')) else {
+    let Some([root, git_dir, head]) = lines.as_deref().and_then(|text| {
+        let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+        <[&str; 3]>::try_from(lines).ok()
+    }) else {
         return Ok(None);
     };
-    let root = physical(Path::new(root.trim()));
+    let root = physical(Path::new(root));
     remember_root(cwd, Some(root.clone()));
     Ok(Some(Repository {
         root,
-        head: head.trim().to_owned(),
+        git_dir: PathBuf::from(git_dir),
+        head: head.to_owned(),
     }))
+}
+
+/// The paths with unmerged index entries, each once.
+pub fn unmerged_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let output = git_command(repo_root)
+        .args(["ls-files", "--unmerged", "-z"])
+        .output()
+        .context("failed to list unmerged files")?;
+    if !output.status.success() {
+        bail!("git ls-files failed");
+    }
+    let mut paths = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| git_path(path)))
+        .collect::<Vec<_>>();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// The merge base of `commit` and `HEAD`, or `None` when `commit` names no
