@@ -6,6 +6,9 @@
 # script changes or removes only a checkout that it created and marked.
 set -euo pipefail
 
+# With CDPATH set, `cd` prints the directory, which would end up in a path.
+unset CDPATH
+
 # Git environment: no inherited repository, index, object store, namespace,
 # config, hooks, filters or prompts. This comes before any Git command.
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \

@@ -171,6 +171,7 @@ fn corpus_matches_snapshot() {
         .args(["--test-threads", "1"])
         .env(CHILD_VARIABLE, path)
         .env("HOME", path.join("home"))
+        .env("USERPROFILE", path.join("home"))
         .env("XDG_CONFIG_HOME", path.join("xdg"))
         .env("GIT_CONFIG_GLOBAL", &gitconfig)
         .env("GIT_CONFIG_SYSTEM", &gitconfig)
@@ -271,10 +272,12 @@ fn canonical(snapshot: &Snapshot) -> String {
 }
 
 /// True when an ignore file holds at least one rule. A missing file, blank
-/// lines and comments hide nothing.
+/// lines and comments hide nothing, and neither does a leading byte order
+/// mark, which the walk strips too.
 fn has_rules(file: &Path) -> bool {
     fs::read_to_string(file).is_ok_and(|text| {
-        text.lines()
+        text.trim_start_matches('\u{feff}')
+            .lines()
             .map(str::trim)
             .any(|line| !line.is_empty() && !line.starts_with('#'))
     })
@@ -637,6 +640,23 @@ fn swapping_values_between_functions_changes_digest() {
     let reordered = [before[1].clone(), before[0].clone()];
     assert_ne!(digest(&before), digest(&swapped));
     assert_eq!(digest(&before), digest(&reordered));
+}
+
+#[test]
+fn only_a_real_rule_makes_an_ignore_file_count() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join(".ignore");
+    assert!(!has_rules(&file));
+    for (text, rules) in [
+        ("", false),
+        ("\n  \n# comment only\n", false),
+        ("\u{feff}# comment only\n", false),
+        ("\u{feff}*.js\n", true),
+        ("# comment\n*.js\n", true),
+    ] {
+        fs::write(&file, text).unwrap();
+        assert_eq!(has_rules(&file), rules, "{text:?}");
+    }
 }
 
 #[test]
