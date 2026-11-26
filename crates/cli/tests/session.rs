@@ -1279,6 +1279,23 @@ fn old_debt_that_the_session_leaves_as_it_was_is_never_listed() {
     }
 }
 
+/// A checkout with CRLF line ends has other bytes than the base, and the old
+/// unit still pairs with its own base text.
+#[test]
+fn old_debt_in_a_crlf_checkout_keeps_its_base() {
+    let base = format!("{}{}{}", params("old", 7), params("old", 1), simple("a"));
+    let (dir, state) = repo(&[("a.js", &base)]);
+    let root = dir.path();
+    git(root, &["config", "core.autocrlf", "true"]);
+    fs::write(root.join("a.js"), base.replace('\n', "\r\n")).unwrap();
+    start(&state, root, "crlf");
+    let current = format!("{}{base}", params("old", 1)).replace('\n', "\r\n");
+    fs::write(root.join("a.js"), current).unwrap();
+    let output = edit(&state, root, "crlf", "a.js");
+    assert!(output.stdout.is_empty(), "{}", text(&output.stdout));
+    assert!(stop(&state, root, "crlf").stdout.is_empty());
+}
+
 /// A copy of an old violating unit, added before it under the same name, is
 /// new debt: the old unit keeps its own base, and the copy has none.
 #[test]

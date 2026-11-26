@@ -1082,19 +1082,21 @@ attribute, so the hunks do not decide alone which units to check. In a file
 with a base, every unit is measured. A violation of a unit that a hunk
 touches keeps its status. A violation of a unit that no hunk touches is
 kept only when its status is `new` or `worsened`; with any other status it
-is dropped and not listed. A unit that no hunk touches pairs first with a
-base unit of the same name and the same text, one base unit for each such
-unit. The other units of that name then pair in source order with the base
-units that are left. So a unit of that name that the session adds before an
-old unit is the new one, also when it is a copy of the old unit. Old debt that the
-session leaves as it was therefore neither blocks nor is listed, while a
-change that the hunks miss still counts. A file with no base, untracked or with no readable base
-content, is checked whole. The config key `hook.fail_on` lists the statuses that block, by
-default `new`, `worsened`, and `unmatched`. A block reason lists the other
-violations as `WARN`, but they never block alone. A run with only warnings
-prints nothing and counts as a clean run for the loop guard. The block reason
-is the `--base` summary, and its `DETAILS` line names the base commit and the
-fail set.
+is dropped and not listed. A named unit that no hunk touches pairs first
+with a base unit of the same name and the same text, one base unit for each
+such unit. CRLF and LF line ends count as the same text. The other units of
+that name then pair in source order with the base units that are left. So a
+unit of that name that the session adds before an old unit is the new one,
+also when it is a copy of the old unit. An `<anonymous>` unit pairs by owner
+and position, as under `--base`. Old debt that the session leaves as it was
+therefore neither blocks nor is listed, while a change that the hunks miss
+still counts. A file with no base, untracked or with no readable base
+content, is checked whole. The config key `hook.fail_on` lists the statuses
+that block, by default `new`, `worsened`, and `unmatched`. A block reason
+lists the other violations as `WARN`, but they never block alone. A run with
+only warnings prints nothing and counts as a clean run for the loop guard.
+The block reason is the `--base` summary, and its `DETAILS` line names the
+base commit and the fail set.
 
 Config. When a config that hooks would read differs from the base, the
 session gate scans twice and blocks when either scan blocks. The working-tree lookup walks

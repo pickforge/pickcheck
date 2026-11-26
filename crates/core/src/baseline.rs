@@ -2,6 +2,7 @@
 //! status of a violation, as "Baseline (`--base`)" in `docs/spec.md` defines.
 
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
 };
@@ -116,7 +117,8 @@ pub struct Text<'a> {
 
 /// Pairs like `pair_units`, but each named unit marked in `untouched` first
 /// claims a base unit with its name and its text, one base unit per claim.
-/// The other units of that name then pair in source order with the base
+/// Texts that differ only in CRLF against LF line ends are the same text,
+/// because a checkout can convert the line ends. The other units of that name then pair in source order with the base
 /// units that no claim took. So a unit of the same name that is added before
 /// an old unit is the new one, and the old unit keeps its own base.
 pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, untouched: &[bool]) -> Vec<Pairing> {
@@ -125,7 +127,7 @@ pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, untouched: &[bool])
     }
     // Base units by name and text, the first in the file last, so `pop`
     // takes them in file order.
-    let mut free = BTreeMap::<(&str, &str), Vec<usize>>::new();
+    let mut free = BTreeMap::<(&str, Cow<'_, str>), Vec<usize>>::new();
     for (index, unit) in base.parsed.functions.iter().enumerate().rev() {
         if let Some(text) = unit_text(base.source, unit) {
             free.entry((&unit.function, text)).or_default().push(index);
@@ -133,7 +135,7 @@ pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, untouched: &[bool])
     }
     let mut claims = BTreeMap::new();
     for (index, unit) in current.parsed.functions.iter().enumerate() {
-        if !untouched[index] || unit.function == ANONYMOUS {
+        if untouched.get(index) != Some(&true) || unit.function == ANONYMOUS {
             continue;
         }
         let claimed = unit_text(current.source, unit)
@@ -145,8 +147,14 @@ pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, untouched: &[bool])
     pair_with_claims(current.parsed, base.parsed, &claims)
 }
 
-fn unit_text<'a>(source: &'a str, unit: &FunctionMetrics) -> Option<&'a str> {
-    source.get(unit.span.0..unit.span.1)
+/// The text of a unit with LF line ends.
+fn unit_text<'a>(source: &'a str, unit: &FunctionMetrics) -> Option<Cow<'a, str>> {
+    let text = source.get(unit.span.0..unit.span.1)?;
+    Some(if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    })
 }
 
 /// `claims` maps a measured current unit to the measured base unit it pairs
@@ -477,6 +485,22 @@ mod tests {
         assert_eq!(
             by_text(&[("g", "long body")], &[("f", "long body")], &[true]),
             [Pairing::New]
+        );
+    }
+
+    #[test]
+    fn line_ends_do_not_change_the_text_of_a_claim() {
+        use Pairing::{New, Paired};
+        let base = [("f", "a {\n}"), ("f", "b {\n}")];
+        let current = [("f", "new"), ("f", "a {\r\n}"), ("f", "b {\r\n}")];
+        assert_eq!(
+            by_text(&current, &base, &[false, true, true]),
+            [New, Paired(0), Paired(1)]
+        );
+        // A unit with no mark claims nothing.
+        assert_eq!(
+            by_text(&current, &base, &[false, true]),
+            [Paired(1), Paired(0), New]
         );
     }
 
