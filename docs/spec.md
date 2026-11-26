@@ -1041,10 +1041,10 @@ edited file that exists and is in no diff is checked as a whole file with no
 base, as an untracked file is, so its violations are `new` and block with the
 default `hook.fail_on`. The exception is a plainly tracked file: `git ls-files
 --stage -v` lists exactly one stage-0 entry at that exact path, with the tag
-`H` and a regular file mode. Such a file in no diff is compared with the
-base with no touched unit, so only its `new` and `worsened` violations
-remain (see Status). Git can hide a change from every diff, as a clean
-filter does. A file that Git ignores, a file of a nested repository or a
+`H` and a regular file mode. Git can hide a change from every diff, as a
+clean filter does, so such a file in no diff is compared with the base with
+no touched unit, and only its `new` and `worsened` violations remain (see
+Status). A file that Git ignores, a file of a nested repository or a
 submodule, a skip-worktree or assume-unchanged entry, and a symbolic link are
 therefore checked whole. So is any file when that `ls-files` fails. A file
 outside the diff that the event does not edit is never checked, and `Stop`
@@ -1145,7 +1145,13 @@ can close this by sending shell tool events to the hook, because every event
 records the changed files. An agent that can write to the state directory can
 replace its own anchor, and with it the base of its session. An agent that
 changes Git's own configuration, for example with a clean filter in
-`.git/config`, can change what Git reports as a diff. A config that another
+`.git/config`, can change what Git reports as a diff. `Stop` can then miss a
+file that such a configuration hides from the diff, while the edit event
+still checks the edited file. A config that is a link inside a directory
+whose name has a newline cannot be read from the base; the session then
+falls back with the state note. A base config that is committed under
+another spelling than `.pickcheck.json` is not a config for the base
+lookup. A config that another
 process rewrites while one hook event runs can be read in two states by that
 event; the next event sees the change. Pruning a session that has been idle
 for 30 days can race with that session's next event, which then starts the
