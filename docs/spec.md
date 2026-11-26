@@ -1011,7 +1011,13 @@ Known limits. A file that a shell command changes and that is committed
 before any later hook event is not attributed to the session. An installer
 can close this by sending shell tool events to the hook, because every event
 records the changed files. An agent that can write to the state directory can
-replace its own anchor, and with it the base of its session.
+replace its own anchor, and with it the base of its session. An agent that
+changes Git's own configuration, for example with a clean filter in
+`.git/config`, can change what Git reports as a diff. A config that another
+process rewrites while one hook event runs can be read in two states by that
+event; the next event sees the change. Pruning a session that has been idle
+for 30 days can race with that session's next event, which then starts the
+session with a new anchor.
 
 ### `init`
 
