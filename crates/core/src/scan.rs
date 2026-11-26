@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::{
     BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
     Metric, ParsedSource,
-    baseline::{self, MetricValues, Pairing, Status},
+    baseline::{self, MetricValues, Pairing, Status, UnitChange},
     diff::{physical, repository_root},
     load_config, load_config_at, parse_source,
 };
@@ -353,8 +353,9 @@ fn scan_file(
 struct Measured {
     /// The unit of each of the file's violations, by index.
     units_of: Vec<usize>,
-    /// Whether each unit was measured although no hunk touches it.
-    untouched: Vec<bool>,
+    /// What the hunks say about each unit. A unit is `Untouched` or `Added`
+    /// only with `measure_untouched`.
+    changes: Vec<UnitChange>,
 }
 
 /// Adds the violations of the units in `spans`, every unit without spans,
@@ -370,7 +371,7 @@ fn measure_units(
     let first = result.violations.len();
     let mut measured = Measured {
         units_of: Vec::new(),
-        untouched: vec![false; parsed.functions.len()],
+        changes: vec![UnitChange::Touched; parsed.functions.len()],
     };
     for (index, function) in parsed.functions.iter().enumerate() {
         let touched = spans.is_none_or(|ranges| touches(function, ranges));
@@ -381,14 +382,17 @@ fn measure_units(
         measured
             .units_of
             .resize(result.violations.len() - first, index);
-        if touched {
-            result.checked += 1;
-            result
-                .functions
-                .push((file.display.to_path_buf(), function.clone()));
-        } else {
-            measured.untouched[index] = true;
+        if !touched {
+            measured.changes[index] = UnitChange::Untouched;
+            continue;
         }
+        if measure_untouched && spans.is_some_and(|ranges| added(function, ranges)) {
+            measured.changes[index] = UnitChange::Added;
+        }
+        result.checked += 1;
+        result
+            .functions
+            .push((file.display.to_path_buf(), function.clone()));
     }
     measured
 }
@@ -406,7 +410,7 @@ fn keep_untouched_changes(
     let mut kept = BTreeSet::new();
     let violations = result.violations.split_off(first);
     for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
-        if measured.untouched[index] {
+        if measured.changes[index] == UnitChange::Untouched {
             let status = violation.baseline.as_ref().map(|baseline| baseline.status);
             if matches!(status, Some(Status::Unchanged | Status::Improved) | None) {
                 continue;
@@ -467,7 +471,7 @@ fn compare_with_base(
                 source: &base.source,
                 parsed: &base.parsed,
             };
-            baseline::pair_units_by_text(current_text, base_text, &current.measured.untouched)
+            baseline::pair_units_by_text(current_text, base_text, &current.measured.changes)
         },
     );
     let first = result.violations.len() - units_of.len();
@@ -603,6 +607,13 @@ fn touches(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
     ranges
         .iter()
         .any(|range| range.intersects(function.line, function.end_line))
+}
+
+/// Whether one hunk that removes no line adds every line of the unit.
+fn added(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.added && range.start <= function.line && function.end_line <= range.end)
 }
 
 fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &mut ScanResult) {

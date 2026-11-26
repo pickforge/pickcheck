@@ -36,6 +36,8 @@ static ROOTS: Mutex<BTreeMap<PathBuf, Option<PathBuf>>> = Mutex::new(BTreeMap::n
 pub struct LineRange {
     pub start: usize,
     pub end: usize,
+    /// The hunk adds these lines and removes none.
+    pub added: bool,
 }
 
 impl LineRange {
@@ -817,6 +819,7 @@ pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
                 .push(LineRange {
                     start: new.0,
                     end: new.0 + new.1 - 1,
+                    added: old.1 == 0,
                 });
         }
     }
@@ -1077,17 +1080,18 @@ mod tests {
             "diff --git a/b.js b/b.js\n--- a/b.js\n+++ b/b.js\n@@ -1 +1 @@\n-a\n+b\n",
         );
         let spans = parse_diff_hunks(diff);
-        let ranges = |pairs: &[(usize, usize)]| {
-            pairs
+        // Only the first hunk removes no line.
+        let ranges = |ranges: &[(usize, usize, bool)]| {
+            ranges
                 .iter()
-                .map(|&(start, end)| LineRange { start, end })
+                .map(|&(start, end, added)| LineRange { start, end, added })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             spans[Path::new("a.js")],
-            ranges(&[(1, 4), (8, 9), (12, 12)])
+            ranges(&[(1, 4, true), (8, 9, false), (12, 12, false)])
         );
-        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1)]));
+        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1, false)]));
         // Lines that only look like headers name no file.
         assert_eq!(spans.len(), 2, "{spans:?}");
     }
@@ -1128,8 +1132,16 @@ mod tests {
         assert_eq!(
             spans[Path::new("a.rs")],
             vec![
-                LineRange { start: 2, end: 4 },
-                LineRange { start: 19, end: 19 },
+                LineRange {
+                    start: 2,
+                    end: 4,
+                    added: false
+                },
+                LineRange {
+                    start: 19,
+                    end: 19,
+                    added: false
+                },
             ]
         );
     }

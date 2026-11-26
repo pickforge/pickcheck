@@ -1087,15 +1087,26 @@ kept with any other status.
 A unit that no hunk touches pairs first with a base unit of the same text,
 one base unit for each such unit. CRLF and LF line ends count as the same
 text. A named unit looks among the base units of its name, and an
-`<anonymous>` unit among the base `<anonymous>` units of its owner. The
-other units of that name or owner then pair as under `--base`, with the base
-units that are left. So a unit that the session adds before an old unit is
-the new one, also when it is a copy of the old unit. Last, a unit that no
-hunk touches and that still has no base unit takes a base unit of the same
-text that pairs with no measured unit, whatever its name or owner. So an old unit
-keeps its base when a change outside it renames it or its owner. Old debt
-that the session leaves as it was therefore neither blocks nor is listed,
-while a change that the hunks miss still counts.
+`<anonymous>` unit among the base `<anonymous>` units of its owner. A unit
+that finds none there looks among the other named base units, or the other
+base `<anonymous>` units, and takes one whose name or owner is gone first.
+Its text counts before the name or the position of another unit. So an old
+unit keeps its base when a change outside it renames it or its owner, also
+when a new unit takes the old name.
+
+A unit that lies wholly in the lines of one hunk that removes no line is an
+added unit. It is no edit of a base unit. After the units that no hunk
+touches, an added unit takes a base unit of the same text among the base
+units of its name or owner, because a unit can move with its text. An added
+`<anonymous>` unit that takes none does not pair by position and is `new`.
+
+The units that are left pair as under `--base`, with the base units that
+are left. So a unit that the session adds before an old unit is the new
+one, also when it is a copy of the old unit. Last, a unit that no hunk
+touches or an added unit that still has no base unit takes a base unit of
+the same text that pairs with no measured unit, whatever its name or owner.
+Old debt that the session leaves as it was therefore neither blocks nor is
+listed, while a change that the hunks miss still counts.
 
 A file with no base, untracked or with no readable base content, is checked
 whole. The config key `hook.fail_on` lists the statuses

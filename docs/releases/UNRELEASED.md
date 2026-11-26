@@ -88,6 +88,12 @@
   change that an encoding attribute, a clean filter, or a renamed link hides
   from the hunks still blocks, and old debt that the session leaves as it
   was is still never listed. A file with any violation now reads its base content. (#53)
+- In a session, a function that no hunk touches keeps the base function with
+  its text, also when a new function takes its old name, as after a class
+  is renamed and a wrapper is added under the old name. An anonymous
+  function in lines that a hunk only adds is new unless it moved with its
+  text, so it no longer pairs by position with a function that the same
+  edit removes. (#74)
 - `check --changed`, `check --base`, and hooks now read each hunk by the line
   counts in its header, so an added line such as `++ /dev/null` inside a
   comment no longer drops the rest of the file's changes. A path that Git

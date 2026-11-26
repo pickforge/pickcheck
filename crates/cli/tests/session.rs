@@ -1352,6 +1352,87 @@ fn old_debt_keeps_its_base_when_a_change_outside_it_renames_or_moves_it() {
     }
 }
 
+/// A new unit can take the name that an old unit had. The old unit, which no
+/// hunk touches, still keeps the base unit with its text.
+#[test]
+fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
+    let old = closure(7);
+    // The base content and the content after the session's edit.
+    let cases = [
+        (
+            "class",
+            "class Legacy {\n  run(p0, p1, p2, p3, p4, p5, p6) {\n    return p0;\n  }\n}\n"
+                .to_owned(),
+            "class Adapter {\n  run(p0, p1, p2, p3, p4, p5, p6) {\n    return p0;\n  }\n}\n\n\
+             class Legacy {\n  run(options) {\n    return new Adapter().run(...options);\n  }\n}\n"
+                .to_owned(),
+        ),
+        (
+            "owner",
+            format!("function foo(list) {{\n  return list.map({old});\n}}\n"),
+            format!(
+                "function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return list.map((b) => b);\n}}\n"
+            ),
+        ),
+    ];
+    for (session, base, current) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let output = edit(&state, root, session, "a.js");
+        assert!(
+            output.stdout.is_empty(),
+            "{session}: {}",
+            text(&output.stdout)
+        );
+        assert!(stop(&state, root, session).stdout.is_empty(), "{session}");
+    }
+}
+
+/// A closure in lines that a hunk only adds is no edit of a base closure. It
+/// is new also when the owner loses another closure, so that the owner has
+/// as many closures as before. A closure that moves with its text is not.
+#[test]
+fn an_added_closure_blocks_also_when_another_closure_is_removed() {
+    let on = |event: &str, result: &str| {
+        format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g) => {result});\n")
+    };
+    let file = |lines: &[String]| format!("function bind(worker) {{\n{}}}\n", lines.concat());
+    let base = file(&[on("data", "a"), on("close", "b")]);
+    // The content after the session's edit, and whether it blocks.
+    let cases = [
+        ("swap", file(&[on("ready", "a"), on("data", "a")]), true),
+        ("move", file(&[on("close", "b"), on("data", "a")]), false),
+    ];
+    for (session, current, blocks) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let outputs = [
+            edit(&state, root, session, "a.js"),
+            stop(&state, root, session),
+        ];
+        for output in outputs {
+            if blocks {
+                let reason = block_reason(&output);
+                assert!(
+                    reason.contains("FAIL a.js  1 function, 1 violation"),
+                    "{reason}"
+                );
+            } else {
+                assert!(
+                    output.stdout.is_empty(),
+                    "{session}: {}",
+                    text(&output.stdout)
+                );
+            }
+        }
+    }
+}
+
 /// Lines that the session only removes leave no changed line in the file.
 /// Two closures that become one too complex closure still block.
 #[test]
