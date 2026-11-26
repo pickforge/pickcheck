@@ -62,3 +62,18 @@ jobs:
           scan-args: |-
             --config=osv-scanner.toml
             --lockfile=Cargo.lock
+
+  corpus:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/corpus
+          key: corpus-${{ hashFiles('tests/corpus/manifest.json', 'scripts/fetch-corpus.sh') }}
+      - run: scripts/fetch-corpus.sh "$RUNNER_TEMP/corpus"
+      - run: cargo test -p pickcheck-core --test corpus --release --locked -- --ignored
+        env:
+          PICKCHECK_CORPUS_DIR: ${{ runner.temp }}/corpus
