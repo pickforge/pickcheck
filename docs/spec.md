@@ -557,6 +557,8 @@ pickcheck --version
   disabled, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_EXTERNAL_DIFF`/`GIT_CONFIG_*`
   removed from its environment. Rename detection is explicit so a renamed file
   reports only the functions its edits touch, whatever `diff.renames` says.
+  The hunk diff also passes `--text`, so a `-diff` or `binary` attribute or a
+  NUL byte never hides the changed lines of a file.
 - With `--base <ref>`: the same as `--changed`, which it implies, but the diff
   starts at the merge base of `<ref>` and `HEAD` instead of `HEAD`, so branch
   commits count together with staged, unstaged, and untracked work. This is the
@@ -931,7 +933,7 @@ The repository root, the Git directory, and `HEAD` come from one
 progress. When the base
 is `HEAD`, the names diff against `HEAD` serves as the names diff from the
 base. Otherwise one `merge-base` and one names diff from the base follow. The
-hunks come from one `diff --unified=0` from the base. Each file with a
+hunks come from one `diff --unified=0 --text` from the base. Each file with a
 violation then reads its base content with one `ls-tree` and one `cat-file`.
 An edited file that exists and is in no diff adds one `ls-files --stage`; it
 has no base to read. When at least one file is checked, one `cat-file --batch

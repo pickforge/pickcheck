@@ -74,6 +74,11 @@
   config from the session base, so loosening a limit no longer empties the
   gate, and the block reason carries the note. (#53)
 
+- `check --changed`, `check --base`, and hooks now diff every file as text.
+  Before, a `-diff` or `binary` attribute, or a NUL byte in a source file,
+  made Git report the file as binary with no changed lines, so its changes
+  were not checked. (#53)
+
 ## Validation
 
 - <What was actually run, and where its evidence lives. Nothing aspirational.>

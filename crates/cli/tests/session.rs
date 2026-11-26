@@ -801,6 +801,41 @@ fn one_event_runs_each_git_command_once() {
     assert_eq!(commands.len(), 9, "{commands:#?}");
 }
 
+/// Git's binary decision never hides a change: a `-diff` or `binary`
+/// attribute and a NUL byte still give the hunks of a source file.
+#[test]
+fn a_file_that_git_treats_as_binary_still_shows_its_changes() {
+    let cases: [(&str, fn(&Path)); 3] = [
+        ("attribute", |root| {
+            fs::write(root.join(".gitattributes"), "*.js -diff\n").unwrap();
+            fs::write(root.join("app.js"), params("a", 7)).unwrap();
+        }),
+        ("info", |root| {
+            fs::write(root.join(".git/info/attributes"), "*.js binary\n").unwrap();
+            fs::write(root.join("app.js"), params("a", 7)).unwrap();
+        }),
+        ("nul", |root| {
+            fs::write(root.join("app.js"), format!("// \0\n{}", params("a", 7))).unwrap();
+        }),
+    ];
+    for (session, change) in cases {
+        let (dir, state) = repo(&[("app.js", &params("a", 1))]);
+        let root = dir.path();
+        start(&state, root, session);
+        change(root);
+        let reason = block_reason(&edit(&state, root, session, "app.js"));
+        assert!(
+            reason.contains("FAIL app.js  1 function"),
+            "{session}: {reason}"
+        );
+        let reason = block_reason(&stop(&state, root, session));
+        assert!(
+            reason.contains("FAIL app.js  1 function"),
+            "{session}: {reason}"
+        );
+    }
+}
+
 /// Past 100 recorded files that no longer exist, the names diff of an edit
 /// covers the whole tree instead of naming each of them.
 #[test]
@@ -833,7 +868,8 @@ fn many_gone_files_widen_the_names_diff_of_an_edit() {
     assert!(
         commands
             .iter()
-            .any(|command| command.ends_with(&format!("--unified=0 {base} -- ':(literal)a.js'"))),
+            .any(|command| command
+                .ends_with(&format!("--unified=0 --text {base} -- ':(literal)a.js'"))),
         "{commands:#?}"
     );
 }
@@ -1174,6 +1210,15 @@ fn violating(name: &str, score: usize) -> String {
         .map(|index| format!("  if (x === {index}) x++;\n"))
         .collect::<String>();
     format!("function {name}(x) {{\n{decisions}  return x;\n}}\n")
+}
+
+/// A function with `count` parameters; the default limit is 6.
+fn params(name: &str, count: usize) -> String {
+    let list = (0..count)
+        .map(|index| format!("p{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("function {name}({list}) {{\n  return p0;\n}}\n")
 }
 
 /// `violating` with an edit that keeps the score.

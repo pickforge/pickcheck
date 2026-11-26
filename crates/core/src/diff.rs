@@ -225,12 +225,14 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
 }
 
 /// The changed line ranges of each file from `from` to the working tree.
+/// Every file is diffed as text, so neither a `-diff` or `binary` attribute
+/// nor a NUL byte hides its hunks.
 pub fn diff_spans(
     repo_root: &Path,
     from: &str,
     paths: &[Pathspec<'_>],
 ) -> Result<BTreeMap<PathBuf, Vec<LineRange>>> {
-    let hunks = git_diff(repo_root, from, &["--unified=0"], paths)?;
+    let hunks = git_diff(repo_root, from, &["--unified=0", "--text"], paths)?;
     Ok(parse_diff_hunks(&hunks))
 }
 
