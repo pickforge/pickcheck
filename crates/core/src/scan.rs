@@ -340,6 +340,7 @@ fn scan_file(
             source: &source,
             parsed: &parsed,
             measured: &measured,
+            spans,
         };
         compare_with_base(changed, &context, &current, result)?;
     }
@@ -441,6 +442,8 @@ struct Current<'a> {
     source: &'a str,
     parsed: &'a ParsedSource,
     measured: &'a Measured,
+    /// The hunks of the file, or `None` when the whole file is checked.
+    spans: Option<&'a [LineRange]>,
 }
 
 /// The file's text and units at the merge base.
@@ -463,17 +466,7 @@ fn compare_with_base(
     let base = base_units(changed, file, result)?;
     let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| {
-            let current_text = baseline::Text {
-                source: current.source,
-                parsed: current.parsed,
-            };
-            let base_text = baseline::Text {
-                source: &base.source,
-                parsed: &base.parsed,
-            };
-            baseline::pair_units_by_text(current_text, base_text, &current.measured.changes)
-        },
+        |base| pair_with_base(current, base),
     );
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
@@ -495,6 +488,31 @@ fn compare_with_base(
         });
     }
     Ok(())
+}
+
+/// Pairs the units of the file with its units at the merge base.
+fn pair_with_base(current: &Current<'_>, base: &BaseUnits) -> Vec<Pairing> {
+    let current_text = baseline::Text {
+        source: current.source,
+        parsed: current.parsed,
+    };
+    let base_text = baseline::Text {
+        source: &base.source,
+        parsed: &base.parsed,
+    };
+    let ranges = current.spans.unwrap_or_default();
+    let removed = (base.parsed.functions.iter())
+        .map(|unit| {
+            ranges
+                .iter()
+                .any(|range| range.removes(unit.line, unit.end_line))
+        })
+        .collect::<Vec<_>>();
+    let hunks = baseline::Hunks {
+        changes: &current.measured.changes,
+        removed: &removed,
+    };
+    baseline::pair_units_by_text(current_text, base_text, hunks)
 }
 
 /// The file's text and units at the merge base, or `None` when it has no

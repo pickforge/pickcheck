@@ -128,11 +128,23 @@ pub enum UnitChange {
     Added,
 }
 
+/// What the hunks of a diff say about the units of a file and of its base.
+#[derive(Clone, Copy, Default)]
+pub struct Hunks<'a> {
+    /// One item for each unit of the file.
+    pub changes: &'a [UnitChange],
+    /// For each base unit, whether one hunk removes all its lines and adds
+    /// no line.
+    pub removed: &'a [bool],
+}
+
 /// Pairs like `pair_units`, but a unit that is `Untouched` or `Added` can
 /// claim a base unit with its text, one base unit per claim. Texts that
 /// differ only in CRLF against LF line ends are the same text, because a
-/// checkout can convert the line ends. The `Untouched` units claim before
-/// the `Added` units, because an added unit can be a copy of one of them.
+/// checkout can convert the line ends. An `Added` unit claims only a base
+/// unit that is `removed` in `hunks`: then the unit moved with its text.
+/// Without that, an added copy of an old unit would take the base of the
+/// old unit. The `Untouched` units claim before the `Added` units.
 ///
 /// 1. An `Untouched` unit claims the base unit that starts at its base line.
 ///    The lines of such a unit are the lines of that base unit, so this
@@ -148,11 +160,8 @@ pub enum UnitChange {
 /// So a unit that is added before an old unit is the new one, an added
 /// closure is new unless it moved with its text, and an old unit keeps its
 /// base when only its name or its owner's name changes.
-pub fn pair_units_by_text(
-    current: Text<'_>,
-    base: Text<'_>,
-    changes: &[UnitChange],
-) -> Vec<Pairing> {
+pub fn pair_units_by_text(current: Text<'_>, base: Text<'_>, hunks: Hunks<'_>) -> Vec<Pairing> {
+    let changes = hunks.changes;
     let change = |index: usize| changes.get(index).copied().unwrap_or(UnitChange::Touched);
     let claiming = |(index, unit)| match change(index) {
         UnitChange::Touched => None,
@@ -168,6 +177,7 @@ pub fn pair_units_by_text(
         base: (base.parsed.functions.iter())
             .map(|unit| unit_text(base.source, unit))
             .collect(),
+        removed: hunks.removed.to_vec(),
         base_lines: (0..units.len()).map(base_line).collect(),
         added: (0..units.len())
             .map(|index| change(index) == UnitChange::Added)
@@ -182,6 +192,8 @@ pub fn pair_units_by_text(
 struct Texts<'a> {
     current: Vec<Option<Cow<'a, str>>>,
     base: Vec<Option<Cow<'a, str>>>,
+    /// Whether one hunk removes all the lines of each base unit.
+    removed: Vec<bool>,
     /// The base line of each current unit that is `UnitChange::Untouched`.
     base_lines: Vec<Option<usize>>,
     /// Whether each current unit is `UnitChange::Added`.
@@ -375,12 +387,14 @@ struct Round<'a> {
 
 /// Pairs each unit of `members` that claims in this round and has no base
 /// unit with the first unit of `base_members` that has its text and that no
-/// unit pairs with.
+/// unit pairs with. In the round of the `Added` units, only a base unit
+/// whose lines one hunk removes can be claimed.
 fn claim_by_text(round: Round<'_>, members: &[usize], base_members: &[usize], pairs: &mut Pairs) {
     let texts = round.texts;
     let mut free = BTreeMap::<&str, VecDeque<usize>>::new();
     for &base_index in base_members {
-        if pairs.taken.contains(&base_index) {
+        let moved = texts.removed.get(base_index) == Some(&true);
+        if pairs.taken.contains(&base_index) || round.added && !moved {
             continue;
         }
         if let Some(text) = text_of(&texts.base, base_index) {
@@ -619,7 +633,12 @@ mod tests {
             source: &base_source,
             parsed: &base_parsed,
         };
-        pair_units_by_text(current, base, &changes(untouched))
+        let changes = &changes(untouched);
+        let hunks = Hunks {
+            changes,
+            ..Hunks::default()
+        };
+        pair_units_by_text(current, base, hunks)
     }
 
     /// A unit that no hunk touches, with a base line where no unit starts,
@@ -745,6 +764,19 @@ mod tests {
         base: &[(&str, &[&str])],
         changes: &[UnitChange],
     ) -> Vec<Pairing> {
+        let hunks = Hunks {
+            changes,
+            ..Hunks::default()
+        };
+        pair_owners_with(current, base, hunks)
+    }
+
+    /// `pair_owners` with the base units whose lines a hunk removes.
+    fn pair_owners_with(
+        current: &[(&str, &[&str])],
+        base: &[(&str, &[&str])],
+        hunks: Hunks<'_>,
+    ) -> Vec<Pairing> {
         let (source, parsed) = owners(current);
         let (base_source, base_parsed) = owners(base);
         let current = Text {
@@ -755,7 +787,7 @@ mod tests {
             source: &base_source,
             parsed: &base_parsed,
         };
-        pair_units_by_text(current, base, changes)
+        pair_units_by_text(current, base, hunks)
     }
 
     /// `pair_owners` for one owner, with `untouched` marks.
@@ -842,7 +874,11 @@ mod tests {
             source: &base_source,
             parsed: &base_parsed,
         };
-        pair_units_by_text(current, base, changes)
+        let hunks = Hunks {
+            changes,
+            ..Hunks::default()
+        };
+        pair_units_by_text(current, base, hunks)
     }
 
     #[test]
@@ -924,17 +960,30 @@ mod tests {
             pair_owners(&current, &base, &[Touched, Touched, Added, Touched]),
             [Paired(0), Paired(1), New, Paired(2)]
         );
-        // An added closure with the text of a removed one moved, in its
-        // owner or into another owner.
+        // An added closure with the text of a closure whose lines a hunk
+        // removes moved, in its owner or into another owner.
+        let moved = |changes| Hunks {
+            changes,
+            removed: &[false, false, true],
+        };
         let current = [("f", &["(close) => b", "(data) => a"][..])];
+        let changes = [Touched, Added, UNTOUCHED];
         assert_eq!(
-            pair_owners(&current, &base, &[Touched, Added, UNTOUCHED]),
+            pair_owners_with(&current, &base, moved(&changes)),
             [Paired(0), Paired(2), Paired(1)]
         );
         let current = [("f", &["(data) => a"][..]), ("g", &["(close) => b"][..])];
+        let changes = [Touched, UNTOUCHED, Added, Added];
         assert_eq!(
-            pair_owners(&current, &base, &[Touched, UNTOUCHED, Added, Added]),
+            pair_owners_with(&current, &base, moved(&changes)),
             [Paired(0), Paired(1), New, Paired(2)]
+        );
+        // A copy of a closure that is edited in place does not take its
+        // base: no hunk removes the lines of the base closure.
+        let current = [("f", &["(data) => A", "(close) => b", "(close) => b"][..])];
+        assert_eq!(
+            pair_owners(&current, &base, &[Touched, Touched, Touched, Added]),
+            [Paired(0), Paired(1), Paired(2), New]
         );
         // A copy of a closure that stays is new, also before the closure
         // and when another closure is removed.

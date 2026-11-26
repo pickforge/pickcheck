@@ -1096,9 +1096,11 @@ name, or for an `<anonymous>` unit among the base `<anonymous>` units of
 its owner.
 
 A unit that lies wholly in the lines of one hunk that removes no line is an
-added unit. It is no edit of a base unit. After the units that no hunk
-touches, an added unit takes a base unit of the same text among the base
-units of its name or owner, because a unit can move with its text. An added
+added unit. It is no edit of a base unit. An added unit takes only a base
+unit of the same text whose lines one hunk removes wholly while it adds no
+line: then the unit moved with its text. A copy of a unit that stays or that the session edits
+therefore takes no base unit. After the units that no hunk touches, an
+added unit looks among the base units of its name or owner. An added
 `<anonymous>` unit that takes none does not pair by position and does not
 count among the `<anonymous>` units of its owner. It is `new` unless the
 last step gives it a base unit.

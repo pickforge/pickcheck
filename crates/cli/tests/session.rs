@@ -1407,7 +1407,8 @@ fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
 
 /// A closure in lines that a hunk only adds is no edit of a base closure. It
 /// is new also when the owner loses another closure, so that the owner has
-/// as many closures as before. A closure that moves with its text is not.
+/// as many closures as before, and also when it is a copy of a closure that
+/// the session edits. A closure that moves with its text is not new.
 #[test]
 fn an_added_closure_blocks_also_when_another_closure_is_removed() {
     let on = |event: &str, result: &str| {
@@ -1416,9 +1417,17 @@ fn an_added_closure_blocks_also_when_another_closure_is_removed() {
     let file = |lines: &[String]| format!("function bind(worker) {{\n{}}}\n", lines.concat());
     let base = file(&[on("data", "a"), on("close", "b")]);
     // The content after the session's edit, and whether it blocks.
+    let one = "  worker.on(\"data\", (a) => a);\n".to_owned();
     let cases = [
         ("swap", file(&[on("ready", "a"), on("data", "a")]), true),
         ("move", file(&[on("close", "b"), on("data", "a")]), false),
+        // The old closure is cut to one parameter, and a copy of it is
+        // added after the other closure.
+        (
+            "copy",
+            file(&[one, on("close", "b"), on("data", "a")]),
+            true,
+        ),
     ];
     for (session, current, blocks) in cases {
         let (dir, state) = repo(&[("a.js", &base)]);
