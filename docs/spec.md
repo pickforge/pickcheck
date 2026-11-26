@@ -477,16 +477,16 @@ not classified, so a grammar upgrade that introduces new syntax is visible.
   `function expression() { return [<text>]; }` (spread, because a spread
   parses only as an array element). The first wrapper whose tree has no
   `ERROR` or `MISSING` node is scored. When none parses cleanly, the
-  expression wrapper is scored, or the spread wrapper for a spread, and nodes
-  inside an `ERROR` subtree add nothing. So an `{#each}` binding with a key,
-  such as `item, i (item.id)`, is read as an expression, and a binding with
-  both a destructuring default and a key, such as `{ x = a }, i (x)`, adds
-  nothing. Each `ternary_expression`
+  error-recovered tree of the expression wrapper is scored, or that of the
+  spread wrapper for a spread. So an `{#each}` binding with a key, such as
+  `item, i (item.id)`, is read as an expression, and so is an inline
+  `{#await p then v}` or `{#await p catch e}`, where the promise and the
+  binding share one text. Each `ternary_expression`
   and each short-circuit operator node (`&&`, `||`, `??`, `&&=`, `||=`, `??=`)
-  adds 1, including inside a function in the expression; `bool_ops` takes its
-  chains from the same tree. Nodes inside an `ERROR` subtree add nothing, and
-  operator characters inside a string, a regular expression, or a comment are
-  not operator nodes.
+  adds 1, including inside a function in the expression and inside an `ERROR`
+  subtree of a recovered tree; `bool_ops` takes its chains from the same
+  tree. Operator characters inside a string, a regular expression, or a
+  comment are not operator nodes.
   Depth follows `{#if}`/`{#each}`/`{#await}` nesting within a unit, so a block
   unit has depth at least 1; snippets and `{#key}` add no depth. Template
   units are exempt from `lines` and `params`.
