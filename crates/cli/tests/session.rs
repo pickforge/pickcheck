@@ -328,6 +328,27 @@ fn a_newline_in_a_directory_name_keeps_the_base_config() {
     );
 }
 
+/// A newline in the repository root path is no reason to skip the hook.
+#[cfg(unix)]
+#[test]
+fn a_newline_in_the_repository_root_keeps_the_hook() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("re\npo");
+    fs::create_dir(&root).unwrap();
+    init_repo(&root);
+    fs::write(root.join("a.js"), simple("a")).unwrap();
+    commit_all(&root, "initial");
+    let state = tempfile::tempdir().unwrap();
+    start(&state, &root, "root");
+    fs::write(root.join("a.js"), params("a", 7)).unwrap();
+    let reason = block_reason(&edit(&state, &root, "root", "a.js"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+    for session in ["", "root"] {
+        let reason = block_reason(&stop(&state, &root, session));
+        assert!(reason.contains("FAIL a.js  1 function"), "{reason}");
+    }
+}
+
 /// A config that `core.autocrlf` checks out with CRLF holds the same JSON
 /// as its LF base, so it is no config change.
 #[test]

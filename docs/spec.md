@@ -931,7 +931,9 @@ checks only the files in the diff.
 Git commands. One event runs no Git command twice with the same arguments,
 unless a session failure makes it run the gate without a session too.
 The repository root, the Git directory, and `HEAD` come from one
-`rev-parse`. Recording runs one `diff --name-status` against `HEAD` and one
+`rev-parse`. The commit is its last line. When the two paths hold more
+newlines, the root is the longest candidate that contains `cwd` and leaves
+an absolute Git directory. Recording runs one `diff --name-status` against `HEAD` and one
 `ls-files --others`, and one `ls-files --unmerged` while an operation is in
 progress. When the base
 is `HEAD`, the names diff against `HEAD` serves as the names diff from the

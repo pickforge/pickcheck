@@ -156,19 +156,40 @@ pub fn repository(cwd: &Path) -> Result<Option<Repository>> {
             "HEAD^{commit}",
         ],
     )?;
-    let Some([root, git_dir, head]) = lines.as_deref().and_then(|text| {
-        let lines = text.lines().map(str::trim).collect::<Vec<_>>();
-        <[&str; 3]>::try_from(lines).ok()
-    }) else {
+    let Some(repo) = lines.and_then(|text| parse_repository(&text, cwd)) else {
         return Ok(None);
     };
-    let root = physical(Path::new(root));
-    remember_root(cwd, Some(root.clone()));
-    Ok(Some(Repository {
-        root,
+    remember_root(cwd, Some(repo.root.clone()));
+    Ok(Some(repo))
+}
+
+/// Reads the root, the Git directory, and the `HEAD` commit that `rev-parse`
+/// prints on three lines. The commit is the last line. Both paths can hold
+/// a newline, so when the rest has several, the root is the longest
+/// candidate that contains `cwd` and leaves an absolute Git directory.
+fn parse_repository(text: &str, cwd: &Path) -> Option<Repository> {
+    #[cfg(windows)]
+    let text = &text.replace("\r\n", "\n");
+    let (paths, head) = text.rsplit_once('\n')?;
+    let splits = paths
+        .match_indices('\n')
+        .map(|(index, _)| (&paths[..index], &paths[index + 1..]))
+        .collect::<Vec<_>>();
+    let (root, git_dir) = match splits[..] {
+        [] => return None,
+        [only] => only,
+        _ => {
+            let cwd = physical(cwd);
+            splits.into_iter().rev().find(|(root, git_dir)| {
+                Path::new(git_dir).is_absolute() && cwd.starts_with(physical(Path::new(root)))
+            })?
+        }
+    };
+    Some(Repository {
+        root: physical(Path::new(root)),
         git_dir: PathBuf::from(git_dir),
         head: head.to_owned(),
-    }))
+    })
 }
 
 /// The paths with unmerged index entries, each once.
@@ -911,6 +932,23 @@ mod tests {
         );
         let only = files_at(&root, "HEAD", &[PathBuf::from("gone\n/c.json")]).unwrap();
         assert_eq!(only, [Missing]);
+    }
+
+    /// The commit is the last line; the root is the candidate that holds
+    /// `cwd` and leaves an absolute Git directory.
+    #[cfg(unix)]
+    #[test]
+    fn rev_parse_paths_with_newlines_split_at_the_root_that_holds_cwd() {
+        let cwd = Path::new("/no-such/re\npo/sub");
+        let text = "/no-such/re\npo\n/no-such/re\npo/.git\nabc";
+        let repo = parse_repository(text, cwd).unwrap();
+        assert_eq!(repo.root, Path::new("/no-such/re\npo"));
+        assert_eq!(repo.git_dir, Path::new("/no-such/re\npo/.git"));
+        assert_eq!(repo.head, "abc");
+        let plain = parse_repository("/r\n/r/.git\nabc", cwd).unwrap();
+        assert_eq!(plain.root, Path::new("/r"));
+        assert!(parse_repository("/r\nabc", cwd).is_none());
+        assert!(parse_repository("/a\nb\nc\nabc", cwd).is_none());
     }
 
     #[test]
