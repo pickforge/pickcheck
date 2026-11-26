@@ -227,6 +227,24 @@ fn a_config_in_no_diff_that_differs_from_the_base_keeps_the_base_limits() {
     assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
 }
 
+/// A config that `core.autocrlf` checks out with CRLF holds the same JSON
+/// as its LF base, so it is no config change.
+#[test]
+fn a_line_ending_conversion_is_no_config_change() {
+    let strict = "{\"hook\":{\"max_blocks\":5}}\n";
+    let (dir, state) = repo(&[(".pickcheck.json", strict), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    git(root, &["config", "core.autocrlf", "true"]);
+    fs::remove_file(root.join(".pickcheck.json")).unwrap();
+    git(root, &["checkout", "--", ".pickcheck.json"]);
+    let converted = fs::read_to_string(root.join(".pickcheck.json")).unwrap();
+    assert!(converted.ends_with("\r\n"), "{converted:?}");
+    start(&state, root, "crlf");
+    fs::write(root.join("a.js"), params("a", 7)).unwrap();
+    let reason = block_reason(&stop(&state, root, "crlf"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+}
+
 /// Git lists an untracked nested repository as its directory. That entry
 /// is no checked file, so its config is not compared with the base.
 #[test]

@@ -242,7 +242,7 @@ impl CommitConfigs {
             let working = path.is_file().then(|| fs::read(&path).ok());
             let same = match (self.entries.get(relative), &working) {
                 (Some(TreeFile::Missing), None) => true,
-                (Some(TreeFile::Content(base)), Some(Some(content))) => base == content,
+                (Some(TreeFile::Content(base)), Some(Some(content))) => same_config(base, content),
                 _ => false,
             };
             if !same || working.is_some() {
@@ -270,6 +270,19 @@ impl CommitConfigs {
             return Ok(Some((PathBuf::from(label), text)));
         }
         Ok(None)
+    }
+}
+
+/// Whether two config files hold the same settings: equal JSON values, so a
+/// line-ending conversion is no change, or equal bytes when either side is
+/// not JSON.
+fn same_config(base: &[u8], working: &[u8]) -> bool {
+    match (
+        serde_json::from_slice::<Value>(base),
+        serde_json::from_slice::<Value>(working),
+    ) {
+        (Ok(base), Ok(working)) => base == working,
+        _ => base == working,
     }
 }
 

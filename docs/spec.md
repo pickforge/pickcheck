@@ -965,7 +965,9 @@ a link too, with the file at the same path in the base commit, read through
 links that stay inside the base tree. A config on one side only, or content
 that differs, is a change. A config that Git ignores, a skip-worktree entry,
 and a changed link target therefore count, as does a name that the file
-system matches without regard to case. A diff from the base that adds,
+system matches without regard to case. Content is compared as parsed JSON, so a
+line-ending conversion such as `core.autocrlf` is no change; when either side
+is not JSON, its bytes are compared. A diff from the base that adds,
 edits, deletes, or renames any `.pickcheck.json` is also a change. For each
 checked file the config then is the nearest `.pickcheck.json` in the tree of
 the base commit, from the file's directory up to the repository root, and
