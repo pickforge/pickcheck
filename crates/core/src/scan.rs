@@ -320,7 +320,6 @@ fn scan_file(
             reason,
         });
     }
-    let functions = &parsed.functions;
     let context = FileContext {
         display: &display,
         matched: &matched_path,
@@ -333,47 +332,76 @@ fn scan_file(
     let measure_untouched =
         spans.is_some() && compared.is_some_and(|changed| changed.measure_untouched);
     let first = result.violations.len();
-    let mut units_of = Vec::new();
-    let mut untouched = vec![false; functions.len()];
-    for (index, function) in functions.iter().enumerate() {
-        let touched = spans.is_none_or(|ranges| touches(function, ranges));
-        if !touched && !measure_untouched {
-            continue;
-        }
-        add_violations(&context, function, result);
-        units_of.resize(result.violations.len() - first, index);
-        if touched {
-            result.checked += 1;
-            result.functions.push((display.clone(), function.clone()));
-        } else {
-            untouched[index] = true;
-        }
-    }
+    let measured = measure_units(&context, &parsed, spans, measure_untouched, result);
     if let Some(changed) = compared
-        && !units_of.is_empty()
+        && !measured.units_of.is_empty()
     {
-        compare_with_base(changed, &context, &parsed, &units_of, result)?;
+        compare_with_base(changed, &context, &parsed, &measured.units_of, result)?;
     }
     if measure_untouched {
-        keep_untouched_changes(result, first, &units_of, &untouched, &parsed, &display);
+        keep_untouched_changes(result, first, &measured, &context, &parsed);
     }
     Ok(())
 }
 
+/// The units that a scan measured in one file.
+struct Measured {
+    /// The unit of each of the file's violations, by index.
+    units_of: Vec<usize>,
+    /// Whether each unit was measured although no hunk touches it.
+    untouched: Vec<bool>,
+}
+
+/// Adds the violations of the units in `spans`, every unit without spans,
+/// and with `measure_untouched` every other unit too. Only touched units
+/// count as checked here.
+fn measure_units(
+    file: &FileContext<'_>,
+    parsed: &ParsedSource,
+    spans: Option<&[LineRange]>,
+    measure_untouched: bool,
+    result: &mut ScanResult,
+) -> Measured {
+    let first = result.violations.len();
+    let mut measured = Measured {
+        units_of: Vec::new(),
+        untouched: vec![false; parsed.functions.len()],
+    };
+    for (index, function) in parsed.functions.iter().enumerate() {
+        let touched = spans.is_none_or(|ranges| touches(function, ranges));
+        if !touched && !measure_untouched {
+            continue;
+        }
+        add_violations(file, function, result);
+        measured
+            .units_of
+            .resize(result.violations.len() - first, index);
+        if touched {
+            result.checked += 1;
+            result
+                .functions
+                .push((file.display.to_path_buf(), function.clone()));
+        } else {
+            measured.untouched[index] = true;
+        }
+    }
+    measured
+}
+
 /// Drops each violation of a unit that no hunk touches unless its status
 /// is `new` or `worsened`, and counts the untouched units that keep one.
-/// The file's violations are the last `units_of.len()` in `result`.
+/// The file's violations start at `first` in `result`.
 fn keep_untouched_changes(
     result: &mut ScanResult,
     first: usize,
-    units_of: &[usize],
-    untouched: &[bool],
+    measured: &Measured,
+    file: &FileContext<'_>,
     parsed: &ParsedSource,
-    display: &Path,
 ) {
     let mut kept = BTreeSet::new();
-    for (violation, &index) in result.violations.split_off(first).into_iter().zip(units_of) {
-        if untouched[index] {
+    let violations = result.violations.split_off(first);
+    for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
+        if measured.untouched[index] {
             let status = violation.baseline.as_ref().map(|baseline| baseline.status);
             if !matches!(status, Some(Status::New | Status::Worsened)) {
                 continue;
@@ -386,7 +414,7 @@ fn keep_untouched_changes(
         result.checked += 1;
         result
             .functions
-            .push((display.to_path_buf(), parsed.functions[index].clone()));
+            .push((file.display.to_path_buf(), parsed.functions[index].clone()));
     }
 }
 
