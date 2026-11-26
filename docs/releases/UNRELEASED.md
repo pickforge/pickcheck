@@ -49,6 +49,30 @@
 - `lines` now indexes each file's lines and comments once instead of
   rescanning the file for every function, so a 100,000-line file with 20,000
   functions is measured in about a second instead of tens of seconds. (#49)
+- Hooks now anchor the gate to the agent session (#53). The first hook event
+  of a session records `HEAD`, and `Stop` checks the diff from the merge base
+  of that commit and `HEAD`, restricted to the files the session touched. A
+  violation the agent commits before it stops still blocks, and a commit that
+  a merge or rebase brings in counts only where it touches a session file.
+  Session state lives in `sessions/` under the state directory, and state
+  older than 30 days is deleted. A state failure, such as an unwritable state
+  directory or a corrupt anchor, is one `note:` line on stderr, and the hook
+  then works as without a session; it never changes the exit code or stdout.
+  An edit of a file outside the repository still checks the whole file, and
+  an edit of a file that Git ignores checks the whole file with no base, so
+  its violations are new. A session run that does not block writes the same
+  `note: UNVERIFIED` lines on stderr as a run outside a session.
+- Default change: hooks now compare every violation with the session base and
+  block only the statuses in the new `hook.fail_on` key, by default
+  `["new", "worsened", "unmatched"]`. A legacy violation that an edit leaves
+  `unchanged` or `improved` is listed as `WARN` when something else blocks and
+  never blocks alone. `PostToolUse` checks only the functions the session
+  changed in the edited file, not the whole file. To restore the old
+  strictness, set
+  `"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}`.
+- When a session changes any `.pickcheck.json`, hooks read the repository
+  config from the session base, so loosening a limit no longer empties the
+  gate, and the block reason carries the note. (#53)
 
 ## Validation
 

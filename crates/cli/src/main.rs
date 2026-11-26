@@ -2,6 +2,7 @@
 
 mod hooks;
 mod report;
+mod session;
 
 use std::{
     env, fs,
@@ -186,6 +187,7 @@ fn run_check(
         paths,
         explicit_config: config,
         changed: changes.as_ref(),
+        commit_configs: None,
     })?;
     match format {
         Format::Text => {

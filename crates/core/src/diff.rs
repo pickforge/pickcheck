@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +15,19 @@ const REMOVED_GIT_ENV: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_COUNT",
+    // Pathspec magic such as `:(literal)` must keep its meaning.
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 ];
+
+/// The pathspec that matches every repository config.
+const REPO_CONFIGS: &str = ":(glob)**/.pickcheck.json";
+
+/// Repository roots already located, by the directory asked for. The root
+/// of a directory does not change while the process runs.
+static ROOTS: Mutex<BTreeMap<PathBuf, Option<PathBuf>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineRange {
@@ -42,6 +55,75 @@ pub struct ChangedFiles {
     /// every base read.
     pub base: Option<String>,
     pub fallback: bool,
+}
+
+/// The paths that `git diff --name-status` lists.
+#[derive(Clone, Debug, Default)]
+pub struct DiffStatus {
+    /// Renamed files, new path to old path.
+    pub renames: BTreeMap<PathBuf, PathBuf>,
+    /// Every path, old and new, including deletions, pure renames, and empty
+    /// files that have no hunks.
+    pub touched: Vec<PathBuf>,
+}
+
+/// Limits a diff. No pathspec means the whole tree.
+#[derive(Clone, Copy, Debug)]
+pub enum Pathspec<'a> {
+    /// One path relative to the repository root, matched literally.
+    File(&'a Path),
+    /// Every `.pickcheck.json` in the tree.
+    RepoConfigs,
+}
+
+impl Pathspec<'_> {
+    fn arg(self) -> String {
+        match self {
+            Self::File(path) => format!(":(literal){}", slash_path(path)),
+            Self::RepoConfigs => REPO_CONFIGS.to_owned(),
+        }
+    }
+}
+
+/// A Git work tree and the commit `HEAD` names.
+#[derive(Clone, Debug)]
+pub struct Repository {
+    /// The physical root.
+    pub root: PathBuf,
+    pub head: String,
+}
+
+/// The repository around `cwd` with its `HEAD` commit, from one Git command.
+/// `None` outside a repository and in one without commits.
+pub fn repository(cwd: &Path) -> Result<Option<Repository>> {
+    let lines = git_line(
+        cwd,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--verify",
+            "--quiet",
+            "HEAD^{commit}",
+        ],
+    )?;
+    let Some((root, head)) = lines.as_deref().and_then(|text| text.split_once('\n')) else {
+        return Ok(None);
+    };
+    let root = physical(Path::new(root.trim()));
+    remember_root(cwd, Some(root.clone()));
+    Ok(Some(Repository {
+        root,
+        head: head.trim().to_owned(),
+    }))
+}
+
+/// The merge base of `commit` and `HEAD`, or `None` when `commit` names no
+/// commit or the two share no history.
+pub fn merge_base_with_head(repo_root: &Path, commit: &str) -> Result<Option<String>> {
+    if commit.is_empty() || commit.starts_with('-') {
+        return Ok(None);
+    }
+    git_line(repo_root, &["merge-base", commit, "HEAD"])
 }
 
 /// A file's content at the merge base.
@@ -82,20 +164,36 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
     }
     let base = base.map(|base| merge_base(&repo_root, base)).transpose()?;
     let from = base.clone().unwrap_or_else(|| "HEAD".to_owned());
-    let hunks = git_diff(&repo_root, &from, &["--unified=0"])?;
-    // Name-status lists deletions, pure renames, and empty files, which have
-    // no hunks, and it never quotes paths.
-    let (renames, touched) =
-        parse_name_status(&git_diff(&repo_root, &from, &["--name-status", "-z"])?);
+    let spans = diff_spans(&repo_root, &from, &[])?;
+    let DiffStatus { renames, touched } = diff_status(&repo_root, &from, &[])?;
     Ok(ChangedFiles {
-        spans: parse_diff_hunks(&hunks),
-        untracked: untracked(&repo_root)?,
+        spans,
+        untracked: untracked_files(&repo_root)?,
         renames,
         touched,
         base,
         repo_root,
         fallback: false,
     })
+}
+
+/// The changed line ranges of each file from `from` to the working tree.
+pub fn diff_spans(
+    repo_root: &Path,
+    from: &str,
+    paths: &[Pathspec<'_>],
+) -> Result<BTreeMap<PathBuf, Vec<LineRange>>> {
+    let hunks = git_diff(repo_root, from, &["--unified=0"], paths)?;
+    Ok(parse_diff_hunks(&hunks))
+}
+
+/// The paths that differ from `from` to the working tree. Name-status lists
+/// deletions, pure renames, and empty files, which have no hunks, and it
+/// never quotes paths. A rename is found only when both paths are in
+/// `paths`.
+pub fn diff_status(repo_root: &Path, from: &str, paths: &[Pathspec<'_>]) -> Result<DiffStatus> {
+    let output = git_diff(repo_root, from, &["--name-status", "-z"], paths)?;
+    Ok(parse_name_status(&output))
 }
 
 /// Reads `path`, relative to the repository root, at `commit` without
@@ -112,29 +210,71 @@ pub fn base_blob(repo_root: &Path, commit: &str, path: &Path) -> BaseBlob {
         _ => return BaseBlob::Unreadable,
     };
     let listing = String::from_utf8_lossy(&listing);
-    let Some(meta) = listing.split('\0').find_map(|entry| {
-        entry
-            .split_once('\t')
-            .filter(|(_, name)| *name == path)
-            .map(|(meta, _)| meta)
-    }) else {
+    let Some(object) =
+        tree_entries(&listing).find_map(|(object, name)| (name == path).then_some(object))
+    else {
         return BaseBlob::Missing;
     };
-    // `<mode> <type> <object>`
-    let mut fields = meta.split(' ').skip(1);
-    let (Some("blob"), Some(object)) = (fields.next(), fields.next()) else {
-        return BaseBlob::Unreadable;
-    };
+    object
+        .and_then(|object| read_blob(repo_root, object))
+        .map_or(BaseBlob::Unreadable, BaseBlob::Content)
+}
+
+/// Every entry named `name` in the tree of `commit`, by its directory
+/// relative to the repository root: the blob's object name, or `None` for an
+/// entry that is not a file. One `ls-tree` lists the whole tree.
+pub(crate) fn named_entries(
+    repo_root: &Path,
+    commit: &str,
+    name: &str,
+) -> Result<BTreeMap<PathBuf, Option<String>>> {
+    let output = git_command(repo_root)
+        .args(["ls-tree", "-r", "-z", commit])
+        .output()
+        .context("failed to execute git ls-tree")?;
+    if !output.status.success() {
+        bail!("cannot list the tree of {commit}");
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(tree_entries(&listing)
+        .filter_map(|(object, path)| {
+            let (directory, file) = path.rsplit_once('/').unwrap_or(("", path));
+            (file == name).then(|| (git_path(directory), object.map(str::to_owned)))
+        })
+        .collect())
+}
+
+/// `ls-tree -z` entries, `<mode> <type> <object>\t<path>`, as the object
+/// name of a blob (`None` for other types) and the path.
+fn tree_entries(listing: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
+    listing.split('\0').filter_map(|entry| {
+        let (meta, path) = entry.split_once('\t')?;
+        let mut fields = meta.split(' ').skip(1);
+        let object = match (fields.next(), fields.next()) {
+            (Some("blob"), Some(object)) => Some(object),
+            _ => None,
+        };
+        Some((object, path))
+    })
+}
+
+/// The content of blob `object`, or `None` when Git cannot read it.
+pub(crate) fn read_blob(repo_root: &Path, object: &str) -> Option<Vec<u8>> {
     match git_command(repo_root)
         .args(["cat-file", "blob", object])
         .output()
     {
-        Ok(output) if output.status.success() => BaseBlob::Content(output.stdout),
-        _ => BaseBlob::Unreadable,
+        Ok(output) if output.status.success() => Some(output.stdout),
+        _ => None,
     }
 }
 
-fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
+fn git_diff(
+    repo_root: &Path,
+    from: &str,
+    format: &[&str],
+    paths: &[Pathspec<'_>],
+) -> Result<String> {
     let output = git_command(repo_root)
         .args([
             "-c",
@@ -155,6 +295,7 @@ fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
         ])
         .args(format)
         .args([from, "--"])
+        .args(paths.iter().map(|path| path.arg()))
         .output()
         .context("failed to execute git diff")?;
     if !output.status.success() {
@@ -168,7 +309,7 @@ fn git_diff(repo_root: &Path, from: &str, format: &[&str]) -> Result<String> {
 
 /// Reads `git diff --name-status -z` fields: a status, then one path, or the
 /// old and new paths for a rename or copy.
-fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>) {
+fn parse_name_status(output: &str) -> DiffStatus {
     let mut renames = BTreeMap::new();
     let mut touched = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
@@ -184,19 +325,35 @@ fn parse_name_status(output: &str) -> (BTreeMap<PathBuf, PathBuf>, Vec<PathBuf>)
         }
         touched.push(path);
     }
-    (renames, touched)
+    DiffStatus { renames, touched }
 }
 
 pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
+    if let Some(root) = lock_roots().get(cwd) {
+        return Ok(root.clone());
+    }
     let output = git_command(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("failed to locate Git repository root")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
-    Ok(Some(physical(Path::new(root.trim()))))
+    let root = if output.status.success() {
+        let root = String::from_utf8(output.stdout).context("Git repository root was not UTF-8")?;
+        Some(physical(Path::new(root.trim())))
+    } else {
+        None
+    };
+    remember_root(cwd, root.clone());
+    Ok(root)
+}
+
+fn remember_root(cwd: &Path, root: Option<PathBuf>) {
+    lock_roots().insert(cwd.to_path_buf(), root);
+}
+
+fn lock_roots() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Option<PathBuf>>> {
+    ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The physical spelling of an existing path: symbolic links and Windows
@@ -298,7 +455,20 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
-fn untracked(cwd: &Path) -> Result<Vec<PathBuf>> {
+/// Whether Git ignores `path`, relative to the repository root: an untracked
+/// path that a `.gitignore` or exclude rule matches. A tracked path is never
+/// ignored.
+pub fn is_ignored(repo_root: &Path, path: &Path) -> Result<bool> {
+    let output = git_command(repo_root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(slash_path(path))
+        .output()
+        .context("failed to execute git check-ignore")?;
+    Ok(output.status.success())
+}
+
+/// The untracked files that Git does not ignore.
+pub fn untracked_files(cwd: &Path) -> Result<Vec<PathBuf>> {
     let output = git_command(cwd)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()
@@ -371,7 +541,7 @@ mod tests {
     #[test]
     fn name_status_maps_renames_and_lists_every_path() {
         let output = "M\0kept.js\0R087\0old dir/a.js\0new\tdir/a.js\0C100\0src.js\0copy.js\0D\0gone.js\0A\0added.js\0";
-        let (renames, touched) = parse_name_status(output);
+        let DiffStatus { renames, touched } = parse_name_status(output);
         assert_eq!(
             renames,
             BTreeMap::from([(

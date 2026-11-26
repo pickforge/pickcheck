@@ -690,13 +690,15 @@ fn base_units_that_were_too_deep_count_as_missing() {
         deep_function_then("function bad(a, b, c, d, e, f, g) { return b; }\n"),
     )
     .unwrap();
-    for event in ["PostToolUse", "Stop"] {
-        let input = serde_json::json!({
-            "hook_event_name": event, "session_id": "deep", "cwd": root,
+    let input = |event: &str, session: &str| {
+        serde_json::json!({
+            "hook_event_name": event, "session_id": session, "cwd": root,
             "tool_name": "Edit", "tool_input": {"file_path": root.join("deep.js")}
         })
-        .to_string();
-        let hook = hook_output(state.path(), &input);
+        .to_string()
+    };
+    for event in ["PostToolUse", "Stop"] {
+        let hook = hook_output(state.path(), &input(event, ""));
         assert!(hook.status.success(), "{event}");
         let value: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
         let reason = value["reason"].as_str().unwrap();
@@ -707,6 +709,18 @@ fn base_units_that_were_too_deep_count_as_missing() {
         assert!(
             reason.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
             "{event}: {reason}"
+        );
+    }
+    // In a session `bad` is unchanged against the anchor, so nothing blocks
+    // and the unverified file is a note.
+    for event in ["PostToolUse", "Stop"] {
+        let hook = hook_output(state.path(), &input(event, "deep"));
+        assert_eq!(hook.status.code(), Some(0), "{event}");
+        assert!(hook.stdout.is_empty(), "{event}");
+        assert_eq!(
+            String::from_utf8_lossy(&hook.stderr),
+            "note: UNVERIFIED deep.js  syntax nesting too deep to measure\n",
+            "{event}"
         );
     }
 }
@@ -994,6 +1008,7 @@ fn stop_loop_guard_blocks_three_then_releases_without_reset() {
 #[test]
 fn both_hook_commands_parse_current_post_tool_input() {
     let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
     let file = dir.path().join("bad.js");
     fs::write(&file, "function bad(x) { return x; }\n").unwrap();
     git(dir.path(), &["init", "-q"]);
@@ -1011,19 +1026,7 @@ fn both_hook_commands_parse_current_post_tool_input() {
         let input = serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"test",
             "cwd":dir.path(), "tool_name":tool, "tool_input":tool_input})
         .to_string();
-        let mut child = binary()
-            .args(["hook", harness])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = hook_output_for(state.path(), harness, &input);
         assert!(output.status.success());
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["decision"], "block");

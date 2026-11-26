@@ -3,13 +3,13 @@
 
 use std::{cmp::Reverse, collections::BTreeMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{FunctionMetrics, Metric, ParsedSource};
 
 const ANONYMOUS: &str = "<anonymous>";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     New,
