@@ -367,7 +367,7 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
         return pass(input, stop);
     };
     if !stop {
-        return emit_feedback(harness, &report, false);
+        return emit_feedback(harness, report, false);
     }
     let max = outcome.gate.config(cwd)?.hook.max_blocks;
     if increment_counter(&input.session_id)? > max {
