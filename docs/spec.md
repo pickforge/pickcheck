@@ -1096,21 +1096,27 @@ name, or for an `<anonymous>` unit among the base `<anonymous>` units of
 its owner.
 
 A unit that lies wholly in the lines of one hunk that removes no line is an
-added unit. It is no edit of a base unit. An added unit takes only a base
-unit of the same text whose lines one hunk removes wholly while it adds no
-line: then the unit moved with its text. So an added unit never takes, by
-its text, the base unit of a unit that stays or that the session edits where
-it is. After the units that no hunk touches, an added unit looks among the
-base units of its name or owner. An added `<anonymous>` unit that takes none
-does not pair by position and does not count among the `<anonymous>` units
-of its owner. It is `new` unless the last step gives it a base unit. An
-added unit with a name that takes none still pairs by name and order.
+added unit. A base unit is a removed unit when one hunk removes all its
+lines and adds no line. An added unit is no edit of a base unit that stays,
+and a removed unit is no base of a unit that stays. So a unit that no hunk
+touches never takes a removed unit by its text. An added unit takes by its
+text only a removed unit: then the unit moved with its text. After the
+units that no hunk touches, an added unit looks among the removed units of
+its name or owner.
 
-The units that are left pair as under `--base`, with the base units that
-are left. So a unit that the session adds before an old unit is the new
-one, also when it is a copy of the old unit. Last, a unit that no hunk
-touches or an added unit that still has no base unit takes a base unit of
-the same text that pairs with no measured unit, whatever its name or owner.
+The units that are left pair as under `--base`, with two limits. For units
+with a name, the units that stay pair first with the base units that stay,
+and the added units with the removed units. Then the units that are left
+pair by name and order alone. For `<anonymous>` units, an added unit and a
+removed unit do not pair by position and do not count among the
+`<anonymous>` units of their owner. So a unit that the session adds before
+an old unit is the new one, also when it is a copy of the old unit, and
+also when the session edits the old unit where it is. A unit that grows
+where it is does not take the place of a removed unit. Last, a unit that
+still has no base unit takes a base unit of the same text that pairs with no
+measured unit, whatever its name or owner: a unit that no hunk touches takes
+one that stays, and an added unit a removed one. An added `<anonymous>`
+unit that takes none is `new`.
 Old debt that the session leaves as it was therefore neither blocks nor is
 listed, while a change that the hunks miss still counts.
 
@@ -1193,7 +1199,8 @@ can show the edited unit as added lines, and an edited `<anonymous>` unit is
 then `new`. A unit that moves with its text is `new` when the hunk that
 removes its old lines also adds lines, as when the session edits the unit
 beside those lines or puts another unit in their place. The `<anonymous>`
-units of that hunk can then be `unmatched`.
+units of that hunk can then be `unmatched`. An `<anonymous>` unit that moves
+into lines of a hunk that also removes lines is `unmatched`.
 
 ### `init`
 

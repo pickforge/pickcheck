@@ -1437,6 +1437,14 @@ fn an_added_closure_blocks_also_when_another_closure_is_removed() {
     let base = file(&[on("data", "a"), on("close", "b")]);
     let one = "  worker.on(\"data\", (a) => a);\n".to_owned();
     let flush = "  worker.flush();\n".to_owned();
+    let open = "  worker.open();\n".to_owned();
+    let clean = |event: &str| format!("  worker.on(\"{event}\", (x) => x);\n");
+    // A closure with seven parameters on lines of their own, between marks.
+    let wide = |event: &str, before: &str, after: &str| {
+        format!(
+            "  worker.on(\"{event}\", (\n    a,\n{before}    b, c, d, e, f, g,\n{after}  ) => a);\n"
+        )
+    };
     let eight = |event: &str| format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g, h) => a);\n");
     // The base content, the content after the session's edit, and the
     // number of violations that block.
@@ -1484,7 +1492,8 @@ fn an_added_closure_blocks_also_when_another_closure_is_removed() {
             "owner",
             named("input", &[on("data", "a")])
                 + &named("output", &[on("close", "b"), flush.clone()]),
-            named("input", &[one]) + &named("output", &[flush, on("data", "a")]),
+            named("input", std::slice::from_ref(&one))
+                + &named("output", &[flush.clone(), on("data", "a")]),
             1,
         ),
         // A closure moves with its text, and the session edits the closure
@@ -1495,6 +1504,72 @@ fn an_added_closure_blocks_also_when_another_closure_is_removed() {
             file(&[on("data", "a"), on("close", "b"), on("end", "c")]),
             file(&[on("close", "b + 1"), on("end", "c"), on("data", "a")]),
             2,
+        ),
+        // A closure grows to seven parameters where it is, a closure with
+        // seven parameters is removed, and clean closures are added.
+        (
+            "grow",
+            file(&[on("data", "b"), flush.clone(), one, open.clone()]),
+            file(&[
+                flush.clone(),
+                on("data", "a"),
+                clean("ready"),
+                open.clone(),
+                clean("end"),
+            ]),
+            1,
+        ),
+        // Comment marks around a closure are removed, and so is a closure.
+        (
+            "bare",
+            file(&[
+                "  /*\n".to_owned(),
+                on("ready", "a"),
+                "  */\n".to_owned(),
+                flush.clone(),
+                on("close", "b"),
+            ]),
+            file(&[on("ready", "a"), flush.clone()]),
+            1,
+        ),
+        // Comment marks in a parameter list are removed, and so is a
+        // closure with the text that the first closure has then.
+        (
+            "marks",
+            file(&[
+                wide("data", "    /*\n", "    */\n"),
+                flush.clone(),
+                wide("close", "", ""),
+            ]),
+            file(&[wide("data", "", ""), flush.clone()]),
+            1,
+        ),
+        // A closure moves to another owner, and its old owner gets a clean
+        // closure in a line that the session edits.
+        (
+            "away",
+            named("input", &[on("data", "a"), flush.clone(), open.clone()])
+                + &named("output", std::slice::from_ref(&open)),
+            named("input", &[flush.clone(), clean("close")])
+                + &named("output", &[open.clone(), on("data", "a")]),
+            0,
+        ),
+        // A closure is removed, and the session edits the closure that
+        // stays, which keeps its seven parameters.
+        (
+            "left",
+            file(&[on("data", "a"), flush.clone(), on("close", "b")]),
+            file(&[flush.clone(), on("close", "b + 1")]),
+            0,
+        ),
+        // A closure moves with its text into a line that the session
+        // replaces. The hunk also removes a line, so the closure is no
+        // added unit and is unmatched.
+        (
+            "into",
+            file(&[on("data", "a"), flush.clone(), open]),
+            file(&[flush, on("data", "a")]),
+            1,
         ),
     ];
     for (session, base, current, violations) in cases {
@@ -1569,17 +1644,34 @@ fn old_debt_in_a_crlf_checkout_keeps_its_base() {
 #[test]
 fn a_copy_of_old_debt_under_the_same_name_blocks() {
     let old = params("old", 7);
-    let (dir, state) = repo(&[("a.js", &format!("{old}{}", simple("a")))]);
-    let root = dir.path();
-    start(&state, root, "copy");
-    let content = fs::read_to_string(root.join("a.js")).unwrap();
-    fs::write(root.join("a.js"), format!("{old}{content}")).unwrap();
-    let reason = block_reason(&edit(&state, root, "copy", "a.js"));
-    assert!(
-        reason.contains("FAIL a.js  1 function, 1 violation"),
-        "{reason}"
-    );
-    block_reason(&stop(&state, root, "copy"));
+    let base = format!("{old}{}", simple("a"));
+    let inner = |count| params("old", count).replace('\n', "\n  ");
+    let outer = |name: &str, lines: &str| {
+        format!("function {name}() {{\n  {lines}return {name}.length;\n}}\n\n")
+    };
+    // The base content and the content after the session's edit.
+    let cases = [
+        ("copy", base.clone(), format!("{old}{base}")),
+        // The old function is cut to one parameter where it is, and the
+        // copy goes into the function before it.
+        (
+            "cut",
+            outer("first", "") + &outer("second", &inner(7)),
+            outer("first", &(inner(7) + "register(old);\n  ")) + &outer("second", &inner(1)),
+        ),
+    ];
+    for (session, base, current) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let reason = block_reason(&edit(&state, root, session, "a.js"));
+        assert!(
+            reason.contains("FAIL a.js  1 function, 1 violation"),
+            "{session}: {reason}"
+        );
+        block_reason(&stop(&state, root, session));
+    }
 }
 
 /// Past 100 recorded files that no longer exist, the names diff of an edit

@@ -214,6 +214,10 @@ impl Texts<'_> {
     fn added(&self, index: usize) -> bool {
         self.added.get(index) == Some(&true)
     }
+
+    fn removed(&self, base_index: usize) -> bool {
+        self.removed.get(base_index) == Some(&true)
+    }
 }
 
 /// The text of a unit with LF line ends.
@@ -302,10 +306,26 @@ fn pair_named(current: &[Key<'_>], base: &[Key<'_>], texts: &Texts<'_>, pairs: &
         }
     }
     for (name, members) in &names {
-        let (rest, base_rest) = pairs.rest(members, base_of(name));
-        for (index, base_index) in rest.into_iter().zip(base_rest) {
-            pairs.pair(index, base_index);
-        }
+        let base_members = base_of(name);
+        let (added, placed): (Vec<_>, Vec<_>) =
+            (members.iter().copied()).partition(|&index| texts.added(index));
+        let (removed, kept): (Vec<_>, Vec<_>) =
+            (base_members.iter().copied()).partition(|&base_index| texts.removed(base_index));
+        // A unit that stays is the edit of a base unit that stays, and an
+        // added unit of a base unit that a hunk removes. The name alone
+        // pairs the units that are left.
+        pair_by_order(&placed, &kept, pairs);
+        pair_by_order(&added, &removed, pairs);
+        pair_by_order(members, base_members, pairs);
+    }
+}
+
+/// Pairs the units of `members` that have no base unit, in their order,
+/// with the units of `base_members` that no unit pairs with.
+fn pair_by_order(members: &[usize], base_members: &[usize], pairs: &mut Pairs) {
+    let (rest, base_rest) = pairs.rest(members, base_members);
+    for (index, base_index) in rest.into_iter().zip(base_rest) {
+        pairs.pair(index, base_index);
     }
 }
 
@@ -337,7 +357,8 @@ fn pair_anonymous(current: &[Key<'_>], base: &[Key<'_>], texts: &Texts<'_>, pair
 
 /// Pairs the closures of one owner that have no base unit by position with
 /// the base closures of the owner that are left, when their counts match.
-/// An `Added` closure has no place among them.
+/// An `Added` closure has no place among them, and neither has a base
+/// closure whose lines one hunk removes: an edit keeps neither.
 fn pair_by_position(
     texts: &Texts<'_>,
     members: &[usize],
@@ -347,7 +368,10 @@ fn pair_by_position(
     let placed = (members.iter().copied())
         .filter(|&index| !texts.added(index))
         .collect::<Vec<_>>();
-    let (rest, base_rest) = pairs.rest(&placed, base_members);
+    let kept = (base_members.iter().copied())
+        .filter(|&base_index| !texts.removed(base_index))
+        .collect::<Vec<_>>();
+    let (rest, base_rest) = pairs.rest(&placed, &kept);
     for (position, &index) in rest.iter().enumerate() {
         if base_rest.len() == rest.len() {
             pairs.pair(index, base_rest[position]);
@@ -388,13 +412,13 @@ struct Round<'a> {
 /// Pairs each unit of `members` that claims in this round and has no base
 /// unit with the first unit of `base_members` that has its text and that no
 /// unit pairs with. In the round of the `Added` units, only a base unit
-/// whose lines one hunk removes can be claimed.
+/// whose lines one hunk removes can be claimed, and in the other round only
+/// a base unit that stays.
 fn claim_by_text(round: Round<'_>, members: &[usize], base_members: &[usize], pairs: &mut Pairs) {
     let texts = round.texts;
     let mut free = BTreeMap::<&str, VecDeque<usize>>::new();
     for &base_index in base_members {
-        let moved = texts.removed.get(base_index) == Some(&true);
-        if pairs.taken.contains(&base_index) || round.added && !moved {
+        if pairs.taken.contains(&base_index) || round.added != texts.removed(base_index) {
             continue;
         }
         if let Some(text) = text_of(&texts.base, base_index) {
@@ -864,6 +888,15 @@ mod tests {
         base: &[(&str, &str)],
         changes: &[UnitChange],
     ) -> Vec<Pairing> {
+        let hunks = Hunks {
+            changes,
+            ..Hunks::default()
+        };
+        by_hunks(current, base, hunks)
+    }
+
+    /// `by_change` with the base units whose lines a hunk removes.
+    fn by_hunks(current: &[(&str, &str)], base: &[(&str, &str)], hunks: Hunks<'_>) -> Vec<Pairing> {
         let (source, parsed) = file(current);
         let (base_source, base_parsed) = file(base);
         let current = Text {
@@ -874,11 +907,61 @@ mod tests {
             source: &base_source,
             parsed: &base_parsed,
         };
-        let hunks = Hunks {
-            changes,
-            ..Hunks::default()
-        };
         pair_units_by_text(current, base, hunks)
+    }
+
+    #[test]
+    fn a_unit_that_stays_and_a_base_unit_that_a_hunk_removes_do_not_pair_first() {
+        use Pairing::{New, Paired};
+        use UnitChange::{Added, Touched};
+        let hunks = |changes, removed| Hunks { changes, removed };
+        // A copy before a unit that is edited where it is: the edit keeps
+        // the base unit, and the copy is new.
+        let base = [("v", "old")];
+        let current = [("v", "old"), ("v", "edited")];
+        assert_eq!(
+            by_hunks(&current, &base, hunks(&[Added, Touched], &[false])),
+            [New, Paired(0)]
+        );
+        assert_eq!(
+            by_change(&current, &base, &[Touched, Touched]),
+            [Paired(0), New]
+        );
+        // The first of two base units is removed, and the second is edited.
+        let base = [("v", "gone"), ("v", "old")];
+        let edited = [("v", "edited")];
+        assert_eq!(
+            by_hunks(&edited, &base, hunks(&[Touched], &[true, false])),
+            [Paired(1)]
+        );
+        // An added unit is the edit of the base unit that a hunk removes.
+        let current = [("v", "moved"), ("v", "edited")];
+        assert_eq!(
+            by_hunks(&current, &base, hunks(&[Added, Touched], &[true, false])),
+            [Paired(0), Paired(1)]
+        );
+        // The name alone pairs the units that are left.
+        assert_eq!(
+            by_hunks(&edited, &base[..1], hunks(&[Touched], &[true])),
+            [Paired(0)]
+        );
+        assert_eq!(
+            by_hunks(&edited, &base[..1], hunks(&[Added], &[false])),
+            [Paired(0)]
+        );
+        // A unit that no hunk touches does not take by its text a base unit
+        // that a hunk removes. It pairs by its place.
+        let base = [("f", &["(a) => {}", "(a, b) => {}"][..])];
+        let current = [("f", &["(a, b) => {}"][..])];
+        let changes = [Touched, UNTOUCHED];
+        assert_eq!(
+            pair_owners_with(&current, &base, hunks(&changes, &[false, false, true])),
+            [Paired(0), Paired(1)]
+        );
+        assert_eq!(
+            pair_owners(&current, &base, &changes),
+            [Paired(0), Paired(2)]
+        );
     }
 
     #[test]
@@ -944,7 +1027,7 @@ mod tests {
 
     #[test]
     fn an_added_closure_does_not_pair_by_position() {
-        use Pairing::{New, Paired};
+        use Pairing::{New, Paired, Unmatched};
         use UnitChange::{Added, Touched};
         // One closure is added and another one is removed: the added one is
         // new, although the owner has as many closures as before.
@@ -985,8 +1068,32 @@ mod tests {
             pair_owners(&current, &base, &[Touched, Touched, Touched, Added]),
             [Paired(0), Paired(1), Paired(2), New]
         );
+        // A closure whose lines a hunk removes is the base of no edit. So
+        // a closure that grows does not take the place of a removed one,
+        // and the closures that stay pair when one is removed.
+        let base = [("f", &["(data) => b", "(close) => a"][..])];
+        let gone = |changes| Hunks {
+            changes,
+            removed: &[false, true, false],
+        };
+        let current = [("f", &["(close) => A", "(ready) => a", "(end) => a"][..])];
+        let changes = [Touched, Touched, Touched, Added];
+        assert_eq!(
+            pair_owners_with(&current, &base, gone(&changes)),
+            [Paired(0), Unmatched, Unmatched, New]
+        );
+        let current = [("f", &["(close) => A"][..])];
+        assert_eq!(
+            pair_owners_with(&current, &base, gone(&[Touched, Touched])),
+            [Paired(0), Paired(2)]
+        );
+        assert_eq!(
+            pair_owners(&current, &base, &[Touched, Touched]),
+            [Paired(0), Unmatched]
+        );
         // A copy of a closure that stays is new, also before the closure
         // and when another closure is removed.
+        let base = [("f", &["(data) => a", "(close) => b"][..])];
         let current = [("f", &["(data) => a", "(data) => a", "(close) => b"][..])];
         assert_eq!(
             pair_owners(&current, &base, &[Touched, Added, UNTOUCHED, UNTOUCHED]),

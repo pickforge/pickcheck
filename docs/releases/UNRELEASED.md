@@ -93,7 +93,10 @@
   class is renamed and a wrapper is added under the old name. An anonymous
   function in lines that a hunk only adds is new unless it moved with its
   text, so it no longer pairs by position with a function that the same
-  edit removes. (#74)
+  edit removes. A function that the session removes is no base of a
+  function that stays: a function that grows where it is no longer passes
+  in the place of a removed one, and a copy of a function that the session
+  edits where it is blocks, also under the same name. (#74)
 - `check --changed`, `check --base`, and hooks now read each hunk by the line
   counts in its header, so an added line such as `++ /dev/null` inside a
   comment no longer drops the rest of the file's changes. A path that Git
