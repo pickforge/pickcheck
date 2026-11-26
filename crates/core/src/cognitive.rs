@@ -5,7 +5,9 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::language::{Language, has_operator, is_dart_handler, is_function, node_text};
+use crate::language::{
+    Language, Wrapper, exceeds_depth_limit, has_operator, is_dart_handler, is_function, node_text,
+};
 
 /// Header fields stay at the construct's own nesting level; every other part
 /// of a structural construct sits one level deeper.
@@ -388,7 +390,7 @@ impl Template<'_> {
     }
 
     fn expression(&self, text: &str, level: usize) -> usize {
-        let wrapped = format!("function expression() {{ return ({text}); }}");
+        let (wrapped, range) = Wrapper::Expression.wrap(text);
         let mut parser = Parser::new();
         if parser.set_language(&self.script.grammar()).is_err() {
             return 0;
@@ -396,6 +398,9 @@ impl Template<'_> {
         let Some(tree) = parser.parse(&wrapped, None) else {
             return 0;
         };
+        if exceeds_depth_limit(&tree, range) {
+            return 0;
+        }
         let Some(function) = first_function(tree.root_node(), self.script) else {
             return 0;
         };
@@ -438,7 +443,7 @@ fn field_of(parent: Node<'_>, child: Node<'_>) -> Option<&'static str> {
         .and_then(|index| parent.field_name_for_child(index as u32))
 }
 
-fn first_function(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+pub(crate) fn first_function(node: Node<'_>, language: Language) -> Option<Node<'_>> {
     if is_function(language, node.kind()) {
         return Some(node);
     }

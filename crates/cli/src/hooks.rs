@@ -1,11 +1,11 @@
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
-use pickcheck_core::{ScanOptions, changed_files, load_config, physical, scan};
+use pickcheck_core::{ScanOptions, ScanResult, changed_files, load_config, physical, scan};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -168,6 +168,13 @@ fn file_path(input: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Notes the unverified files of a run that does not block on stderr. A
+/// failed write is ignored, so it never changes the hook's result.
+fn note_unverified(result: &ScanResult) {
+    let notes = report::unverified_notes(result);
+    let _ = io::stderr().write_all(notes.as_bytes());
+}
+
 fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> Result<u8> {
     let cwd = working_directory(input);
     let result = scan(&ScanOptions {
@@ -177,6 +184,7 @@ fn report_post_edit(harness: Harness, input: &HookInput, paths: &[PathBuf]) -> R
         changed: None,
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         return Ok(0);
     }
     emit_feedback(
@@ -198,6 +206,7 @@ fn report_post_changed(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         return Ok(0);
     }
     emit_feedback(
@@ -220,6 +229,7 @@ fn report_stop(harness: Harness, input: &HookInput) -> Result<u8> {
         changed: Some(&changes),
     })?;
     if result.violations.is_empty() {
+        note_unverified(&result);
         reset_counter(&input.session_id)?;
         return Ok(0);
     }
