@@ -1024,6 +1024,143 @@ fn a_file_that_git_treats_as_binary_still_shows_its_changes() {
     }
 }
 
+/// Hunks can miss a change: an encoding attribute changes what Git diffs,
+/// a body line can look like a file header, and a pure rename has no hunk.
+/// Every file that the names diff lists is scanned against its base, so a
+/// new function that no hunk touches still blocks.
+#[test]
+fn a_change_that_the_hunks_miss_still_blocks() {
+    // The session's change, and the file that it edits.
+    type Missed = (&'static str, fn(&Path), &'static str);
+    let mut cases: Vec<Missed> = vec![
+        (
+            "encoding",
+            |root| {
+                let mut grown = format!("{}{}", simple("a"), params("bad", 7));
+                if grown.len() % 2 == 1 {
+                    grown.push('\n');
+                }
+                fs::write(root.join("a.js"), grown).unwrap();
+                let attribute = "*.js working-tree-encoding=UTF-16LE\n";
+                fs::write(root.join(".gitattributes"), attribute).unwrap();
+            },
+            "a.js",
+        ),
+        (
+            "header",
+            |root| {
+                let base = fs::read_to_string(root.join("a.js")).unwrap();
+                let grown = format!("/*\n++ /dev/null\n*/\n{base}// end\n{}", params("bad", 7));
+                fs::write(root.join("a.js"), grown).unwrap();
+            },
+            "a.js",
+        ),
+    ];
+    #[cfg(unix)]
+    cases.extend::<[Missed; 2]>([
+        (
+            "quoted",
+            |root| {
+                git(root, &["mv", "a.js", "we\"ird.js"]);
+                let grown = format!("{}{}", simple("a"), params("bad", 7));
+                fs::write(root.join("we\"ird.js"), grown).unwrap();
+            },
+            "we\"ird.js",
+        ),
+        (
+            "link",
+            |root| {
+                fs::write(root.join("target.txt"), params("bad", 7)).unwrap();
+                std::os::unix::fs::symlink("target.txt", root.join("old.txt")).unwrap();
+                commit_all(root, "a link");
+                git(root, &["mv", "old.txt", "link.js"]);
+            },
+            "link.js",
+        ),
+    ]);
+    for (session, change, file) in cases {
+        let base = format!("{}{}", simple("a"), "\n".repeat(7));
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        change(root);
+        let listed = format!("FAIL {file}  1 function");
+        let reason = block_reason(&edit(&state, root, session, file));
+        assert!(reason.contains(&listed), "{session}: {reason}");
+        let reason = block_reason(&stop(&state, root, session));
+        assert!(reason.contains(&listed), "{session}: {reason}");
+    }
+}
+
+/// A clean filter can make Git report no change at all. The edited file is
+/// plainly tracked and in no diff, so it is scanned against its base, and a
+/// new violation blocks the edit. This reads its base content too.
+#[test]
+fn an_edited_file_that_git_reports_unchanged_is_compared_with_its_base() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "filter");
+    // The filter prints the committed content, so Git sees no change.
+    fs::write(root.join(".git/clean.js"), simple("a")).unwrap();
+    git(root, &["config", "filter.z.clean", "cat .git/clean.js"]);
+    fs::write(root.join(".gitattributes"), "a.js filter=z\n").unwrap();
+    let grown = format!("{}{}", simple("a"), params("bad", 7));
+    fs::write(root.join("a.js"), grown).unwrap();
+    let input = edit_input(root, "filter", &root.join("a.js"));
+    let (output, commands) = traced(&state, &input);
+    let reason = block_reason(&output);
+    assert!(reason.contains("FAIL a.js  1 function"), "{reason}");
+    // Locate, names and untracked for the record, the hunks, the index
+    // entry, the base configs, and the base content.
+    assert_eq!(commands.len(), 8, "{commands:#?}");
+    assert!(commands[4].starts_with("ls-files --stage"), "{commands:#?}");
+}
+
+/// Old debt that the session leaves as it was never blocks and is never
+/// listed, also when the session changes another function of the file, adds
+/// a function of the same name, renames the file, or changes its mode.
+#[test]
+fn old_debt_that_the_session_leaves_as_it_was_is_never_listed() {
+    let old = params("old", 7);
+    let mut cases: Vec<Case> = vec![
+        ("other", |root| {
+            let content = fs::read_to_string(root.join("a.js")).unwrap();
+            fs::write(root.join("a.js"), content.replace("return 1", "return 2")).unwrap();
+        }),
+        ("same name", |root| {
+            let content = fs::read_to_string(root.join("a.js")).unwrap();
+            fs::write(root.join("a.js"), format!("{content}{}", params("old", 1))).unwrap();
+        }),
+        ("rename", |root| git(root, &["mv", "a.js", "b.js"])),
+    ];
+    #[cfg(unix)]
+    cases.push(("mode", |root| {
+        use std::os::unix::fs::PermissionsExt;
+        let file = root.join("a.js");
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }));
+    for (session, change) in cases {
+        let base = format!("{old}{}{}", params("old", 1), simple("a"));
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        change(root);
+        let file = if session == "rename" { "b.js" } else { "a.js" };
+        let output = edit(&state, root, session, file);
+        assert!(
+            output.stdout.is_empty(),
+            "{session}: {}",
+            text(&output.stdout)
+        );
+        assert!(stop(&state, root, session).stdout.is_empty(), "{session}");
+        // Something else blocks: the old function is not listed as `WARN`.
+        fs::write(root.join("new.js"), params("fresh", 7)).unwrap();
+        let reason = block_reason(&stop(&state, root, session));
+        assert!(reason.contains("FAIL new.js  1 function"), "{reason}");
+        assert!(!reason.contains("WARN"), "{session}: {reason}");
+    }
+}
+
 /// Past 100 recorded files that no longer exist, the names diff of an edit
 /// covers the whole tree instead of naming each of them.
 #[test]

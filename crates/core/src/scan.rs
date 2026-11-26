@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
@@ -328,23 +329,65 @@ fn scan_file(
         test_file: Config::matcher(&config.tests.patterns)?.is_match(&matched_path),
     };
     let spans = changed_spans(&matched_path, options.changed);
+    let compared = options.changed.filter(|changed| changed.base.is_some());
+    let measure_untouched =
+        spans.is_some() && compared.is_some_and(|changed| changed.measure_untouched);
     let first = result.violations.len();
     let mut units_of = Vec::new();
+    let mut untouched = vec![false; functions.len()];
     for (index, function) in functions.iter().enumerate() {
-        if spans.is_some_and(|ranges| !touches(function, ranges)) {
+        let touched = spans.is_none_or(|ranges| touches(function, ranges));
+        if !touched && !measure_untouched {
             continue;
         }
-        result.checked += 1;
         add_violations(&context, function, result);
         units_of.resize(result.violations.len() - first, index);
-        result.functions.push((display.clone(), function.clone()));
+        if touched {
+            result.checked += 1;
+            result.functions.push((display.clone(), function.clone()));
+        } else {
+            untouched[index] = true;
+        }
     }
-    if let Some(changed) = options.changed.filter(|changed| changed.base.is_some())
+    if let Some(changed) = compared
         && !units_of.is_empty()
     {
         compare_with_base(changed, &context, &parsed, &units_of, result)?;
     }
+    if measure_untouched {
+        keep_untouched_changes(result, first, &units_of, &untouched, &parsed, &display);
+    }
     Ok(())
+}
+
+/// Drops each violation of a unit that no hunk touches unless its status
+/// is `new` or `worsened`, and counts the untouched units that keep one.
+/// The file's violations are the last `units_of.len()` in `result`.
+fn keep_untouched_changes(
+    result: &mut ScanResult,
+    first: usize,
+    units_of: &[usize],
+    untouched: &[bool],
+    parsed: &ParsedSource,
+    display: &Path,
+) {
+    let mut kept = BTreeSet::new();
+    for (violation, &index) in result.violations.split_off(first).into_iter().zip(units_of) {
+        if untouched[index] {
+            let status = violation.baseline.as_ref().map(|baseline| baseline.status);
+            if !matches!(status, Some(Status::New | Status::Worsened)) {
+                continue;
+            }
+            kept.insert(index);
+        }
+        result.violations.push(violation);
+    }
+    for index in kept {
+        result.checked += 1;
+        result
+            .functions
+            .push((display.to_path_buf(), parsed.functions[index].clone()));
+    }
 }
 
 fn file_config(path: &Path, options: &ScanOptions<'_>) -> Result<Config> {

@@ -354,6 +354,7 @@ impl Snapshot {
             base,
             fallback: false,
             base_reads: None,
+            measure_untouched: false,
         }
     }
 }
@@ -556,20 +557,25 @@ fn session_gate(
             ..Gate::new(mode)
         });
     };
-    let (spans, status) = session_diff(&snapshot, session, &base, edited)?;
+    let (mut spans, status) = session_diff(&snapshot, session, &base, edited)?;
+    // Hunks can miss changed lines, so every file that the names diff lists
+    // with a post-image is scanned, also when it has no hunk.
+    let names = status.as_ref().unwrap_or(&snapshot.status);
+    for path in &names.post_images {
+        spans.entry(path.clone()).or_default();
+    }
     let mut changes = snapshot.changes(spans, status, Some(base.clone()));
+    changes.measure_untouched = true;
     let renames = &changes.renames;
     let kept = |path: &PathBuf| {
         session.contains(path) || renames.get(path).is_some_and(|old| session.contains(old))
     };
     changes.spans.retain(|path, _| kept(path));
     changes.untracked.retain(kept);
-    check_links_whole(&mut changes);
-    if let Some(edited) = edited
-        && edited_outside_diff(&changes, edited)
-    {
-        changes.untracked.push(edited.to_path_buf());
+    if let Some(edited) = edited {
+        add_edited_outside_diff(&mut changes, edited);
     }
+    check_links_whole(&mut changes);
     let configs = base_configs(cwd, &changes, &base, edited)?;
     if configs.is_some() {
         changes.base_reads = Some(BaseReads::default());
@@ -639,16 +645,22 @@ fn base_configs(
     Ok(changed.then_some(configs))
 }
 
-/// Whether `edited` exists, is in no diff, and is not a plainly tracked
-/// file, as an ignored file, a file of a nested repository or a submodule, a
-/// skip-worktree entry, or a link is. Such a file is checked whole with no
-/// base, as an untracked file is. A plainly tracked file in no diff equals
-/// the base, so it has nothing to check.
-fn edited_outside_diff(changes: &ChangedFiles, edited: &Path) -> bool {
+/// Adds `edited` when it exists and is in no diff. A plainly tracked file is
+/// scanned with its base and no touched unit, so only `new` and `worsened`
+/// violations remain; Git can hide a change, for example through a clean
+/// filter. Any other such file, as an ignored file, a file of a nested
+/// repository or a submodule, a skip-worktree entry, or a link, is checked
+/// whole with no base, as an untracked file is.
+fn add_edited_outside_diff(changes: &mut ChangedFiles, edited: &Path) {
     let root = &changes.repo_root;
-    !in_diff(changes, edited)
-        && fs::symlink_metadata(root.join(edited)).is_ok()
-        && !is_plainly_tracked(root, edited)
+    if in_diff(changes, edited) || fs::symlink_metadata(root.join(edited)).is_err() {
+        return;
+    }
+    if is_plainly_tracked(root, edited) {
+        changes.spans.insert(edited.to_path_buf(), Vec::new());
+    } else {
+        changes.untracked.push(edited.to_path_buf());
+    }
 }
 
 /// Whether the diff has a post-image of `path` or lists it as untracked.

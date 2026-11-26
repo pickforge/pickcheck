@@ -882,8 +882,8 @@ Svelte script block that could not be parsed.
 Reads the Claude Code hook JSON from stdin and dispatches on `hook_event_name`:
 
 - `PostToolUse` with `tool_name` `Edit`, `Write`, or `MultiEdit` checks
-  `<tool_input.file_path>`: in a session, the functions of that file that the
-  session changed (see Hook sessions), otherwise the whole file. On violations
+  `<tool_input.file_path>`: in a session, that file compared with the
+  session base (see Hook sessions), otherwise the whole file. On violations
   that block it prints JSON
   `{"decision":"block","reason":"<summary>"}` and exits 0. `<summary>` is the
   `--summary` text report, including its `UNVERIFIED` lines, under the same
@@ -1018,7 +1018,10 @@ at either revision taking part, so a unit paired with a left-out base unit is
 Scope. The base is the merge base of the anchor and `HEAD`. When the anchor
 is `HEAD`, the base is `HEAD` and no merge base is computed. The changed set
 is the diff from the base to the working tree plus untracked files, as under `--base`, restricted to the
-files that the session recorded. A file that the diff renames stays in the
+files that the session recorded. Every file that the names diff from the
+base lists with a post-image, as added, modified, renamed, copied, or
+type-changed, is in the set, also when the hunks show no change in it. A
+file that the diff renames stays in the
 set when the session recorded its old path. A commit that a merge, a pull, or
 a rebase brings in therefore counts only where it touches a recorded file.
 `Stop` and an edit event that names no file check the whole set.
@@ -1029,15 +1032,18 @@ diff from the base lists the edited file, every recorded file that no longer
 exists, and every `.pickcheck.json`. Past 100 such recorded files it covers the
 whole tree. An edit of a file outside the repository around `cwd` checks the
 whole file, exactly as without a session, because that file has no base. A
-file that the diff lists with a post-image and that is a symbolic link on
-disk is checked whole with no base, as an untracked file is, because Git
-diffs the text of the link and not its target. An
+file that the names diff lists with a post-image and that is a symbolic
+link on disk, a pure rename included, is checked whole with no base, as an
+untracked file is, because Git diffs the text of the link and not its
+target. An
 edited file that exists and is in no diff is checked as a whole file with no
 base, as an untracked file is, so its violations are `new` and block with the
 default `hook.fail_on`. The exception is a plainly tracked file: `git ls-files
 --stage -v` lists exactly one stage-0 entry at that exact path, with the tag
-`H` and a regular file mode. Such a file in no diff equals the base and has
-nothing to check. A file that Git ignores, a file of a nested repository or a
+`H` and a regular file mode. Such a file in no diff is compared with the
+base with no touched unit, so only its `new` and `worsened` violations
+remain (see Status). Git can hide a change from every diff, as a clean
+filter does. A file that Git ignores, a file of a nested repository or a
 submodule, a skip-worktree or assume-unchanged entry, and a symbolic link are
 therefore checked whole. So is any file when that `ls-files` fails. A file
 outside the diff that the event does not edit is never checked, and `Stop`
@@ -1054,9 +1060,9 @@ progress. When the base
 is `HEAD`, the names diff against `HEAD` serves as the names diff from the
 base. Otherwise one `merge-base` and one names diff from the base follow. The
 hunks come from one `diff --unified=0 --text` from the base. Each file with a
-violation then reads its base content with one `ls-tree` and one `cat-file`.
-An edited file that exists and is in no diff adds one `ls-files --stage`; it
-has no base to read. When at least one file is checked, one `cat-file --batch
+violation, in a unit that a hunk touches or not, then reads its base
+content with one `ls-tree` and one `cat-file`. An edited file that exists
+and is in no diff adds one `ls-files --stage`. When at least one file is checked, one `cat-file --batch
 --follow-symlinks` reads the base config of every directory from each checked
 file and from `cwd` up to the root, which serves both the comparison and the
 base config. Its request is line-based, so the config paths that hold a
@@ -1064,13 +1070,21 @@ newline are first resolved by one `ls-tree -t` that takes them and their
 directories as arguments; the batch then reads such a config by its object
 name. A link on such a path cannot be read (see Config). The second scan of a config change reads each base content
 that the first scan read from memory. A post-edit or `Stop` event with one
-violating file therefore runs at most 9 commands, and 2 more for each other
-violating file. A config change adds 2 only for each file that violates in
+violating file therefore runs at most 9 commands, 10 when the edited file is
+in no diff, and 2 more for each other violating file. A config change adds 2 only for each file that violates in
 the second scan alone, a config path with a newline adds 1, and an operation
 in progress adds 1.
 
 Status. Every violation in the set is compared with the base, as under
-`--base`. The config key `hook.fail_on` lists the statuses that block, by
+`--base`. Hunks can miss changed lines, for example under an encoding
+attribute, so the hunks do not decide alone which units to check. In a file
+with a base, every unit is measured. A violation of a unit that a hunk
+touches keeps its status. A violation of a unit that no hunk touches is
+kept only when its status is `new` or `worsened`; with any other status it
+is dropped and not listed. Old debt that the session leaves as it was
+therefore neither blocks nor is listed, while a change that the hunks miss
+still counts. A file with no base, untracked or with no readable base
+content, is checked whole. The config key `hook.fail_on` lists the statuses that block, by
 default `new`, `worsened`, and `unmatched`. A block reason lists the other
 violations as `WARN`, but they never block alone. A run with only warnings
 prints nothing and counts as a clean run for the loop guard. The block reason

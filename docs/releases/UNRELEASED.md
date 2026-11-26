@@ -70,8 +70,8 @@
   block only the statuses in the new `hook.fail_on` key, by default
   `["new", "worsened", "unmatched"]`. A legacy violation that an edit leaves
   `unchanged` or `improved` is listed as `WARN` when something else blocks and
-  never blocks alone. `PostToolUse` checks only the functions the session
-  changed in the edited file, not the whole file. To restore the old
+  never blocks alone. `PostToolUse` reports only what the session changed in
+  the edited file, not its old debt. To restore the old
   strictness, set
   `"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}`.
 - When a session changes any `.pickcheck.json`, or a config that a hook
@@ -81,6 +81,13 @@
   config, such as one in a renamed directory or a nested repository, still
   applies. The block reason carries a note that names the config side, and
   `hook.max_blocks` comes from the base. (#53)
+- In a session, hooks no longer trust Git's hunks alone to find the changed
+  functions. Every file that the session diff lists, a pure rename or a mode
+  change included, is measured whole against its base. A function that no
+  hunk touches blocks only when it is new or worsened, so a change that an
+  encoding attribute, a clean filter, or a renamed link hides from the hunks
+  still blocks, and old debt that the session leaves as it was is still
+  never listed. A file with any violation now reads its base content. (#53)
 - `check --changed`, `check --base`, and hooks now diff every file as text.
   Before, a `-diff` or `binary` attribute, or a NUL byte in a source file,
   made Git report the file as binary with no changed lines, so its changes

@@ -52,18 +52,24 @@ are changed or untracked at that moment. During an unfinished merge,
 cherry-pick, revert, or rebase, an event records only the edited file and the
 unmerged files. `Stop` checks the diff from the merge
 base of the anchor and `HEAD` to the working tree, restricted to the recorded
-files. A post-edit event checks the functions that the session changed in the
-edited file. An edit of a file outside the repository checks the whole file,
-as without a session. An edit of a file that is in no diff checks the whole
-file with no base, so its violations are new, unless the index tracks it as a
-plain file. This covers ignored files, files of nested repositories and
+files. A post-edit event checks the edited file. Every file that the names
+diff lists with a post-image is checked, also when Git shows no changed
+line in it. Its units are compared with the base. A violation of a unit
+that the hunks do not touch counts only when it is new or worsened, so old
+debt that the session leaves as it was is never listed. An edit of a file
+outside the repository checks the whole file, as without a session. An edit
+of a file that is in no diff checks the whole file with no base, so its
+violations are new, unless the index tracks it as a plain file. Such a file
+is compared with the base, because Git can hide a change, as a clean filter
+does. This covers ignored files, files of nested repositories and
 submodules, skip-worktree entries, and links. A changed link in the diff is
-also checked whole with no base, because Git diffs the link text and not its
-target. Files outside the diff that the
+also checked whole with no base, a pure rename included, because Git diffs
+the link text and not its target. Files outside the diff that the
 session does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 A post-edit or `Stop` event with one violating file runs at most 9 Git
-commands, and 2 more for each other violating file. A config change adds 2
+commands, 10 when the edited file is in no diff, and 2 more for each other
+violating file. A config change adds 2
 only for each file that violates with the working-tree config alone. An
 unfinished merge, cherry-pick, revert, or rebase adds 1.
 

@@ -61,6 +61,11 @@ pub struct ChangedFiles {
     /// When set, each base read is kept, so a second scan of this diff runs
     /// no Git command twice.
     pub base_reads: Option<BaseReads>,
+    /// Measure every unit of a file with a base, not only the units that
+    /// the hunks touch. A violation of a unit that no hunk touches is kept
+    /// only when its status is `new` or `worsened`. Hunks can miss changed
+    /// lines, so the hook session gate does not rely on them alone.
+    pub measure_untouched: bool,
 }
 
 /// The base reads of one diff, shared by its clones.
@@ -92,6 +97,9 @@ pub struct DiffStatus {
     /// Every path, old and new, including deletions, pure renames, and empty
     /// files that have no hunks.
     pub touched: Vec<PathBuf>,
+    /// Every path that has a post-image: each listed path except a deleted
+    /// one, and the new path of a rename or copy.
+    pub post_images: Vec<PathBuf>,
 }
 
 /// Limits a diff. No pathspec means the whole tree.
@@ -257,7 +265,9 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
     let base = base.map(|base| merge_base(&repo_root, base)).transpose()?;
     let from = base.clone().unwrap_or_else(|| "HEAD".to_owned());
     let spans = diff_spans(&repo_root, &from, &[])?;
-    let DiffStatus { renames, touched } = diff_status(&repo_root, &from, &[])?;
+    let DiffStatus {
+        renames, touched, ..
+    } = diff_status(&repo_root, &from, &[])?;
     Ok(ChangedFiles {
         spans,
         untracked: untracked_files(&repo_root)?,
@@ -267,6 +277,7 @@ fn collect_changes(cwd: &Path, base: Option<&str>) -> Result<ChangedFiles> {
         repo_root,
         fallback: false,
         base_reads: None,
+        measure_untouched: false,
     })
 }
 
@@ -581,6 +592,7 @@ fn git_diff(
 fn parse_name_status(output: &str) -> DiffStatus {
     let mut renames = BTreeMap::new();
     let mut touched = Vec::new();
+    let mut post_images = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
         let path = git_path(path);
@@ -590,11 +602,18 @@ fn parse_name_status(output: &str) -> DiffStatus {
             if status.starts_with('R') {
                 renames.insert(new.clone(), path.clone());
             }
+            post_images.push(new.clone());
             touched.push(new);
+        } else if !status.starts_with('D') {
+            post_images.push(path.clone());
         }
         touched.push(path);
     }
-    DiffStatus { renames, touched }
+    DiffStatus {
+        renames,
+        touched,
+        post_images,
+    }
 }
 
 pub fn repository_root(cwd: &Path) -> Result<Option<PathBuf>> {
@@ -824,7 +843,11 @@ mod tests {
     #[test]
     fn name_status_maps_renames_and_lists_every_path() {
         let output = "M\0kept.js\0R087\0old dir/a.js\0new\tdir/a.js\0C100\0src.js\0copy.js\0D\0gone.js\0A\0added.js\0";
-        let DiffStatus { renames, touched } = parse_name_status(output);
+        let DiffStatus {
+            renames,
+            touched,
+            post_images,
+        } = parse_name_status(output);
         assert_eq!(
             renames,
             BTreeMap::from([(
@@ -844,6 +867,10 @@ mod tests {
                 "added.js",
             ]
             .map(PathBuf::from)
+        );
+        assert_eq!(
+            post_images,
+            ["kept.js", "new\tdir/a.js", "copy.js", "added.js"].map(PathBuf::from)
         );
     }
 
