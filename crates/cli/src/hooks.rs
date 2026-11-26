@@ -379,7 +379,8 @@ fn record_only(input: &HookInput, cwd: &Path) {
 fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathBuf) -> Result<u8> {
     let session = post_edit_gate(input, cwd, &path);
     let paths = [path];
-    let outcome = Outcome::of(session, || Ok(Gate::new(Mode::Paths)), cwd, &paths)?;
+    let plain = || Ok(Gate::new(Mode::Paths));
+    let outcome = Outcome::of(session, plain, cwd, &paths, false)?;
     match outcome.report {
         Some(report) => emit_feedback(harness, &report, false),
         None => {
@@ -401,16 +402,14 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
     let snapshot = Snapshot::read(repo)?;
     let session = changed_gate(input, cwd, &snapshot);
     let head = || Ok(Gate::new(Mode::Head(snapshot.clone().head_changes()?)));
-    let outcome = Outcome::of(session, head, cwd, &[])?;
+    let outcome = Outcome::of(session, head, cwd, &[], stop)?;
     let Some(report) = &outcome.report else {
         outcome.note_pass();
         return pass(input, stop);
     };
-    if !stop {
+    let Some(max) = outcome.max_blocks.filter(|_| stop) else {
         return emit_feedback(harness, report, false);
-    }
-    // From the base when a config differs, so the working tree cannot lower it.
-    let max = outcome.gate.config(cwd, Side::Base)?.hook.max_blocks;
+    };
     if increment_counter(&input.session_id)? > max {
         eprintln!("UNRESOLVED\n{report}");
         return Ok(0);
@@ -435,6 +434,8 @@ struct Outcome {
     gate: Gate,
     result: ScanResult,
     report: Option<String>,
+    /// The loop guard limit of a `Stop` that blocks.
+    max_blocks: Option<usize>,
 }
 
 impl Outcome {
@@ -442,20 +443,23 @@ impl Outcome {
     /// session gate or its scan fails, scans with the `plain` gate of the
     /// hook without a session id. An error of the plain gate is returned
     /// without the note, as the hook without a session id returns it.
+    /// For a `Stop`, a block also resolves `hook.max_blocks`, so a session
+    /// policy that does not load falls back too.
     fn of(
         session: Result<Option<Gate>>,
         plain: impl FnOnce() -> Result<Gate>,
         cwd: &Path,
         paths: &[PathBuf],
+        stop: bool,
     ) -> Result<Self> {
-        let session =
-            session.and_then(|gate| gate.map(|gate| Self::scan(gate, cwd, paths)).transpose());
+        let scan = |gate| Self::scan(gate, cwd, paths, stop);
+        let session = session.and_then(|gate| gate.map(scan).transpose());
         let failure = match session {
             Ok(Some(outcome)) => return Ok(outcome),
             Ok(None) => None,
             Err(error) => Some(error),
         };
-        let outcome = Self::scan(plain()?, cwd, paths)?;
+        let outcome = scan(plain()?)?;
         if let Some(error) = failure {
             note_without_session(&error);
         }
@@ -475,7 +479,7 @@ impl Outcome {
     /// Scans with the gate's configs. When a session config differs from the
     /// base and that scan does not block, scans again with the working-tree
     /// configs, which then give the block reason.
-    fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf]) -> Result<Self> {
+    fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf], stop: bool) -> Result<Self> {
         let mut result = gate.scan(cwd, paths, Side::Base)?;
         let mut report = gate.feedback(cwd, &result, Side::Base)?;
         if report.is_none() && gate.compares_configs() {
@@ -488,10 +492,16 @@ impl Outcome {
             }
             result.unverified.sort_by(|a, b| a.file.cmp(&b.file));
         }
+        // From the base when a config differs, so the working tree cannot lower it.
+        let max_blocks = match report {
+            Some(_) if stop => Some(gate.config(cwd, Side::Base)?.hook.max_blocks),
+            _ => None,
+        };
         Ok(Self {
             gate,
             result,
             report,
+            max_blocks,
         })
     }
 }

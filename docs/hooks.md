@@ -105,7 +105,8 @@ not pruned.
 
 Session code never fails a hook. When the state directory cannot be written,
 the anchor or log is unusable, or another step of the session gate fails,
-such as a Git command or a base config that does not load, the hook prints
+such as a Git command or a base config that does not load, also for
+`hook.max_blocks` alone, the hook prints
 one `note:` line to stderr and works as without a session. A session run that does not block writes the
 same `note: UNVERIFIED` lines as a run outside a session. A failed write to
 stderr is ignored. A session started from a linked working directory and

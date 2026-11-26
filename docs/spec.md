@@ -993,7 +993,8 @@ State failures. Session code is never a reason for a hook to fail. When the
 state directory cannot be created or written, the anchor names no full commit
 (40 or 64 lowercase hex digits), the log cannot be read, the file system has
 no hard links, a Git command that only the session runs fails, or the scan of
-the session gate fails, such as on a base config that does not load, the hook
+the session gate fails, such as on a base config that does not load, also
+when only its `hook.fail_on` or `hook.max_blocks` is looked up, the hook
 writes one line to stderr that starts with `note: hook session state
 unavailable, the hook runs without a session:` and continues as it does
 without a session id (see Fallbacks). Its exit code and stdout are then those

@@ -1016,6 +1016,39 @@ fn session_gate_errors_are_a_note_and_the_hook_works_without_a_session() {
     assert!(reason.contains(&format!("--base {initial} ")), "{reason}");
 }
 
+/// The loop guard limit is a session policy too: when the base config at
+/// `cwd` does not load, `Stop` falls back with the note and blocks, as it
+/// does without a session id, and never exits 2.
+#[test]
+fn a_base_policy_that_does_not_load_is_a_note() {
+    let note = "note: hook session state unavailable, the hook runs without a session: ";
+    let (dir, state) = repo(&[
+        (".pickcheck.json", r#"{"limits":"#),
+        ("src/.pickcheck.json", r#"{"limits":{"params":20}}"#),
+        ("src/a.js", &simple("a")),
+    ]);
+    let root = dir.path();
+    start(&state, root, "policy");
+    git(
+        root,
+        &["update-index", "--skip-worktree", ".pickcheck.json"],
+    );
+    fs::write(root.join(".pickcheck.json"), "{}").unwrap();
+    fs::write(
+        root.join("src/.pickcheck.json"),
+        r#"{"limits":{"params":6}}"#,
+    )
+    .unwrap();
+    let grown = format!("{}{}", simple("a"), params("bad", 7));
+    fs::write(root.join("src/a.js"), grown).unwrap();
+    let output = stop(&state, root, "policy");
+    let stderr = text(&output.stderr);
+    assert!(stderr.starts_with(note), "{stderr}");
+    assert!(stderr.contains("invalid JSON"), "{stderr}");
+    let reason = block_reason(&output);
+    assert!(reason.contains("--changed --verbose"), "{reason}");
+}
+
 /// Garbage in the log is skipped record by record; the session goes on.
 #[test]
 fn a_corrupt_log_keeps_its_readable_records() {
