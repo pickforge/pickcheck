@@ -822,6 +822,36 @@ fn unusable_session_state_is_a_note_and_the_hook_works_without_a_session() {
     assert_without_session(state.path(), root, "log");
 }
 
+/// When the hook without a session id fails too, the hook returns that
+/// error without the state note. An event that only records keeps the note.
+#[test]
+fn a_failing_plain_gate_returns_its_error_without_the_state_note() {
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    fs::write(root.join(".pickcheck.json"), "{").unwrap();
+    fs::write(root.join("a.js"), params("a", 7)).unwrap();
+    let home = state.path().join("file");
+    fs::write(&home, "").unwrap();
+    let stop = |session: &str| json!({"hook_event_name":"Stop", "session_id":session, "cwd":root});
+    let file = root.join("a.js");
+    for (with, without) in [
+        (edit_input(root, "both", &file), edit_input(root, "", &file)),
+        (stop("both"), stop("")),
+    ] {
+        let output = hook_at(&home, "claude", &with);
+        assert_eq!(output.status.code(), Some(2), "{with}");
+        let stderr = text(&output.stderr);
+        assert!(stderr.starts_with("error: invalid JSON in "), "{stderr}");
+        assert_eq!(output.stderr, hook_at(&home, "claude", &without).stderr);
+    }
+    let bash = json!({"hook_event_name":"PostToolUse", "session_id":"both", "cwd":root,
+        "tool_name":"Bash", "tool_input":{"command":"true"}});
+    let output = hook_at(&home, "claude", &bash);
+    assert_eq!(output.status.code(), Some(0));
+    let unavailable = "note: hook session state unavailable, the hook runs without a session: ";
+    assert!(text(&output.stderr).starts_with(unavailable));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_unwritable_state_directory_is_a_note() {

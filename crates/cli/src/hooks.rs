@@ -497,8 +497,8 @@ impl Outcome {
 
 /// The session gate for an edit of `path`: the session's changes in that
 /// file. `None` without a session id, outside a Git repository with
-/// `HEAD`, for a file outside the repository, and after a note when the
-/// session state is unusable. Every error is the session's.
+/// `HEAD`, and for a file outside the repository. Every error, such as
+/// unusable session state, is the session's.
 fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Option<Gate>> {
     if input.session_id.is_empty() {
         return Ok(None);
@@ -511,24 +511,20 @@ fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Option<G
         .ok()
         .map(Path::to_path_buf);
     let snapshot = Snapshot::read(repo)?;
-    let Some(session) = open_session_or_note(input, &snapshot, edited.as_deref()) else {
-        return Ok(None);
-    };
+    let session = open_session(input, &snapshot, edited.as_deref())?;
     edited
         .map(|edited| session_gate(cwd, snapshot, &session, Some(&edited)))
         .transpose()
 }
 
 /// The session gate for `Stop` and for an edit event that names no file.
-/// `None` without a session id and after a note when the session state is
-/// unusable.
+/// `None` without a session id. Every error, such as unusable session
+/// state, is the session's.
 fn changed_gate(input: &HookInput, cwd: &Path, snapshot: &Snapshot) -> Result<Option<Gate>> {
     if input.session_id.is_empty() {
         return Ok(None);
     }
-    let Some(session) = open_session_or_note(input, snapshot, None) else {
-        return Ok(None);
-    };
+    let session = open_session(input, snapshot, None)?;
     session_gate(cwd, snapshot.clone(), &session, None).map(Some)
 }
 
@@ -723,18 +719,6 @@ fn open_session(input: &HookInput, snapshot: &Snapshot, edited: Option<&Path>) -
         session.record(edited.iter().chain(changed))?;
     }
     Ok(session)
-}
-
-/// The session, or `None` after a note when its state is unusable: the hook
-/// then works as it does without a session.
-fn open_session_or_note(
-    input: &HookInput,
-    snapshot: &Snapshot,
-    edited: Option<&Path>,
-) -> Option<Session> {
-    open_session(input, snapshot, edited)
-        .map_err(|error| note_without_session(&error))
-        .ok()
 }
 
 fn note_without_session(error: &anyhow::Error) {
