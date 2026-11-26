@@ -1092,7 +1092,7 @@ other units of that name or owner then pair as under `--base`, with the base
 units that are left. So a unit that the session adds before an old unit is
 the new one, also when it is a copy of the old unit. Last, a unit that no
 hunk touches and that still has no base unit takes a base unit of the same
-text that pairs with no unit, whatever its name or owner. So an old unit
+text that pairs with no measured unit, whatever its name or owner. So an old unit
 keeps its base when a change outside it renames it or its owner. Old debt
 that the session leaves as it was therefore neither blocks nor is listed,
 while a change that the hunks miss still counts.
