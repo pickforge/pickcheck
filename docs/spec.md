@@ -1039,6 +1039,40 @@ osv-scanner jobs; `Swatinem/rust-cache@v2` in every workflow including release;
 macos-aarch64, macos-x86_64, windows-x86_64 archives with checksums. The binary
 gates itself: CI runs `pickcheck check crates` and fails on violations.
 
+The `corpus` CI job measures a pinned corpus of public, permissively licensed
+repositories. `tests/corpus/manifest.json` pins each repository by full commit
+SHA and records its license. `scripts/fetch-corpus.sh <dir>` validates the
+whole manifest, then fetches each repository at that commit. Git runs without
+user or system config, hooks, filters, templates or submodules, and ignores
+inherited Git variables that select a repository or config. The script reuses
+a checkout only at the pinned commit with an unchanged tree and empty submodule
+directories. It marks each checkout that it creates, and it changes or removes
+a directory only when it has that mark. Any other directory stops the script.
+The ignored test `crates/core/tests/corpus.rs` scans every repository in a
+child process with the built-in defaults only: no user config, no Git system or
+global config, no `.git/info/exclude` rules, and no `.ignore` rule above the
+repository. It fails before it compares or writes when the manifest is empty,
+a checkout is missing, off its commit, has a changed, deleted or untracked file
+or a nonempty submodule directory, a repository yields no function, or a
+language has no function in the whole corpus. It compares the result with
+`tests/corpus/snapshot.json` as parsed JSON. Per repository and language, the
+snapshot holds the count of measured source files, the function count, the
+violations per metric, the value histogram of every metric, and a digest. The
+digest is 64-bit FNV-1a over every function record (file, line, name, position
+in source order within the file, and every metric value) in sorted order. Each repository also has its unverified count.
+A mismatch fails the job and prints each changed value. Run these from the
+workspace root; a relative path resolves against it:
+
+```sh
+scripts/fetch-corpus.sh target/corpus
+PICKCHECK_CORPUS_DIR=target/corpus cargo test -p pickcheck-core --test corpus --release --locked -- --ignored
+```
+
+Add `PICKCHECK_CORPUS_UPDATE=1` to the second command to regenerate the
+snapshot. Add `PICKCHECK_CORPUS_LISTING=<file>` to write one line per measured
+function. When only a digest moves, write a listing from each build and compare
+the two with `diff`. Plain `cargo test` never fetches the corpus.
+
 ## Layout
 
 ```
@@ -1049,6 +1083,8 @@ config.default.json
 docs/spec.md  docs/hooks.md
 docs/assets/branding/      # PickCheck marks, README art, social card
 tests/fixtures/<language>/
+tests/corpus/              # pinned corpus manifest and snapshot
+scripts/fetch-corpus.sh
 .github/workflows/{ci,release}.yml
 clippy.toml  osv-scanner.toml
 ```
