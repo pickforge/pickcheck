@@ -923,7 +923,8 @@ therefore checked whole. So is any file when that `ls-files` fails. A file
 outside the diff that the event does not edit is never checked, and `Stop`
 checks only the files in the diff.
 
-Git commands. One event runs no Git command twice with the same arguments.
+Git commands. One event runs no Git command twice with the same arguments,
+unless a session failure makes it run the gate without a session too.
 The repository root, the Git directory, and `HEAD` come from one
 `rev-parse`. Recording runs one `diff --name-status` against `HEAD` and one
 `ls-files --others`, and one `ls-files --unmerged` while an operation is in
@@ -949,9 +950,9 @@ is the `--base` summary, and its `DETAILS` line names the base commit and the
 fail set.
 
 Config. Hooks read the repository config from the base commit when a config
-that they would read differs from the base. The working-tree lookup for each
-checked file and for `cwd` walks from its directory up to the repository root
-and stops at the first `.pickcheck.json` that is a file. At every directory
+that they would read differs from the base. The working-tree lookup walks
+from the directory of each checked file, and from `cwd`, up to the repository
+root, and stops at the first `.pickcheck.json` that is a file. At every directory
 that it reaches, the hook compares what the lookup would read there, through
 a link too, with the file at the same path in the base commit, read through
 links that stay inside the base tree. A config on one side only, or content

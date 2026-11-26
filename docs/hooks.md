@@ -60,6 +60,9 @@ plain file. This covers ignored files, files of nested repositories and
 submodules, skip-worktree entries, and links. Files outside the diff that the
 session does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
+A post-edit or `Stop` event with one violating file runs at most 9 Git
+commands, and 2 more for each other violating file. An unfinished merge,
+cherry-pick, revert, or rebase adds 1.
 
 Violations are compared with that base. `hook.fail_on` lists the statuses that
 block, by default `["new", "worsened", "unmatched"]`. A block reason lists the
