@@ -62,9 +62,9 @@ pub struct ChangedFiles {
     /// no Git command twice.
     pub base_reads: Option<BaseReads>,
     /// Measure every unit of a file with a base, not only the units that
-    /// the hunks touch. A violation of a unit that no hunk touches is kept
-    /// only when its status is `new` or `worsened`. Hunks can miss changed
-    /// lines, so the hook session gate does not rely on them alone.
+    /// the hunks touch. A violation of a unit that no hunk touches is
+    /// dropped when its status is `unchanged` or `improved`. Hunks can miss
+    /// changed lines, so the hook session gate does not rely on them alone.
     pub measure_untouched: bool,
 }
 

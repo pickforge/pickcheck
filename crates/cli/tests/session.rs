@@ -1158,6 +1158,20 @@ fn a_change_that_the_hunks_miss_still_blocks() {
             },
             "a.js",
         ),
+        // An anonymous function that the hunks miss is unmatched.
+        (
+            "encoding of a closure",
+            |root| {
+                let mut grown = format!("{}[1].map({});\n", simple("a"), closure(7));
+                if grown.len() % 2 == 1 {
+                    grown.push('\n');
+                }
+                fs::write(root.join("a.js"), grown).unwrap();
+                let attribute = "*.js working-tree-encoding=UTF-16LE\n";
+                fs::write(root.join(".gitattributes"), attribute).unwrap();
+            },
+            "a.js",
+        ),
         (
             "header",
             |root| {
@@ -1277,6 +1291,83 @@ fn old_debt_that_the_session_leaves_as_it_was_is_never_listed() {
         assert!(reason.contains("FAIL new.js  1 function"), "{reason}");
         assert!(!reason.contains("WARN"), "{session}: {reason}");
     }
+}
+
+/// A change outside an old unit can give it another name, another owner, or
+/// another place among the closures of its owner. The unit keeps the base
+/// unit with its text.
+#[test]
+fn old_debt_keeps_its_base_when_a_change_outside_it_renames_or_moves_it() {
+    let old = closure(7);
+    // The base content, the text to replace, and its replacement.
+    let cases = [
+        (
+            "closure before",
+            format!("function owner(list) {{\n  list.forEach({old});\n}}\n"),
+            "function owner(list) {\n",
+            "function owner(list) {\n  list.map((b) => b);\n",
+        ),
+        (
+            "class",
+            "class Foo {\n  x(p0, p1, p2, p3, p4, p5, p6) {\n    return p0;\n  }\n}\n".to_owned(),
+            "class Foo",
+            "class Bar",
+        ),
+        (
+            "owner",
+            format!("function foo(list) {{\n  return list.map({old});\n}}\n"),
+            "function foo",
+            "function bar",
+        ),
+        (
+            "variable",
+            format!("const handler =\n  {old};\n"),
+            "const handler",
+            "const onEvent",
+        ),
+    ];
+    for (session, base, from, to) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        assert!(base.contains(from), "{session}");
+        fs::write(root.join("a.js"), base.replace(from, to)).unwrap();
+        let output = edit(&state, root, session, "a.js");
+        assert!(
+            output.stdout.is_empty(),
+            "{session}: {}",
+            text(&output.stdout)
+        );
+        assert!(stop(&state, root, session).stdout.is_empty(), "{session}");
+        // Something else blocks: the old function is not listed as `WARN`.
+        fs::write(root.join("new.js"), params("fresh", 7)).unwrap();
+        let reason = block_reason(&stop(&state, root, session));
+        assert!(reason.contains("FAIL new.js  1 function"), "{reason}");
+        assert!(!reason.contains("WARN"), "{session}: {reason}");
+    }
+}
+
+/// Lines that the session only removes leave no changed line in the file.
+/// Two closures that become one too complex closure still block.
+#[test]
+fn a_closure_that_grows_with_no_added_line_blocks() {
+    let decisions = (0..8)
+        .map(|index| format!("    if (a === {index}) a++;\n"))
+        .collect::<String>();
+    let each = format!("  list.forEach((a) => {{\n{decisions}  }});\n");
+    let base = format!("function owner(list) {{\n{each}{each}}}\n");
+    let (dir, state) = repo(&[("a.js", &base)]);
+    let root = dir.path();
+    start(&state, root, "grown");
+    let joined = base.replacen("  });\n  list.forEach((a) => {\n", "", 1);
+    assert_ne!(joined, base);
+    fs::write(root.join("a.js"), joined).unwrap();
+    let reason = block_reason(&edit(&state, root, "grown", "a.js"));
+    assert!(
+        reason.contains("FAIL a.js  1 function, 1 violation"),
+        "{reason}"
+    );
+    block_reason(&stop(&state, root, "grown"));
 }
 
 /// A checkout with CRLF line ends has other bytes than the base, and the old
@@ -1778,6 +1869,15 @@ fn params(name: &str, count: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("function {name}({list}) {{\n  return p0;\n}}\n")
+}
+
+/// An arrow function with `count` parameters.
+fn closure(count: usize) -> String {
+    let list = (0..count)
+        .map(|index| format!("p{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({list}) => {{\n    return p0;\n  }}")
 }
 
 /// `violating` with an edit that keeps the score.

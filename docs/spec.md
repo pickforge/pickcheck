@@ -1081,17 +1081,24 @@ Status. Every violation in the set is compared with the base, as under
 attribute, so the hunks do not decide alone which units to check. In a file
 with a base, every unit is measured. A violation of a unit that a hunk
 touches keeps its status. A violation of a unit that no hunk touches is
-kept only when its status is `new` or `worsened`; with any other status it
-is dropped and not listed. A named unit that no hunk touches pairs first
-with a base unit of the same name and the same text, one base unit for each
-such unit. CRLF and LF line ends count as the same text. The other units of
-that name then pair in source order with the base units that are left. So a
-unit of that name that the session adds before an old unit is the new one,
-also when it is a copy of the old unit. An `<anonymous>` unit pairs by owner
-and position, as under `--base`. Old debt that the session leaves as it was
-therefore neither blocks nor is listed, while a change that the hunks miss
-still counts. A file with no base, untracked or with no readable base
-content, is checked whole. The config key `hook.fail_on` lists the statuses
+dropped and not listed when its status is `unchanged` or `improved`, and
+kept with any other status.
+
+A unit that no hunk touches pairs first with a base unit of the same text,
+one base unit for each such unit. CRLF and LF line ends count as the same
+text. A named unit looks among the base units of its name, and an
+`<anonymous>` unit among the base `<anonymous>` units of its owner. The
+other units of that name or owner then pair as under `--base`, with the base
+units that are left. So a unit that the session adds before an old unit is
+the new one, also when it is a copy of the old unit. Last, a unit that no
+hunk touches and that still has no base unit takes a base unit of the same
+text that pairs with no unit, whatever its name or owner. So an old unit
+keeps its base when a change outside it renames it or its owner. Old debt
+that the session leaves as it was therefore neither blocks nor is listed,
+while a change that the hunks miss still counts.
+
+A file with no base, untracked or with no readable base content, is checked
+whole. The config key `hook.fail_on` lists the statuses
 that block, by default `new`, `worsened`, and `unmatched`. A block reason
 lists the other violations as `WARN`, but they never block alone. A run with
 only warnings prints nothing and counts as a clean run for the loop guard.

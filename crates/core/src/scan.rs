@@ -393,8 +393,8 @@ fn measure_units(
     measured
 }
 
-/// Drops each violation of a unit that no hunk touches unless its status
-/// is `new` or `worsened`, and counts the untouched units that keep one.
+/// Drops each violation of a unit that no hunk touches when its status is
+/// `unchanged` or `improved`, and counts the untouched units that keep one.
 /// The file's violations start at `first` in `result`.
 fn keep_untouched_changes(
     result: &mut ScanResult,
@@ -408,7 +408,7 @@ fn keep_untouched_changes(
     for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
         if measured.untouched[index] {
             let status = violation.baseline.as_ref().map(|baseline| baseline.status);
-            if !matches!(status, Some(Status::New | Status::Worsened)) {
+            if matches!(status, Some(Status::Unchanged | Status::Improved) | None) {
                 continue;
             }
             kept.insert(index);

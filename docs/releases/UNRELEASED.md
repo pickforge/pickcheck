@@ -84,10 +84,10 @@
 - In a session, hooks no longer trust Git's hunks alone to find the changed
   functions. Every file that the session diff lists, a pure rename or a mode
   change included, is measured whole against its base. A function that no
-  hunk touches blocks only when it is new or worsened, so a change that an
-  encoding attribute, a clean filter, or a renamed link hides from the hunks
-  still blocks, and old debt that the session leaves as it was is still
-  never listed. A file with any violation now reads its base content. (#53)
+  hunk touches blocks only when it is new, worsened, or unmatched, so a
+  change that an encoding attribute, a clean filter, or a renamed link hides
+  from the hunks still blocks, and old debt that the session leaves as it
+  was is still never listed. A file with any violation now reads its base content. (#53)
 - `check --changed`, `check --base`, and hooks now read each hunk by the line
   counts in its header, so an added line such as `++ /dev/null` inside a
   comment no longer drops the rest of the file's changes. A path that Git

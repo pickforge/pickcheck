@@ -55,8 +55,8 @@ base of the anchor and `HEAD` to the working tree, restricted to the recorded
 files. A post-edit event checks the edited file. Every file that the names
 diff lists with a post-image is checked, also when Git shows no changed
 line in it. Its units are compared with the base. A violation of a unit
-that the hunks do not touch counts only when it is new or worsened, so old
-debt that the session leaves as it was is never listed. An edit of a file
+that the hunks do not touch counts only when it is new, worsened, or
+unmatched, so old debt that the session leaves as it was is never listed. An edit of a file
 outside the repository checks the whole file, as without a session. An edit
 of a file that is in no diff checks the whole file with no base, so its
 violations are new, unless the index tracks it as a plain file. Such a file
