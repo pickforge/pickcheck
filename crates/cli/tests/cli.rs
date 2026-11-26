@@ -610,6 +610,295 @@ fn stop_hook_reason_lists_unverified_files() {
     assert!(reason.ends_with("Fix the listed files, then finish."));
 }
 
+/// A function over the depth limit, then a measurable one on line 2.
+fn deep_function_then(next: &str) -> String {
+    format!(
+        "function deep(a) {{ return {}a; }}\n{next}",
+        "a+".repeat(3_100)
+    )
+}
+
+const SEVEN_PARAMS: &str = "function bad(a, b, c, d, e, f, g) { return a; }\n";
+
+#[test]
+fn too_deep_units_are_left_out_and_the_rest_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
+    let chain = format!("function chain(a) {{ return {}a; }}\n", "a+".repeat(20_000));
+    fs::write(root.join("chain.js"), chain).unwrap();
+
+    let check = command_output(root, &["check", "."]);
+    assert_eq!(check.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL deep.js:2 bad  params 7 > 6\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+    let summary = command_output(root, &["check", "--summary", "."]);
+    assert_eq!(summary.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&summary.stdout),
+        "FAIL 1 file, 1 function, 1 violation\n\
+         UNVERIFIED 2 files\n\
+         FAIL deep.js  1 function, 1 violation\n\
+         UNVERIFIED chain.js  syntax nesting too deep to measure\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n\
+         DETAILS pickcheck check --verbose <file>\n"
+    );
+    let json = command_output(root, &["check", "--format", "json", "."]);
+    assert_eq!(json.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["checked"], 1);
+    assert_eq!(value["violations"][0]["function"], "bad");
+    assert_eq!(
+        value["unverified"],
+        serde_json::json!([
+            {"file": "chain.js", "reason": "syntax nesting too deep to measure"},
+            {"file": "deep.js", "reason": "syntax nesting too deep to measure"}
+        ])
+    );
+}
+
+#[test]
+fn base_units_that_were_too_deep_count_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    fs::write(root.join("deep.js"), deep_function_then(SEVEN_PARAMS)).unwrap();
+    commit_all(root, "initial");
+    git(root, &["checkout", "-qb", "feature"]);
+    fs::write(
+        root.join("deep.js"),
+        "function deep(a, b, c, d, e, f, g) { return a; }\n\
+         function bad(a, b, c, d, e, f, g) { return b; }\n",
+    )
+    .unwrap();
+    let base = command_output(root, &["check", "--base", "main", "--verbose", "deep.js"]);
+    assert_eq!(base.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&base.stdout),
+        "FAIL deep.js:1 deep  params 7 > 6  new\n\
+         FAIL deep.js:2 bad  params 7 > 6  unchanged\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&base.stderr), "");
+
+    fs::write(
+        root.join("deep.js"),
+        deep_function_then("function bad(a, b, c, d, e, f, g) { return b; }\n"),
+    )
+    .unwrap();
+    for event in ["PostToolUse", "Stop"] {
+        let input = serde_json::json!({
+            "hook_event_name": event, "session_id": "deep", "cwd": root,
+            "tool_name": "Edit", "tool_input": {"file_path": root.join("deep.js")}
+        })
+        .to_string();
+        let hook = hook_output(state.path(), &input);
+        assert!(hook.status.success(), "{event}");
+        let value: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
+        let reason = value["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("FAIL deep.js  1 function, 1 violation\n"),
+            "{event}: {reason}"
+        );
+        assert!(
+            reason.contains("UNVERIFIED deep.js  syntax nesting too deep to measure\n"),
+            "{event}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn closures_keep_an_owner_that_was_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let closure = "[1].map((a, b, c, d, e, f, g) => a);";
+    let file_level = format!("function deep(a) {{ return a; }}\n{closure}\n");
+    fs::write(root.join("deep.js"), file_level).unwrap();
+    commit_all(root, "initial");
+    git(root, &["checkout", "-qb", "feature"]);
+    let inside = format!(
+        "function deep(a) {{ {closure} return {}a; }}\n",
+        "a+".repeat(3_100)
+    );
+    fs::write(root.join("deep.js"), &inside).unwrap();
+    let fail_on = ["--fail-on", "new,worsened,unmatched"];
+    let args = [
+        &["check", "--verbose", "--base", "main"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let moved = command_output(root, &args);
+    assert_eq!(moved.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&moved.stdout),
+        "FAIL deep.js:1 <anonymous>  params 7 > 6  unmatched\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+
+    // The same closure under the same left-out owner at both revisions pairs.
+    commit_all(root, "inside");
+    fs::write(
+        root.join("deep.js"),
+        inside.replace("return a+", "return b+"),
+    )
+    .unwrap();
+    let args = [
+        &["check", "--verbose", "--base", "HEAD"][..],
+        &fail_on,
+        &["deep.js"],
+    ]
+    .concat();
+    let kept = command_output(root, &args);
+    assert_eq!(kept.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&kept.stdout),
+        "WARN deep.js:1 <anonymous>  params 7 > 6  unchanged\n\
+         UNVERIFIED deep.js  syntax nesting too deep to measure\n"
+    );
+}
+
+/// A note that cannot be written to stderr changes neither the exit code nor
+/// stdout of a hook that does not block.
+#[cfg(unix)]
+#[test]
+fn hook_notes_ignore_an_unwritable_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("note.kt"), "fun f() {}\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "full", "cwd": dir.path(),
+        "tool_name": "Edit", "tool_input": {"file_path": dir.path().join("note.kt")}
+    })
+    .to_string();
+    let writable = hook_output(state.path(), &input);
+    assert_eq!(
+        String::from_utf8_lossy(&writable.stderr),
+        "note: UNVERIFIED note.kt  no grammar for .kt\n"
+    );
+    let full = Path::new("/dev/full");
+    let mut command = if full.exists() {
+        let mut command = binary();
+        let stderr = fs::OpenOptions::new().write(true).open(full).unwrap();
+        command.args(["hook", "claude"]).stderr(stderr);
+        command
+    } else {
+        let mut command = Command::new("sh");
+        let script = "exec \"$0\" hook claude 2>&-";
+        command.args(["-c", script, env!("CARGO_BIN_EXE_pickcheck")]);
+        command
+    };
+    let mut child = command
+        .env("PICKCHECK_HOME", state.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    let unwritable = child.wait_with_output().unwrap();
+    assert_eq!(unwritable.status.code(), writable.status.code());
+    assert_eq!(unwritable.status.code(), Some(0));
+    assert_eq!(unwritable.stdout, writable.stdout);
+}
+
+#[test]
+fn hooks_that_do_not_block_note_unverified_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    fs::write(root.join("deep.js"), "function deep(a) { return a; }\n").unwrap();
+    commit_all(root, "initial");
+    fs::write(root.join("deep.js"), deep_function_then("")).unwrap();
+    let file = root.join("deep.js");
+    let note = "note: UNVERIFIED deep.js  syntax nesting too deep to measure\n";
+    let inputs = [
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "claude",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "Edit", "tool_input": {"file_path": file}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "Stop", "cwd": root}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"hook_event_name": "PostToolUse", "cwd": root,
+            "tool_name": "apply_patch", "tool_input": {"command": "patch"}}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "stop", "status": "completed",
+            "workspace_roots": [root]}),
+        ),
+        (
+            "cursor",
+            serde_json::json!({"hook_event_name": "afterFileEdit",
+            "workspace_roots": [root], "file_path": file}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "stop", "workspaceRoot": root}),
+        ),
+        (
+            "grok",
+            serde_json::json!({"hookEventName": "post_tool_use", "workspaceRoot": root,
+            "toolName": "edit", "toolInput": {"filePath": file}}),
+        ),
+    ];
+    for (harness, input) in inputs {
+        let hook = hook_output_for(state.path(), harness, &input.to_string());
+        assert_eq!(hook.status.code(), Some(0), "{harness} {input}");
+        assert!(hook.stdout.is_empty(), "{harness} {input}");
+        assert_eq!(
+            String::from_utf8_lossy(&hook.stderr),
+            note,
+            "{harness} {input}"
+        );
+    }
+
+    for index in 0..21 {
+        fs::write(root.join(format!("{index:02}.kt")), "fun f() = 1\n").unwrap();
+    }
+    let stop = serde_json::json!({"hook_event_name": "Stop", "cwd": root}).to_string();
+    let hook = hook_output(state.path(), &stop);
+    assert!(hook.status.success() && hook.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&hook.stderr);
+    assert_eq!(stderr.matches("note: UNVERIFIED ").count(), 20, "{stderr}");
+    assert!(stderr.ends_with("note: ... 2 more files\n"), "{stderr}");
+}
+
+#[test]
+fn a_damaged_svelte_script_is_unverified_and_the_rest_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("case.svelte"),
+        "<script>const text = \"</scripture>\"; function bad(a,b,c,d,e,f,g) { return a; }</script>\n\
+         <script context=\"module\">function other(a,b,c,d,e,f,g) { return a; }</script>\n",
+    )
+    .unwrap();
+    let check = command_output(root, &["check", "case.svelte"]);
+    assert_eq!(check.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&check.stdout),
+        "FAIL case.svelte:2 other  params 7 > 6\n\
+         UNVERIFIED case.svelte  script block could not be parsed\n"
+    );
+}
+
 #[test]
 fn directory_noise_is_silent_and_invalid_utf8_is_unverified() {
     let dir = tempfile::tempdir().unwrap();
