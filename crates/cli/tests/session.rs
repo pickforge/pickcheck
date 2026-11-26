@@ -1009,6 +1009,29 @@ fn an_edited_file_in_no_diff_is_checked_whole_unless_plainly_tracked() {
     }
 }
 
+/// On a file system that ignores letter case, a tracked file under another
+/// spelling is not plainly tracked, so its edit is checked whole, and a
+/// config under another spelling still makes hooks read the base config.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn another_letter_case_neither_hides_an_edit_nor_a_config() {
+    let (dir, state) = repo(&[("app.js", &simple("app")), ("src/a.js", &simple("a"))]);
+    let root = dir.path();
+    assert!(root.join("APP.JS").exists(), "volume is case-sensitive");
+    start(&state, root, "case");
+    fs::rename(root.join("app.js"), root.join("App.js")).unwrap();
+    fs::write(root.join("App.js"), violating("grown", 16)).unwrap();
+    let reason = block_reason(&edit(&state, root, "case", "App.js"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+
+    let loose = r#"{"limits":{"cognitive":null}}"#;
+    fs::write(root.join("src").join(".Pickcheck.json"), loose).unwrap();
+    fs::write(root.join("src").join("a.js"), violating("a", 16)).unwrap();
+    let reason = block_reason(&edit(&state, root, "case", "src/a.js"));
+    let note = "note: .pickcheck.json changed in this diff; the config comes from";
+    assert!(reason.starts_with(note), "{reason}");
+}
+
 /// The hook with stderr that cannot be written: `/dev/full` where it exists,
 /// a closed descriptor elsewhere.
 #[cfg(unix)]
