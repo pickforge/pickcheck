@@ -238,6 +238,20 @@ Page.svelte:5 {#if}  cognitive 7 <= 15
   8  +2  {#each}      nesting 1
 "
     );
+    // `check` reports the `<template>` unit at line 1, so line 1 selects it,
+    // also when a `<script>` element opens there.
+    let output = run(dir.path(), &["Page.svelte:1"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "Page.svelte:1 <template>  cognitive 0 <= 15\n"
+    );
+    let output = run(dir.path(), &["Page.svelte:2"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "error: no unit in Page.svelte contains line 2\n"
+    );
 }
 
 #[test]
@@ -376,6 +390,40 @@ fn a_line_where_only_a_unit_left_out_starts_selects_no_other_unit() {
     let output = run(dir.path(), &["case.js:2"]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).starts_with("case.js:1 shallow  cognitive 1 <= 15\n"));
+}
+
+#[test]
+fn a_line_inside_a_unit_left_out_in_a_measured_unit_selects_no_unit() {
+    // The `<template>` unit contains every line of the file, so the script
+    // function left out sits inside it.
+    let dir = tempfile::tempdir().unwrap();
+    let chain = "a+".repeat(20_000);
+    fs::write(
+        dir.path().join("In.svelte"),
+        format!(
+            "<script>\n  function deep(a) {{\n    return {chain}a;\n  }}\n</script>\n<p>hi</p>\n"
+        ),
+    )
+    .unwrap();
+    for line in ["In.svelte:3", "In.svelte:4"] {
+        let output = run(dir.path(), &[line]);
+        assert_eq!(output.status.code(), Some(2), "{line}");
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "error: cannot explain {line}: deep at line 2 is left out: \
+                 syntax nesting too deep to measure\n"
+            ),
+            "{line}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+    let output = run(dir.path(), &["In.svelte:6"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "In.svelte:1 <template>  cognitive 0 <= 15\n"
+    );
 }
 
 #[test]
