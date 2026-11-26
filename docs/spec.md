@@ -797,7 +797,7 @@ Text output, per unit, a header and then the increments in source order. Units
 are separated by a blank line, and columns are aligned:
 
 ```
-src/auth.ts:42 authenticate  cognitive 18 > 15
+src/auth.ts:42 authenticate  cognitive 12 <= 15
   43  +1  for          nesting 0
   44  +2  if           nesting 1
   44  +1  sequence &&
@@ -835,15 +835,20 @@ template expressions. A sequence starts at its operator token, and an `else` or
   "version": "0.4.0",
   "file": "src/auth.ts",
   "units": [
-    {"function": "authenticate", "line": 42, "cognitive": 18, "limit": 15,
-     "metrics": {"complexity": 12, "cognitive": 18, "depth": 4, "lines": 30,
-                 "params": 2, "bool_ops": 1, "widget_depth": 0},
+    {"function": "authenticate", "line": 42, "cognitive": 12, "limit": 15,
+     "metrics": {"complexity": 7, "cognitive": 12, "depth": 3, "lines": 11,
+                 "params": 1, "bool_ops": 1, "widget_depth": 0},
      "limits": {"complexity": null, "cognitive": 15, "depth": 4, "lines": 100,
                 "params": 6, "bool_ops": 3, "widget_depth": null},
      "increments": [
        {"line": 43, "column": 3, "add": 1, "construct": "for", "nesting": 0},
+       {"line": 44, "column": 5, "add": 2, "construct": "if", "nesting": 1},
        {"line": 44, "column": 13, "add": 1, "construct": "sequence &&",
-        "nesting": null}
+        "nesting": null},
+       {"line": 46, "column": 7, "add": 1, "construct": "else if",
+        "nesting": null},
+       {"line": 47, "column": 24, "add": 3, "construct": "catch", "nesting": 2},
+       {"line": 48, "column": 13, "add": 4, "construct": "ternary", "nesting": 3}
      ]}
   ]
 }
