@@ -121,14 +121,15 @@ pub fn scan(options: &ScanOptions<'_>) -> Result<ScanResult> {
         collect_files(&roots, &match_base, &base_config)?
     };
     let mut result = ScanResult::default();
-    if options.changed.is_some_and(config_changed) {
-        result.notes.push(match options.commit_configs {
-            Some(configs) => format!(
-                ".pickcheck.json changed in this diff; the config comes from {}",
-                configs.commit()
-            ),
-            None => ".pickcheck.json changed in this diff".to_owned(),
-        });
+    if let Some(configs) = options.commit_configs {
+        result.notes.push(format!(
+            ".pickcheck.json changed in this diff; the config comes from {}",
+            configs.commit()
+        ));
+    } else if options.changed.is_some_and(config_changed) {
+        result
+            .notes
+            .push(".pickcheck.json changed in this diff".to_owned());
     }
     for file in files {
         scan_file(&file, &match_base, options, &mut result)?;

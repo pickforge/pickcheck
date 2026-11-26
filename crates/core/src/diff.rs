@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Mutex,
+    thread,
 };
 
 use anyhow::{Context, Result, bail};
@@ -220,28 +222,91 @@ pub fn base_blob(repo_root: &Path, commit: &str, path: &Path) -> BaseBlob {
         .map_or(BaseBlob::Unreadable, BaseBlob::Content)
 }
 
-/// Every entry named `name` in the tree of `commit`, by its directory
-/// relative to the repository root: the blob's object name, or `None` for an
-/// entry that is not a file. One `ls-tree` lists the whole tree.
-pub(crate) fn named_entries(
-    repo_root: &Path,
-    commit: &str,
-    name: &str,
-) -> Result<BTreeMap<PathBuf, Option<String>>> {
-    let output = git_command(repo_root)
-        .args(["ls-tree", "-r", "-z", commit])
-        .output()
-        .context("failed to execute git ls-tree")?;
-    if !output.status.success() {
-        bail!("cannot list the tree of {commit}");
+/// A path's content in the tree of a commit, read through links that stay
+/// inside the tree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TreeFile {
+    /// No file: no entry, a directory, or a path through a file.
+    Missing,
+    Content(Vec<u8>),
+    /// A link that leaves the tree, dangles, or loops, or a path that cannot
+    /// be asked for.
+    Unresolved,
+}
+
+/// The content of each of `paths`, relative to the repository root, at
+/// `commit`, from one `cat-file --batch --follow-symlinks`, or none for no
+/// paths.
+pub(crate) fn files_at(repo_root: &Path, commit: &str, paths: &[PathBuf]) -> Result<Vec<TreeFile>> {
+    let requests = paths
+        .iter()
+        .map(|path| Some(slash_path(path)).filter(|path| !path.contains('\n')))
+        .collect::<Vec<_>>();
+    if requests.iter().all(Option::is_none) {
+        return Ok(requests.iter().map(|_| TreeFile::Unresolved).collect());
     }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    Ok(tree_entries(&listing)
-        .filter_map(|(object, path)| {
-            let (directory, file) = path.rsplit_once('/').unwrap_or(("", path));
-            (file == name).then(|| (git_path(directory), object.map(str::to_owned)))
+    let input = requests
+        .iter()
+        .flatten()
+        .map(|path| format!("{commit}:{path}\n"))
+        .collect::<String>();
+    let mut child = git_command(repo_root)
+        .args(["cat-file", "--batch", "--follow-symlinks"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to execute git cat-file")?;
+    let mut stdin = child.stdin.take().context("cannot write to git cat-file")?;
+    // Written apart from the read, so a full output pipe cannot block it.
+    let writer = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output().context("git cat-file failed")?;
+    let written = writer.join();
+    if !output.status.success() || !matches!(written, Ok(Ok(()))) {
+        bail!(
+            "git cat-file failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut rest = output.stdout.as_slice();
+    requests
+        .iter()
+        .map(|request| match request {
+            Some(_) => next_tree_file(&mut rest),
+            None => Ok(TreeFile::Unresolved),
         })
-        .collect())
+        .collect()
+}
+
+/// Reads one `cat-file --batch --follow-symlinks` answer from `rest`.
+fn next_tree_file(rest: &mut &[u8]) -> Result<TreeFile> {
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("truncated git cat-file output")?;
+    let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+    *rest = &rest[end + 1..];
+    if header.ends_with(" missing") {
+        return Ok(TreeFile::Missing);
+    }
+    let fields = header.split(' ').collect::<Vec<_>>();
+    let (kind, size) = match fields[..] {
+        [_, kind, size] | [kind, size] => (kind, size),
+        _ => bail!("unexpected git cat-file output {header}"),
+    };
+    let size = size
+        .parse::<usize>()
+        .with_context(|| format!("unexpected git cat-file output {header}"))?;
+    let body = rest
+        .get(..size)
+        .filter(|_| rest.get(size) == Some(&b'\n'))
+        .context("truncated git cat-file output")?;
+    *rest = &rest[size + 1..];
+    Ok(match (fields.len(), kind) {
+        (3, "blob") => TreeFile::Content(body.to_vec()),
+        (3, _) | (2, "notdir") => TreeFile::Missing,
+        _ => TreeFile::Unresolved,
+    })
 }
 
 /// `ls-tree -z` entries, `<mode> <type> <object>\t<path>`, as the object
@@ -259,7 +324,7 @@ fn tree_entries(listing: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
 }
 
 /// The content of blob `object`, or `None` when Git cannot read it.
-pub(crate) fn read_blob(repo_root: &Path, object: &str) -> Option<Vec<u8>> {
+fn read_blob(repo_root: &Path, object: &str) -> Option<Vec<u8>> {
     match git_command(repo_root)
         .args(["cat-file", "blob", object])
         .output()
@@ -576,6 +641,31 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn batch_answers_follow_links_only_inside_the_tree() {
+        let output = concat!(
+            "0123 blob 2\n{}\n",
+            "c:x/.pickcheck.json missing\n",
+            "4567 tree 3\nabc\n",
+            "notdir 4\nc:ab\n",
+            "symlink 9\n../out.js\n",
+            "dangling 4\nc:ab\n",
+            "loop 4\nc:ab\n",
+        );
+        let mut rest = output.as_bytes();
+        let answers = (0..7)
+            .map(|_| next_tree_file(&mut rest).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rest.is_empty());
+        use TreeFile::{Content, Missing, Unresolved};
+        let expected = [Content(b"{}".to_vec()), Missing, Missing, Missing];
+        assert_eq!(answers[..4], expected);
+        assert_eq!(answers[4..], [Unresolved, Unresolved, Unresolved]);
+        for broken in ["0123 blob 5\n{}\n", "odd\n", "0123 blob x\n", "no newline"] {
+            assert!(next_tree_file(&mut broken.as_bytes()).is_err(), "{broken}");
+        }
     }
 
     #[test]

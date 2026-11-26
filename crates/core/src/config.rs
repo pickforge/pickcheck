@@ -1,6 +1,5 @@
 use std::{
-    cell::OnceCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -12,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     Metric, Status,
-    diff::{named_entries, read_blob},
+    diff::{TreeFile, files_at},
 };
 
 const DEFAULTS: &str = include_str!("../../../config.default.json");
@@ -181,69 +180,105 @@ pub fn load_config(start: &Path, explicit: Option<&Path>) -> Result<ConfigResolu
     resolve(value, chain)
 }
 
-/// The repository configs of one commit: listed once, each read on first
-/// use.
+/// The repository configs of one commit that the lookups from a set of
+/// starts can reach, read with one Git command.
 pub struct CommitConfigs {
     repo_root: PathBuf,
     commit: String,
-    /// By directory relative to the root.
-    entries: BTreeMap<PathBuf, CommitConfig>,
-}
-
-struct CommitConfig {
-    /// `None` for an entry that is not a file.
-    object: Option<String>,
-    content: OnceCell<Option<Vec<u8>>>,
+    /// The config of each directory a lookup reaches, by its path relative
+    /// to the root.
+    entries: BTreeMap<PathBuf, TreeFile>,
+    differs: bool,
 }
 
 impl CommitConfigs {
-    pub fn read(repo_root: &Path, commit: &str) -> Result<Self> {
-        let entries = named_entries(repo_root, commit, REPO_CONFIG)?
+    /// Reads the config at `commit` of every directory from each of `starts`
+    /// up to the repository root. A start is a file or a directory, as for
+    /// `load_config`.
+    pub fn read(repo_root: &Path, commit: &str, starts: &[PathBuf]) -> Result<Self> {
+        let directories = starts
+            .iter()
+            .flat_map(|start| lookup_directory(start).ancestors())
+            .filter_map(|directory| directory.strip_prefix(repo_root).ok())
+            .collect::<BTreeSet<_>>();
+        let paths = directories
+            .iter()
+            .map(|directory| directory.join(REPO_CONFIG))
+            .collect::<Vec<_>>();
+        let files = files_at(repo_root, commit, &paths)?;
+        let entries = directories
             .into_iter()
-            .map(|(directory, object)| {
-                let content = OnceCell::new();
-                (directory, CommitConfig { object, content })
-            })
+            .map(Path::to_path_buf)
+            .zip(files)
             .collect();
-        Ok(Self {
+        let mut configs = Self {
             repo_root: repo_root.to_path_buf(),
             commit: commit.to_owned(),
             entries,
-        })
+            differs: false,
+        };
+        configs.differs = starts.iter().any(|start| configs.lookup_differs(start));
+        Ok(configs)
     }
 
     pub fn commit(&self) -> &str {
         &self.commit
     }
 
-    /// The nearest config from `start` up to the root, labelled
-    /// `<commit>:<path>`.
-    fn nearest(&self, start: &Path) -> Result<Option<(PathBuf, String)>> {
-        let start = if start.is_file() {
-            start.parent().unwrap_or(start)
-        } else {
-            start
-        };
-        for directory in start.ancestors() {
+    /// Whether a working-tree lookup from a start reaches a config that
+    /// differs from the commit: content that it reads, through a link too,
+    /// where the commit has none or other content, or none where the commit
+    /// has one.
+    pub fn differs_from_working_tree(&self) -> bool {
+        self.differs
+    }
+
+    fn lookup_differs(&self, start: &Path) -> bool {
+        for directory in lookup_directory(start).ancestors() {
             let Ok(relative) = directory.strip_prefix(&self.repo_root) else {
                 break;
             };
-            let Some(entry) = self.entries.get(relative) else {
-                continue;
+            let path = directory.join(REPO_CONFIG);
+            let working = path.is_file().then(|| fs::read(&path).ok());
+            let same = match (self.entries.get(relative), &working) {
+                (Some(TreeFile::Missing), None) => true,
+                (Some(TreeFile::Content(base)), Some(Some(content))) => base == content,
+                _ => false,
+            };
+            if !same || working.is_some() {
+                return !same;
+            }
+        }
+        false
+    }
+
+    /// The nearest config from `start` up to the root, labelled
+    /// `<commit>:<path>`.
+    fn nearest(&self, start: &Path) -> Result<Option<(PathBuf, String)>> {
+        for directory in lookup_directory(start).ancestors() {
+            let Ok(relative) = directory.strip_prefix(&self.repo_root) else {
+                break;
             };
             let label = format!("{}:{}", self.commit, relative.join(REPO_CONFIG).display());
-            let content = entry.content.get_or_init(|| {
-                let object = entry.object.as_deref()?;
-                read_blob(&self.repo_root, object)
-            });
-            let Some(bytes) = content else {
-                bail!("cannot read config {label}");
+            let bytes = match self.entries.get(relative) {
+                Some(TreeFile::Missing) => continue,
+                Some(TreeFile::Content(bytes)) => bytes,
+                Some(TreeFile::Unresolved) | None => bail!("cannot read config {label}"),
             };
             let text = String::from_utf8(bytes.clone())
                 .with_context(|| format!("invalid JSON in {label}"))?;
             return Ok(Some((PathBuf::from(label), text)));
         }
         Ok(None)
+    }
+}
+
+/// The directory where a config lookup from `start` begins.
+fn lookup_directory(start: &Path) -> &Path {
+    if start.is_file() {
+        start.parent().unwrap_or(start)
+    } else {
+        start
     }
 }
 
@@ -880,7 +915,9 @@ mod tests {
         fs::write(root.join(REPO_CONFIG), r#"{"limits":{"depth":null}}"#).unwrap();
         fs::remove_file(package.join(REPO_CONFIG)).unwrap();
 
-        let configs = CommitConfigs::read(&root, &commit).unwrap();
+        let starts = [root.clone(), package.join("a.js")];
+        let configs = CommitConfigs::read(&root, &commit, &starts).unwrap();
+        assert!(configs.differs_from_working_tree());
         let top = load_config_at(&root, &configs).unwrap();
         assert_eq!(top.config.limits.depth, Some(2));
         assert_eq!(
@@ -895,7 +932,8 @@ mod tests {
         fs::write(root.join(REPO_CONFIG), "{").unwrap();
         git(&root, &["commit", "-qam", "broken"]);
         let broken = git(&root, &["rev-parse", "HEAD"]);
-        let configs = CommitConfigs::read(&root, &broken).unwrap();
+        let configs = CommitConfigs::read(&root, &broken, &starts).unwrap();
+        assert!(!configs.differs_from_working_tree());
         let error = load_config_at(&root, &configs).unwrap_err();
         assert_eq!(
             error.to_string(),

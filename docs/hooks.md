@@ -68,9 +68,11 @@ violation in scope, set:
 {"hook": {"fail_on": ["new", "worsened", "unmatched", "improved", "unchanged"]}}
 ```
 
-When any `.pickcheck.json` differs between the base and the working tree,
-hooks read the repository config from the base commit, and the block reason
-starts with a note that says so.
+When a `.pickcheck.json` that a hook would read differs from the base, or the
+diff changes any `.pickcheck.json`, hooks read the repository config from the
+base commit, and the block reason starts with a note that says so. The
+comparison reads content through links, so a config that Git ignores, a
+skip-worktree entry, or a changed link target counts too.
 
 The state lives in `sessions/` under the state directory: one
 `<session>.<key hash>.anchor` file and one append-only

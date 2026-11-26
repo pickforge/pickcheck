@@ -137,6 +137,103 @@ fn loosening_the_config_in_the_session_keeps_the_base_limits() {
     assert_eq!(check.status.code(), Some(0), "{}", text(&check.stdout));
 }
 
+/// The config that the working-tree lookup reads is compared with the base
+/// at the same path, so a config in no diff still makes hooks read the base
+/// config: one that Git ignores, one at the directory of the hook's `cwd`,
+/// and a skip-worktree entry.
+#[test]
+fn a_config_in_no_diff_that_differs_from_the_base_keeps_the_base_limits() {
+    let note = "note: .pickcheck.json changed in this diff; the config comes from";
+    let loose = r#"{"limits":{"cognitive":null},"hook":{"fail_on":["improved"]}}"#;
+    let strict = r#"{"hook":{"max_blocks":20}}"#;
+    let (dir, state) = repo(&[(".pickcheck.json", strict), ("src/a.js", &simple("a"))]);
+    let root = dir.path();
+    start(&state, root, "configs");
+    fs::write(root.join("src/a.js"), violating("a", 16)).unwrap();
+    let blocks = |cwd: &Path| {
+        let input = edit_input(cwd, "configs", &root.join("src/a.js"));
+        let reason = block_reason(&hook(&state, "claude", &input));
+        assert!(reason.starts_with(note), "{reason}");
+        let input = json!({"hook_event_name":"Stop", "session_id":"configs", "cwd":cwd});
+        let reason = block_reason(&hook(&state, "claude", &input));
+        assert!(reason.starts_with(note), "{reason}");
+        assert!(reason.contains(&native("src/a.js  1 function")), "{reason}");
+    };
+
+    // Ignored, through `.gitignore` and through the exclude file.
+    fs::write(root.join(".gitignore"), "src/.pickcheck.json\n").unwrap();
+    fs::write(root.join("src/.pickcheck.json"), loose).unwrap();
+    blocks(root);
+    fs::remove_file(root.join(".gitignore")).unwrap();
+    fs::write(root.join(".git/info/exclude"), "src/.pickcheck.json\n").unwrap();
+    blocks(root);
+    fs::remove_file(root.join("src/.pickcheck.json")).unwrap();
+
+    // Only at the directory of `cwd`, where the hook reads `hook.fail_on`.
+    fs::create_dir(root.join("tools")).unwrap();
+    fs::write(root.join("tools/.pickcheck.json"), loose).unwrap();
+    blocks(&root.join("tools"));
+    fs::remove_file(root.join("tools/.pickcheck.json")).unwrap();
+
+    // A skip-worktree entry.
+    git(
+        root,
+        &["update-index", "--skip-worktree", ".pickcheck.json"],
+    );
+    fs::write(root.join(".pickcheck.json"), loose).unwrap();
+    blocks(root);
+
+    // The same config as the base: no note.
+    fs::write(root.join(".pickcheck.json"), strict).unwrap();
+    let reason = block_reason(&edit(&state, root, "configs", "src/a.js"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+}
+
+/// A config link reads through its target, at the base as in the working
+/// tree. A base link that leaves the repository is the state note.
+#[cfg(unix)]
+#[test]
+fn config_links_are_compared_through_their_targets() {
+    let note = "note: .pickcheck.json changed in this diff; the config comes from";
+    let relaxed = r#"{"limits":{"cognitive":null}}"#;
+    let (dir, state) = repo(&[("cfg/pc.json", "{}"), ("a.js", &simple("a"))]);
+    let root = dir.path();
+    std::os::unix::fs::symlink("cfg/pc.json", root.join(".pickcheck.json")).unwrap();
+    commit_all(root, "link");
+    start(&state, root, "links");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+
+    // An unchanged link: the working tree config, no note.
+    let reason = block_reason(&edit(&state, root, "links", "a.js"));
+    assert!(reason.starts_with("FAIL 1 changed file"), "{reason}");
+
+    // The target loosens the link, then a plain file replaces the link.
+    fs::write(root.join("cfg/pc.json"), relaxed).unwrap();
+    let reason = block_reason(&edit(&state, root, "links", "a.js"));
+    assert!(reason.starts_with(note), "{reason}");
+    fs::remove_file(root.join(".pickcheck.json")).unwrap();
+    fs::write(root.join(".pickcheck.json"), relaxed).unwrap();
+    let reason = block_reason(&stop(&state, root, "links"));
+    assert!(reason.starts_with(note), "{reason}");
+
+    // A base link that leaves the repository cannot be read at the base.
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("pc.json"), "{}").unwrap();
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    let target = outside.path().join("pc.json");
+    std::os::unix::fs::symlink(target, root.join(".pickcheck.json")).unwrap();
+    commit_all(root, "outside link");
+    start(&state, root, "outside");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    let output = edit(&state, root, "outside", "a.js");
+    let stderr = text(&output.stderr);
+    let unavailable = "note: hook session state unavailable, the hook runs without a session: ";
+    assert!(stderr.starts_with(unavailable), "{stderr}");
+    assert!(stderr.contains("cannot read config"), "{stderr}");
+    assert!(block_reason(&output).starts_with("FAIL 1 file, 1 function"));
+}
+
 #[test]
 fn legacy_violations_block_only_with_their_status_in_fail_on() {
     for (config, blocks) in [("{}", false), (ALL_STATUSES, true)] {
@@ -631,14 +728,21 @@ fn one_event_runs_each_git_command_once() {
     let (output, commands) = traced(&state, &input);
     block_reason(&output);
     // Locate, names and untracked for the record, merge base, the edited
-    // file's names and hunks, and its base content.
-    assert_eq!(commands.len(), 8, "{commands:#?}");
+    // file's names and hunks, the base configs, and its base content.
+    assert_eq!(commands.len(), 9, "{commands:#?}");
+    assert!(commands[6].starts_with("cat-file --batch"), "{commands:#?}");
 
     let input = json!({"hook_event_name":"Stop", "session_id":"count", "cwd":root});
     let (output, commands) = traced(&state, &input);
     block_reason(&output);
     // The same, with whole-tree names and hunks from the base.
-    assert_eq!(commands.len(), 8, "{commands:#?}");
+    assert_eq!(commands.len(), 9, "{commands:#?}");
+
+    // A changed config adds no command: the base configs are already read.
+    fs::write(root.join(".pickcheck.json"), "{}").unwrap();
+    let (output, commands) = traced(&state, &input);
+    assert!(block_reason(&output).starts_with("note: .pickcheck.json changed"));
+    assert_eq!(commands.len(), 9, "{commands:#?}");
 }
 
 /// Past 100 recorded files that no longer exist, the names diff of an edit
@@ -775,9 +879,9 @@ fn an_edited_ignored_file_is_checked_whole_with_no_base() {
     fs::write(root.join("gen").join("new.js"), edited).unwrap();
     let input = edit_input(root, "ignored", &root.join("gen").join("new.js"));
     let (output, commands) = traced(&state, &input);
-    // Locate, names and untracked for the record, the hunks, and the index
-    // entry; a file with no base reads none.
-    assert_eq!(commands.len(), 5, "{commands:#?}");
+    // Locate, names and untracked for the record, the hunks, the index
+    // entry, and the base configs; a file with no base reads no content.
+    assert_eq!(commands.len(), 6, "{commands:#?}");
     assert!(commands[4].starts_with("ls-files --stage"), "{commands:#?}");
     let reason = block_reason(&output);
     assert!(

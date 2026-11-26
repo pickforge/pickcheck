@@ -359,7 +359,7 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
         return pass(input, stop);
     };
     let snapshot = Snapshot::read(repo)?;
-    let session = changed_gate(input, &snapshot);
+    let session = changed_gate(input, cwd, &snapshot);
     let head = || Ok(Gate::new(Mode::Head(snapshot.clone().head_changes()?)));
     let outcome = Outcome::of(session, head, cwd, &[])?;
     let Some(report) = outcome.report else {
@@ -452,27 +452,32 @@ fn post_edit_gate(input: &HookInput, cwd: &Path, path: &Path) -> Result<Option<G
         return Ok(None);
     };
     edited
-        .map(|edited| session_gate(snapshot, &session, Some(&edited)))
+        .map(|edited| session_gate(cwd, snapshot, &session, Some(&edited)))
         .transpose()
 }
 
 /// The session gate for `Stop` and for an edit event that names no file.
 /// `None` without a session id and after a note when the session state is
 /// unusable.
-fn changed_gate(input: &HookInput, snapshot: &Snapshot) -> Result<Option<Gate>> {
+fn changed_gate(input: &HookInput, cwd: &Path, snapshot: &Snapshot) -> Result<Option<Gate>> {
     if input.session_id.is_empty() {
         return Ok(None);
     }
     let Some(session) = open_session_or_note(input, snapshot, None) else {
         return Ok(None);
     };
-    session_gate(snapshot.clone(), &session, None).map(Some)
+    session_gate(cwd, snapshot.clone(), &session, None).map(Some)
 }
 
 /// The session's changes since its base, restricted to the files it
 /// recorded, or to `edited` for an edit. When the anchor is unusable the
 /// gate is the one outside a session, with a note.
-fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) -> Result<Gate> {
+fn session_gate(
+    cwd: &Path,
+    snapshot: Snapshot,
+    session: &Session,
+    edited: Option<&Path>,
+) -> Result<Gate> {
     let repo = &snapshot.repo;
     let base = if session.anchor() == repo.head {
         Some(repo.head.clone())
@@ -500,19 +505,49 @@ fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) ->
     };
     changes.spans.retain(|path, _| kept(path));
     changes.untracked.retain(kept);
-    let configs = config_changed(&changes)
-        .then(|| CommitConfigs::read(&changes.repo_root, &base))
-        .transpose()?;
     if let Some(edited) = edited
         && edited_outside_diff(&changes, edited)
     {
         changes.untracked.push(edited.to_path_buf());
     }
+    let configs = base_configs(cwd, &changes, &base, edited)?;
     Ok(Gate::new(Mode::Session {
         changes,
         base,
         configs,
     }))
+}
+
+/// The configs of `base` when the config of a checked file or of `cwd`
+/// differs from it, or when the diff changes any config. `None` also when
+/// no file is checked.
+fn base_configs(
+    cwd: &Path,
+    changes: &ChangedFiles,
+    base: &str,
+    edited: Option<&Path>,
+) -> Result<Option<CommitConfigs>> {
+    let checked = match edited {
+        Some(edited) => vec![edited]
+            .into_iter()
+            .filter(|path| in_diff(changes, path))
+            .collect(),
+        None => changes
+            .spans
+            .keys()
+            .chain(&changes.untracked)
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>(),
+    };
+    if checked.is_empty() {
+        return Ok(None);
+    }
+    let root = &changes.repo_root;
+    let mut starts = vec![cwd.to_path_buf()];
+    starts.extend(checked.into_iter().map(|path| root.join(path)));
+    let configs = CommitConfigs::read(root, base, &starts)?;
+    let changed = config_changed(changes) || configs.differs_from_working_tree();
+    Ok(changed.then_some(configs))
 }
 
 /// Whether `edited` exists, is in no diff, and is not a plainly tracked
@@ -521,10 +556,15 @@ fn session_gate(snapshot: Snapshot, session: &Session, edited: Option<&Path>) ->
 /// base, as an untracked file is. A plainly tracked file in no diff equals
 /// the base, so it has nothing to check.
 fn edited_outside_diff(changes: &ChangedFiles, edited: &Path) -> bool {
-    let listed =
-        changes.spans.contains_key(edited) || changes.untracked.iter().any(|path| path == edited);
     let root = &changes.repo_root;
-    !listed && fs::symlink_metadata(root.join(edited)).is_ok() && !is_plainly_tracked(root, edited)
+    !in_diff(changes, edited)
+        && fs::symlink_metadata(root.join(edited)).is_ok()
+        && !is_plainly_tracked(root, edited)
+}
+
+/// Whether the diff has a post-image of `path` or lists it as untracked.
+fn in_diff(changes: &ChangedFiles, path: &Path) -> bool {
+    changes.spans.contains_key(path) || changes.untracked.iter().any(|item| item == path)
 }
 
 /// The diff from `base`, with the names diff when it differs from the one

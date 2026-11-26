@@ -921,12 +921,13 @@ is `HEAD`, the names diff against `HEAD` serves as the names diff from the
 base. Otherwise one `merge-base` and one names diff from the base follow. The
 hunks come from one `diff --unified=0` from the base. Each file with a
 violation then reads its base content with one `ls-tree` and one `cat-file`.
-When a `.pickcheck.json` changed, one `ls-tree -r` lists the configs of the
-base commit, and one `cat-file` reads each config that a lookup reaches. An
-edited file that exists and is in no diff adds one `ls-files --stage`; it has
-no base to read. A post-edit or `Stop` event with one violating file therefore runs at most 8
-commands, and 2 more for each other violating file. A config change adds 1
-command, and 1 more for each config that is read.
+An edited file that exists and is in no diff adds one `ls-files --stage`; it
+has no base to read. When at least one file is checked, one `cat-file --batch
+--follow-symlinks` reads the base config of every directory from each checked
+file and from `cwd` up to the root, which serves both the comparison and the
+base config. A post-edit or `Stop` event with one violating file therefore
+runs at most 9 commands, and 2 more for each other violating file. A config
+change adds none.
 
 Status. Every violation in the set is compared with the base, as under
 `--base`. The config key `hook.fail_on` lists the statuses that block, by
@@ -936,14 +937,24 @@ prints nothing and counts as a clean run for the loop guard. The block reason
 is the `--base` summary, and its `DETAILS` line names the base commit and the
 fail set.
 
-Config. When the diff from the base adds, edits, deletes, or renames any
-`.pickcheck.json`, hooks read the repository config from the base commit. For
-each checked file this is the nearest `.pickcheck.json` in the tree of the
-base commit, from the file's directory up to the repository root, and then
-the working tree above the root. The configs of the base commit are listed
-once per event. That config gives the limits, `ignore`, the
-test patterns, `hook.max_blocks`, and `hook.fail_on`. The user config and the
-built-in defaults resolve as usual. The block reason starts with
+Config. Hooks read the repository config from the base commit when a config
+that they would read differs from the base. The working-tree lookup for each
+checked file and for `cwd` walks from its directory up to the repository root
+and stops at the first `.pickcheck.json` that is a file. At every directory
+that it reaches, the hook compares what the lookup would read there, through
+a link too, with the file at the same path in the base commit, read through
+links that stay inside the base tree. A config on one side only, or content
+that differs, is a change. A config that Git ignores, a skip-worktree entry,
+and a changed link target therefore count, as does a name that the file
+system matches without regard to case. A diff from the base that adds,
+edits, deletes, or renames any `.pickcheck.json` is also a change. For each
+checked file the config then is the nearest `.pickcheck.json` in the tree of
+the base commit, from the file's directory up to the repository root, and
+then the working tree above the root. That config gives the limits, `ignore`,
+the test patterns, `hook.max_blocks`, and `hook.fail_on`. The user config and
+the built-in defaults resolve as usual. A base link that leaves the
+repository, dangles, or loops cannot be read: when a lookup reaches it, the
+session gate fails (see State failures). The block reason starts with
 `note: .pickcheck.json changed in this diff; the config comes from <base>`,
 and other scan notes follow it.
 
@@ -959,8 +970,7 @@ HEAD; the hook checks the diff against HEAD`.
 Known limits. A file that a shell command changes and that is committed
 before any later hook event is not attributed to the session. An installer
 can close this by sending shell tool events to the hook, because every event
-records the changed files. A `.pickcheck.json` that Git ignores is in no
-diff, so a change to it does not make hooks read the base config.
+records the changed files.
 
 ### `init`
 

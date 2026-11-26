@@ -1628,8 +1628,12 @@ fn links_resolve_like_the_file_system() {
         assert!(!leaf_text.contains("legacy.js"), "stdout: {leaf_text}");
     }
 
-    // The loop guard reads `hook.max_blocks` from the repository of a linked cwd.
+    // The loop guard reads `hook.max_blocks` from the repository of a linked
+    // cwd. The config is committed: in a session a config that differs from
+    // the base never applies.
     fs::write(real.join(".pickcheck.json"), r#"{"hook":{"max_blocks":1}}"#).unwrap();
+    git(&real, &["add", "-f", ".pickcheck.json"]);
+    git(&real, &["commit", "-qm", "config"]);
     let sub = dir.path().join("sub");
     symlink(real.join("src"), &sub).unwrap();
     let stop =
