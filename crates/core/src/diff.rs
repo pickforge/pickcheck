@@ -786,10 +786,18 @@ pub fn untracked_files(cwd: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The post-image line ranges of each file in `git diff --unified=0`
+/// output. Each hunk body is read by the line counts of its header, so a
+/// changed line that looks like a file or hunk header is never read as one.
 pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
     let mut result = BTreeMap::new();
     let mut file = None;
-    for line in diff.lines() {
+    let mut lines = diff.lines();
+    while let Some(line) = lines.next() {
+        if line.starts_with("diff ") {
+            file = None;
+            continue;
+        }
         if let Some(path) = line.strip_prefix("+++ ") {
             file = diff_path(path);
             if let Some(path) = &file {
@@ -797,43 +805,101 @@ pub fn parse_diff_hunks(diff: &str) -> BTreeMap<PathBuf, Vec<LineRange>> {
             }
             continue;
         }
-        if !line.starts_with("@@") {
+        let Some((old, new)) = hunk_header(line) else {
             continue;
-        }
+        };
+        skip_hunk_body(&mut lines, old.1, new.1);
         let Some(path) = file.as_ref() else { continue };
-        if let Some(range) = post_image_range(line) {
+        if new.1 > 0 {
             result
                 .entry(path.clone())
                 .or_insert_with(Vec::new)
-                .push(range);
+                .push(LineRange {
+                    start: new.0,
+                    end: new.0 + new.1 - 1,
+                });
         }
     }
     result
 }
 
-fn diff_path(value: &str) -> Option<PathBuf> {
-    if value == "/dev/null" {
-        return None;
+/// The start and line count of the old and the new side of a hunk header
+/// `@@ -<start>[,<count>] +<start>[,<count>] @@`. A count left out is 1.
+fn hunk_header(line: &str) -> Option<((usize, usize), (usize, usize))> {
+    let mut sides = line.strip_prefix("@@ ")?.split(' ');
+    let side = |text: Option<&str>, sign: char| -> Option<(usize, usize)> {
+        let mut values = text?.strip_prefix(sign)?.split(',');
+        let start = values.next()?.parse().ok()?;
+        let count = values.next().map_or(Some(1), |count| count.parse().ok())?;
+        Some((start, count))
+    };
+    Some((side(sides.next(), '-')?, side(sides.next(), '+')?))
+}
+
+/// Consumes the body of a hunk with `old` removed and `new` added lines. A
+/// context line counts on both sides; a `\ No newline at end of file` line
+/// counts on neither.
+fn skip_hunk_body<'a>(lines: &mut impl Iterator<Item = &'a str>, mut old: usize, mut new: usize) {
+    while old > 0 || new > 0 {
+        let Some(line) = lines.next() else { return };
+        match line.as_bytes().first() {
+            Some(b'-') => old = old.saturating_sub(1),
+            Some(b'+') => new = new.saturating_sub(1),
+            Some(b'\\') => {}
+            _ => {
+                old = old.saturating_sub(1);
+                new = new.saturating_sub(1);
+            }
+        }
     }
-    let value = value.split('\t').next().unwrap_or(value);
+}
+
+/// The path of a `+++` header with its `b/` prefix removed, decoded when Git
+/// quotes it. `None` for `/dev/null`.
+fn diff_path(value: &str) -> Option<PathBuf> {
+    let value = match value.strip_prefix('"') {
+        Some(quoted) => unquote(quoted)?,
+        None if value == "/dev/null" => return None,
+        None => value.split('\t').next().unwrap_or(value).to_owned(),
+    };
     let path = value.strip_prefix("b/")?;
     Some(git_path(path))
 }
 
-fn post_image_range(header: &str) -> Option<LineRange> {
-    let plus = header
-        .split_whitespace()
-        .find(|part| part.starts_with('+'))?;
-    let mut values = plus.trim_start_matches('+').split(',');
-    let start = values.next()?.parse().ok()?;
-    let count = values
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1);
-    (count > 0).then_some(LineRange {
-        start,
-        end: start + count - 1,
-    })
+/// Decodes the C-style quoting that Git uses for a path with a `"`, a `\`,
+/// or a control character: the text after the opening quote, up to the
+/// closing one, with `\"`, `\\`, `\t`, `\n`, the other letter escapes, and
+/// three-digit octal byte escapes. `None` when the quote does not close.
+fn unquote(text: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut rest = text.bytes();
+    loop {
+        let byte = match rest.next()? {
+            b'"' => break,
+            b'\\' => match rest.next()? {
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b't' => b'\t',
+                b'n' => b'\n',
+                b'v' => 0x0b,
+                b'f' => 0x0c,
+                b'r' => b'\r',
+                digit @ b'0'..=b'3' => {
+                    let mut value = digit - b'0';
+                    for _ in 0..2 {
+                        let digit = rest.next().filter(|digit| (b'0'..=b'7').contains(digit))?;
+                        value = value * 8 + (digit - b'0');
+                    }
+                    value
+                }
+                quoted @ (b'"' | b'\\') => quoted,
+                _ => return None,
+            },
+            other => other,
+        };
+        bytes.push(byte);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -998,9 +1064,66 @@ mod tests {
         assert_eq!(physical(&physical(&dir)), physical(&dir));
     }
 
+    /// A body line is read by the counts of its hunk header, never as a
+    /// header, also next to `\ No newline at end of file` lines.
+    #[test]
+    fn hunk_bodies_are_read_by_their_line_counts() {
+        let diff = concat!(
+            "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n",
+            "@@ -0,0 +1,4 @@\n+/*\n+++ /dev/null\n+@@ -1 +100,9 @@\n+*/\n",
+            "@@ -5 +8,2 @@\n-x\n\\ No newline at end of file\n+-- y\n+z\n",
+            "\\ No newline at end of file\n",
+            "@@ -9,2 +12 @@ f\n--- a/b.js\n-- old\n++++ b/c.js\n",
+            "diff --git a/b.js b/b.js\n--- a/b.js\n+++ b/b.js\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let spans = parse_diff_hunks(diff);
+        let ranges = |pairs: &[(usize, usize)]| {
+            pairs
+                .iter()
+                .map(|&(start, end)| LineRange { start, end })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spans[Path::new("a.js")],
+            ranges(&[(1, 4), (8, 9), (12, 12)])
+        );
+        assert_eq!(spans[Path::new("b.js")], ranges(&[(1, 1)]));
+        // Lines that only look like headers name no file.
+        assert_eq!(spans.len(), 2, "{spans:?}");
+    }
+
+    #[test]
+    fn quoted_paths_are_decoded_before_the_prefix_is_removed() {
+        for (header, path) in [
+            (r#""b/we\"ird.js""#, "we\"ird.js"),
+            (r#""b/a\tb.js""#, "a\tb.js"),
+            (r#""b/back\\slash\n.js""#, "back\\slash\n.js"),
+            (r#""b/caf\303\251.js""#, "caf\u{e9}.js"),
+            ("b/plain name.js\t", "plain name.js"),
+        ] {
+            assert_eq!(diff_path(header), Some(git_path(path)), "{header}");
+        }
+        for header in [
+            "/dev/null",
+            r#""b/open.js"#,
+            r#""a/b.js""#,
+            r#""b/bad\8xx.js""#,
+            "b.js",
+        ] {
+            assert_eq!(diff_path(header), None, "{header}");
+        }
+        let diff = "+++ \"b/a\\tb.js\"\n@@ -0,0 +1 @@\n+x\n";
+        assert!(parse_diff_hunks(diff).contains_key(&git_path("a\tb.js")));
+    }
+
     #[test]
     fn synthetic_hunks_use_post_image_and_skip_deletions() {
-        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\t\n@@ -2,2 +2,3 @@\n@@ -10,2 +11,0 @@\n@@ -20 +19 @@\n";
+        let diff = concat!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\t\n",
+            "@@ -2,2 +2,3 @@\n-a\n-b\n+a\n+b\n+c\n",
+            "@@ -10,2 +11,0 @@\n-d\n-e\n",
+            "@@ -20 +19 @@\n-f\n+g\n",
+        );
         let spans = parse_diff_hunks(diff);
         assert_eq!(
             spans[Path::new("a.rs")],

@@ -404,6 +404,35 @@ fn changed_explicit_paths_normalize_parent_components() {
     }
 }
 
+/// A changed line that looks like a file header, and a path that Git quotes,
+/// keep their hunks: `check --changed` reports the new function in each.
+#[test]
+fn changed_hunks_survive_header_like_lines_and_quoted_paths() {
+    let clean = "function ok(x) {\n  return 1;\n}\n";
+    let bad = "function bad(p0, p1, p2, p3, p4, p5, p6) {\n  return p0;\n}\n";
+    // Windows file names cannot hold a tab or a quote.
+    let names: &[&str] = if cfg!(unix) {
+        &["a.js", "we\"ird.js", "a\tb.js"]
+    } else {
+        &["a.js"]
+    };
+    for name in names {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let base = format!("{clean}{}// end\n", "\n".repeat(7));
+        fs::write(root.join(name), &base).unwrap();
+        init_repo(root);
+        commit_all(root, "initial");
+        let grown = format!("/*\n++ /dev/null\n*/\n{base}{bad}");
+        fs::write(root.join(name), grown).unwrap();
+        let output = command_output(root, &["check", "--changed", "--format", "json"]);
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["violations"][0]["function"], "bad", "{name}");
+        assert_eq!(report["violations"][0]["file"], *name, "{name}");
+    }
+}
+
 #[test]
 fn changed_config_note_covers_deleted_and_renamed_configs() {
     let dir = tempfile::tempdir().unwrap();

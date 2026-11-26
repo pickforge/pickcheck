@@ -88,6 +88,11 @@
   encoding attribute, a clean filter, or a renamed link hides from the hunks
   still blocks, and old debt that the session leaves as it was is still
   never listed. A file with any violation now reads its base content. (#53)
+- `check --changed`, `check --base`, and hooks now read each hunk by the line
+  counts in its header, so an added line such as `++ /dev/null` inside a
+  comment no longer drops the rest of the file's changes. A path that Git
+  quotes, such as one with a `"` or a tab, is now decoded, so its changes
+  are checked instead of skipped. (#53)
 - `check --changed`, `check --base`, and hooks now diff every file as text.
   Before, a `-diff` or `binary` attribute, or a NUL byte in a source file,
   made Git report the file as binary with no changed lines, so its changes
