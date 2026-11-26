@@ -666,9 +666,9 @@ fn base_configs(
 }
 
 /// Adds `edited` when it exists and is in no diff. A plainly tracked file is
-/// scanned with its base and no touched unit, so only `new` and `worsened`
-/// violations remain; Git can hide a change, for example through a clean
-/// filter. Any other such file, as an ignored file, a file of a nested
+/// scanned with its base and no touched unit, so only `new`, `worsened`,
+/// and `unmatched` violations remain; Git can hide a change, for example
+/// through a clean filter. Any other such file, as an ignored file, a file of a nested
 /// repository or a submodule, a skip-worktree entry, or a link, is checked
 /// whole with no base, as an untracked file is.
 fn add_edited_outside_diff(changes: &mut ChangedFiles, edited: &Path) {

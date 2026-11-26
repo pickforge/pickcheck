@@ -1043,8 +1043,8 @@ default `hook.fail_on`. The exception is a plainly tracked file: `git ls-files
 --stage -v` lists exactly one stage-0 entry at that exact path, with the tag
 `H` and a regular file mode. Git can hide a change from every diff, as a
 clean filter does, so such a file in no diff is compared with the base with
-no touched unit, and only its `new` and `worsened` violations remain (see
-Status). A file that Git ignores, a file of a nested repository or a
+no touched unit, and only its `new`, `worsened`, and `unmatched` violations
+remain (see Status). A file that Git ignores, a file of a nested repository or a
 submodule, a skip-worktree or assume-unchanged entry, and a symbolic link are
 therefore checked whole. So is any file when that `ls-files` fails. A file
 outside the diff that the event does not edit is never checked, and `Stop`
@@ -1168,7 +1168,9 @@ lookup. A config that another
 process rewrites while one hook event runs can be read in two states by that
 event; the next event sees the change. Pruning a session that has been idle
 for 30 days can race with that session's next event, which then starts the
-session with a new anchor.
+session with a new anchor. A unit whose text a checkout rewrites, as the
+`ident` attribute does, finds no base unit by its text; it then pairs as
+under `--base`.
 
 ### `init`
 
