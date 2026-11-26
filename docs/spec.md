@@ -884,9 +884,10 @@ parse is skipped, not a failure. So is a record that is empty, has a NUL
 byte, or has a component other than a normal one, such as an absolute path
 or `..`. The loop guard keeps its own error behavior.
 
-Notes. Every stderr note that session code writes, the state note above and
-the `note: UNVERIFIED` lines, is one write whose failure is ignored, so a
-stderr that cannot be written never changes the exit code or stdout. A
+Notes. Every stderr note that session code writes, the state note above, the
+anchor note (see Fallbacks), and the `note: UNVERIFIED` lines, is one write
+whose failure is ignored, so a stderr that cannot be written never changes
+the exit code or stdout. A
 session run that does not block, including one whose violations are all
 `WARN`, writes the `note: UNVERIFIED <file>  <reason>` lines of its
 unverified files, under the 20-path cap, as a hook outside a session does.
@@ -972,7 +973,8 @@ and the repository config comes from the working tree. Without a session id
 nothing is recorded. When the anchor names no commit or has no merge base
 with `HEAD`, hooks behave the same way, and a block reason starts with
 `note: session anchor <anchor> does not resolve or has no merge base with
-HEAD; the hook checks the diff against HEAD`.
+HEAD; the hook checks the diff against HEAD`. A run that does not block writes
+the same note to stderr, before its `note: UNVERIFIED` lines.
 
 Known limits. A file that a shell command changes and that is committed
 before any later hook event is not attributed to the session. An installer

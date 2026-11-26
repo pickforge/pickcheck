@@ -94,7 +94,8 @@ continued from the physical one keeps one anchor.
 
 Outside Git, without `HEAD`, or without a session ID, hooks work as before
 sessions. When the anchor no longer resolves or has no merge base with `HEAD`,
-they work as before and the block reason starts with a note.
+they work as before, and the block reason starts with a note. A run that
+does not block writes that note to stderr.
 
 A file that a shell command changes and commits before the next hook event is
 not attributed to the session. An installer can close this gap by sending

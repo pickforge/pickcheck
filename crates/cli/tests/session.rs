@@ -497,6 +497,24 @@ fn an_unusable_anchor_falls_back_to_head_with_a_note() {
         reason.starts_with(&format!("note: session anchor {initial} ")),
         "{reason}"
     );
+
+    // A fallback that does not block writes the note to stderr.
+    let (dir, state) = repo(&[("a.js", &simple("a"))]);
+    let root = dir.path();
+    let initial = head(root);
+    start(&state, root, "quiet");
+    fs::write(root.join("a.js"), violating("a", 16)).unwrap();
+    commit_all(root, "violation in the session");
+    git(root, &["checkout", "-q", "--orphan", "fresh"]);
+    commit_all(root, "unrelated root");
+    let output = stop(&state, root, "quiet");
+    assert!(output.stdout.is_empty(), "{}", text(&output.stdout));
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "note: session anchor {initial} does not resolve or has no merge base with HEAD; the hook checks the diff against HEAD\n"
+        )
+    );
 }
 
 #[test]

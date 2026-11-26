@@ -343,7 +343,7 @@ fn report_post_edit(harness: Harness, input: &HookInput, cwd: &Path, path: PathB
     match outcome.report {
         Some(report) => emit_feedback(harness, &report, false),
         None => {
-            note_unverified(&outcome.result);
+            outcome.note_pass();
             Ok(0)
         }
     }
@@ -362,8 +362,8 @@ fn report_changed(harness: Harness, input: &HookInput, cwd: &Path, stop: bool) -
     let session = changed_gate(input, cwd, &snapshot);
     let head = || Ok(Gate::new(Mode::Head(snapshot.clone().head_changes()?)));
     let outcome = Outcome::of(session, head, cwd, &[])?;
-    let Some(report) = outcome.report else {
-        note_unverified(&outcome.result);
+    let Some(report) = &outcome.report else {
+        outcome.note_pass();
         return pass(input, stop);
     };
     if !stop {
@@ -419,6 +419,16 @@ impl Outcome {
             note_without_session(&error);
         }
         Ok(outcome)
+    }
+
+    /// Writes the notes of a run that does not block to stderr: the gate's
+    /// own notes, which a block reason would start with, then the unverified
+    /// files.
+    fn note_pass(&self) {
+        for text in &self.gate.notes {
+            note(&format!("note: {text}\n"));
+        }
+        note_unverified(&self.result);
     }
 
     fn scan(gate: Gate, cwd: &Path, paths: &[PathBuf]) -> Result<Self> {
