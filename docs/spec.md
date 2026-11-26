@@ -913,7 +913,10 @@ finds a rename only between two paths of one diff, so the post-edit names
 diff from the base lists the edited file, every recorded file that no longer
 exists, and every `.pickcheck.json`. Past 100 such recorded files it covers the
 whole tree. An edit of a file outside the repository around `cwd` checks the
-whole file, exactly as without a session, because that file has no base. An
+whole file, exactly as without a session, because that file has no base. A
+file that the diff lists with a post-image and that is a symbolic link on
+disk is checked whole with no base, as an untracked file is, because Git
+diffs the text of the link and not its target. An
 edited file that exists and is in no diff is checked as a whole file with no
 base, as an untracked file is, so its violations are `new` and block with the
 default `hook.fail_on`. The exception is a plainly tracked file: `git ls-files

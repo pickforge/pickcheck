@@ -515,6 +515,7 @@ fn session_gate(
     };
     changes.spans.retain(|path, _| kept(path));
     changes.untracked.retain(kept);
+    check_links_whole(&mut changes);
     if let Some(edited) = edited
         && edited_outside_diff(&changes, edited)
     {
@@ -526,6 +527,25 @@ fn session_gate(
         base,
         configs,
     }))
+}
+
+/// Moves every file with a post-image that is a symbolic link on disk to the
+/// untracked files. Git diffs the link text, not the target, so such a file
+/// is checked whole with no base.
+fn check_links_whole(changes: &mut ChangedFiles) {
+    let root = &changes.repo_root;
+    let links = changes
+        .spans
+        .keys()
+        .filter(|path| {
+            fs::symlink_metadata(root.join(path)).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for link in links {
+        changes.spans.remove(&link);
+        changes.untracked.push(link);
+    }
 }
 
 /// The configs of `base` when the config of a checked file or of `cwd`

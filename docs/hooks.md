@@ -57,7 +57,9 @@ edited file. An edit of a file outside the repository checks the whole file,
 as without a session. An edit of a file that is in no diff checks the whole
 file with no base, so its violations are new, unless the index tracks it as a
 plain file. This covers ignored files, files of nested repositories and
-submodules, skip-worktree entries, and links. Files outside the diff that the
+submodules, skip-worktree entries, and links. A changed link in the diff is
+also checked whole with no base, because Git diffs the link text and not its
+target. Files outside the diff that the
 session does not edit are never checked. Commits made during the session stay in scope. Commits that a
 merge or rebase brings in count only where they touch a recorded file.
 A post-edit or `Stop` event with one violating file runs at most 9 Git

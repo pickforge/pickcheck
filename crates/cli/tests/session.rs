@@ -1045,6 +1045,55 @@ fn an_edited_file_in_no_diff_is_checked_whole_unless_plainly_tracked() {
     }
 }
 
+/// Git diffs a link as its one-line target text, so a changed link, a file
+/// replaced by a link, and a new committed link are checked whole with no
+/// base, as an untracked file is.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_diff_is_checked_whole_with_no_base() {
+    use std::os::unix::fs::symlink;
+
+    let bad = format!("// first line\n{}", params("bad", 7));
+    let files = [("ok.js", simple("ok")), ("bad.js", bad.clone())];
+    let files = files
+        .each_ref()
+        .map(|(path, content)| (*path, content.as_str()));
+    // The base has a link to a clean file, a plain file, or no file.
+    let cases: [(&str, fn(&Path)); 3] = [
+        ("retarget", |_| {}),
+        ("replace", |root| {
+            fs::remove_file(root.join("link.js")).unwrap();
+            fs::write(root.join("link.js"), simple("plain")).unwrap();
+            commit_all(root, "a plain file");
+        }),
+        ("new", |root| {
+            fs::remove_file(root.join("link.js")).unwrap();
+            commit_all(root, "no link");
+        }),
+    ];
+    for (session, base) in cases {
+        let (dir, state) = repo(&files);
+        let root = dir.path();
+        symlink("ok.js", root.join("link.js")).unwrap();
+        commit_all(root, "link");
+        base(root);
+        start(&state, root, session);
+        let _ = fs::remove_file(root.join("link.js"));
+        symlink("bad.js", root.join("link.js")).unwrap();
+        let reason = block_reason(&edit(&state, root, session, "link.js"));
+        assert!(
+            reason.contains("FAIL link.js  1 function"),
+            "{session}: {reason}"
+        );
+        commit_all(root, "the link");
+        let reason = block_reason(&stop(&state, root, session));
+        assert!(
+            reason.contains("FAIL link.js  1 function"),
+            "{session}: {reason}"
+        );
+    }
+}
+
 /// On a file system that ignores letter case, a tracked file under another
 /// spelling is not plainly tracked, so its edit is checked whole, and a
 /// config under another spelling still makes hooks read the base config.
