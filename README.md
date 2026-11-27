@@ -90,6 +90,17 @@ default (`hook.fail_on`). Field mappings and limitations are in
   <img src="docs/assets/branding/pickcheck-stop-hook-mock.svg" alt="PICKCHECK · STOP HOOK — a changed function over the complexity limit blocks the agent's Stop" width="900">
 </p>
 
+## CLI reference
+
+| Command | Does |
+|---|---|
+| `pickcheck check [paths]` | Measures functions in files and directories. `--changed` and `--base <ref>` limit it to a Git diff. |
+| `pickcheck explain <file>[:<line>]` | Shows which lines add to one function's cognitive score. |
+| `pickcheck hook claude\|codex\|cursor\|grok` | Runs as a native hook for that harness and reads the event from stdin. |
+| `pickcheck init` | Writes the current effective config to `.pickcheck.json` in the working directory and refuses to overwrite one. |
+| `pickcheck doctor` | Prints the config chain and loaded grammars; `--coverage` lists syntax with no rule. |
+| `pickcheck-install` | Installs hooks or plugins for the chosen harnesses; comes with the npm package. |
+
 ## Metrics
 
 Each function is measured on its own. A violation is `value > limit`.
@@ -148,6 +159,14 @@ Run `pickcheck init` to write `.pickcheck.json`. Resolution order is
 built-in defaults, user config, nearest repo config, then `--config`; later
 values win. Defaults and language overrides are documented in
 [`docs/spec.md`](docs/spec.md).
+
+## Architecture
+
+| Path | Role |
+|---|---|
+| `crates/core` | `pickcheck-core`: tree-sitter parsing, metrics per language, config, Git diffs and base pairing. |
+| `crates/cli` | `pickcheck` binary: commands, reports, harness hooks and session state. |
+| `config.default.json` | Built-in defaults: limits, test patterns, ignore globs and hook policy. |
 
 ## Privacy
 

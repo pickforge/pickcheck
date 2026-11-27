@@ -7,6 +7,13 @@ kit in `pickforge/branding-visual`. The brand standard puts README assets in
 | File | Use |
 |---|---|
 | `pickcheck-mark-128.svg` | Canonical mark. Source geometry for every other file. |
+| `pickcheck-mark-light.svg` | Light-mode mark on cream. |
+| `pickcheck-mark-mono.svg` | Monochrome mark for print. |
+| `pickcheck-mark-raster.png` | 512px raster mark, same as `pickcheck-mark-512.png`. |
+| `pickcheck-favicon.svg`, `pickcheck-favicon-{16,32}.png`, `pickcheck-favicon.ico` | Favicon source and fallbacks. |
+| `pickcheck-app-icon.svg`, `pickcheck-app-icon-{32,64,128,256,512,1024}.png` | Icon with the ember halo, for avatars and package listings. |
+| `pickcheck-wordmark.svg`, `pickcheck-wordmark.png` | Wordmark export. |
+| `pickcheck-lockup-stacked.svg`, `pickcheck-lockup-stacked.png` | Stacked lockup. |
 | `pickcheck-mark-512.png` | Raster mark for surfaces that cannot use SVG. |
 | `pickcheck-lockup-horizontal.svg` | README hero, width 560. |
 | `pickcheck-lockup-horizontal.png` | Raster lockup, 1440 × 360. |
