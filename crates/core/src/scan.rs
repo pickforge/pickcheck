@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::{
     BaseBlob, ChangedFiles, CommitConfigs, Config, FunctionMetrics, Language, Limits, LineRange,
     Metric, ParsedSource,
-    baseline::{self, MetricValues, Pairing, Status},
+    baseline::{self, MetricValues, Pairing, Status, UnitChange},
     diff::{physical, repository_root},
     load_config, load_config_at, parse_source,
 };
@@ -340,6 +340,7 @@ fn scan_file(
             source: &source,
             parsed: &parsed,
             measured: &measured,
+            hunks: spans.filter(|_| measure_untouched).unwrap_or_default(),
         };
         compare_with_base(changed, &context, &current, result)?;
     }
@@ -353,8 +354,9 @@ fn scan_file(
 struct Measured {
     /// The unit of each of the file's violations, by index.
     units_of: Vec<usize>,
-    /// Whether each unit was measured although no hunk touches it.
-    untouched: Vec<bool>,
+    /// What the hunks say about each unit. A unit is `Untouched` or `Added`
+    /// only with `measure_untouched`.
+    changes: Vec<UnitChange>,
 }
 
 /// Adds the violations of the units in `spans`, every unit without spans,
@@ -370,7 +372,7 @@ fn measure_units(
     let first = result.violations.len();
     let mut measured = Measured {
         units_of: Vec::new(),
-        untouched: vec![false; parsed.functions.len()],
+        changes: vec![UnitChange::Touched; parsed.functions.len()],
     };
     for (index, function) in parsed.functions.iter().enumerate() {
         let touched = spans.is_none_or(|ranges| touches(function, ranges));
@@ -381,14 +383,18 @@ fn measure_units(
         measured
             .units_of
             .resize(result.violations.len() - first, index);
-        if touched {
-            result.checked += 1;
-            result
-                .functions
-                .push((file.display.to_path_buf(), function.clone()));
-        } else {
-            measured.untouched[index] = true;
+        if !touched {
+            let base_line = LineRange::base_line(spans.unwrap_or_default(), function.line);
+            measured.changes[index] = UnitChange::Untouched { base_line };
+            continue;
         }
+        if measure_untouched && spans.is_some_and(|ranges| added(function, ranges)) {
+            measured.changes[index] = UnitChange::Added;
+        }
+        result.checked += 1;
+        result
+            .functions
+            .push((file.display.to_path_buf(), function.clone()));
     }
     measured
 }
@@ -406,7 +412,7 @@ fn keep_untouched_changes(
     let mut kept = BTreeSet::new();
     let violations = result.violations.split_off(first);
     for (violation, &index) in violations.into_iter().zip(&measured.units_of) {
-        if measured.untouched[index] {
+        if matches!(measured.changes[index], UnitChange::Untouched { .. }) {
             let status = violation.baseline.as_ref().map(|baseline| baseline.status);
             if matches!(status, Some(Status::Unchanged | Status::Improved) | None) {
                 continue;
@@ -436,6 +442,9 @@ struct Current<'a> {
     source: &'a str,
     parsed: &'a ParsedSource,
     measured: &'a Measured,
+    /// The hunks of the file that pairing reads: only those of a scan with
+    /// `measure_untouched`, so that other scans pair as `pair_units` does.
+    hunks: &'a [LineRange],
 }
 
 /// The file's text and units at the merge base.
@@ -458,17 +467,7 @@ fn compare_with_base(
     let base = base_units(changed, file, result)?;
     let pairing = base.as_ref().map_or_else(
         || vec![Pairing::New; functions.len()],
-        |base| {
-            let current_text = baseline::Text {
-                source: current.source,
-                parsed: current.parsed,
-            };
-            let base_text = baseline::Text {
-                source: &base.source,
-                parsed: &base.parsed,
-            };
-            baseline::pair_units_by_text(current_text, base_text, &current.measured.untouched)
-        },
+        |base| pair_with_base(current, base),
     );
     let first = result.violations.len() - units_of.len();
     for (violation, &index) in result.violations[first..].iter_mut().zip(units_of) {
@@ -490,6 +489,26 @@ fn compare_with_base(
         });
     }
     Ok(())
+}
+
+/// Pairs the units of the file with its units at the merge base.
+fn pair_with_base(current: &Current<'_>, base: &BaseUnits) -> Vec<Pairing> {
+    let current_text = baseline::Text {
+        source: current.source,
+        parsed: current.parsed,
+    };
+    let base_text = baseline::Text {
+        source: &base.source,
+        parsed: &base.parsed,
+    };
+    let removed = (base.parsed.functions.iter())
+        .map(|unit| (current.hunks.iter()).any(|range| range.removes(unit.line, unit.end_line)))
+        .collect::<Vec<_>>();
+    let hunks = baseline::Hunks {
+        changes: &current.measured.changes,
+        removed: &removed,
+    };
+    baseline::pair_units_by_text(current_text, base_text, hunks)
 }
 
 /// The file's text and units at the merge base, or `None` when it has no
@@ -603,6 +622,13 @@ fn touches(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
     ranges
         .iter()
         .any(|range| range.intersects(function.line, function.end_line))
+}
+
+/// Whether one hunk that removes no line adds every line of the unit.
+fn added(function: &FunctionMetrics, ranges: &[LineRange]) -> bool {
+    ranges.iter().any(|range| {
+        range.removed == 0 && range.start <= function.line && function.end_line <= range.end
+    })
 }
 
 fn add_violations(file: &FileContext<'_>, function: &FunctionMetrics, result: &mut ScanResult) {

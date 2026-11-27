@@ -1086,16 +1086,39 @@ kept with any other status.
 
 A unit that no hunk touches pairs first with a base unit of the same text,
 one base unit for each such unit. CRLF and LF line ends count as the same
-text. A named unit looks among the base units of its name, and an
-`<anonymous>` unit among the base `<anonymous>` units of its owner. The
-other units of that name or owner then pair as under `--base`, with the base
-units that are left. So a unit that the session adds before an old unit is
-the new one, also when it is a copy of the old unit. Last, a unit that no
-hunk touches and that still has no base unit takes a base unit of the same
-text that pairs with no measured unit, whatever its name or owner. So an old unit
-keeps its base when a change outside it renames it or its owner. Old debt
-that the session leaves as it was therefore neither blocks nor is listed,
-while a change that the hunks miss still counts.
+text. The hunks before the unit give the line of the base file where its
+first line was. The unit takes the base unit that starts at that line and
+has its text, before any other unit pairs by name or position. So an old
+unit keeps its base when a change outside it renames it or its owner, also
+when a new unit takes the old name. A unit that finds no such base unit, as
+when Git hides a change from the hunks, looks among the base units of its
+name, or for an `<anonymous>` unit among the base `<anonymous>` units of
+its owner.
+
+A unit that lies wholly in the lines of one hunk that removes no line is an
+added unit. A base unit is a removed unit when one hunk removes all its
+lines and adds no line. An added unit is no edit of a base unit that stays,
+and a removed unit is no base of a unit that stays. So a unit that no hunk
+touches never takes a removed unit by its text. An added unit takes by its
+text only a removed unit: then the unit moved with its text. After the
+units that no hunk touches, an added unit looks among the removed units of
+its name or owner.
+
+The units that are left pair as under `--base`, with two limits. For units
+with a name, the units that stay pair first with the base units that stay,
+and the added units with the removed units. Then the units that are left
+pair by name and order alone. For `<anonymous>` units, an added unit and a
+removed unit do not pair by position and do not count among the
+`<anonymous>` units of their owner. So a unit that the session adds before
+an old unit is the new one, also when it is a copy of the old unit, and
+also when the session edits the old unit where it is. A unit that grows
+where it is does not take the place of a removed unit. Last, a unit that
+still has no base unit takes a base unit of the same text that pairs with no
+measured unit, whatever its name or owner: a unit that no hunk touches takes
+one that stays, and an added unit a removed one. An added `<anonymous>`
+unit that takes none is `new`.
+Old debt that the session leaves as it was therefore neither blocks nor is
+listed, while a change that the hunks miss still counts.
 
 A file with no base, untracked or with no readable base content, is checked
 whole. The config key `hook.fail_on` lists the statuses
@@ -1170,7 +1193,22 @@ event; the next event sees the change. Pruning a session that has been idle
 for 30 days can race with that session's next event, which then starts the
 session with a new anchor. A unit whose text a checkout rewrites, as the
 `ident` attribute does, finds no base unit by its text; it then pairs as
-under `--base`.
+under `--base`. Git decides which lines a hunk adds and removes. When a
+unit with the old text of an edited unit stays elsewhere in the file, Git
+can show the edited unit as added lines, and an edited `<anonymous>` unit is
+then `new`. A unit that moves with its text is `new` when the hunk that
+removes its old lines also adds lines, as when the session edits the unit
+beside those lines or puts another unit in their place. The `<anonymous>`
+units of that hunk can then be `unmatched`. An `<anonymous>` unit that moves
+into lines of a hunk that also removes lines does not take its base unit by
+its text. It pairs by position among the `<anonymous>` units of its owner
+that stay, also across other hunks, and it is `unmatched` when the counts of
+its owner differ. Units
+of one name pair by that name. So when the session removes or renames a
+unit, a unit that takes its name, or a copy of it, can pair with its base
+unit and be `unchanged`. A unit that becomes code when the session removes
+comment marks around it can pair by position with a unit of its owner that
+the session turns into a comment.
 
 ### `init`
 

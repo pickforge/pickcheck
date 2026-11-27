@@ -1352,6 +1352,253 @@ fn old_debt_keeps_its_base_when_a_change_outside_it_renames_or_moves_it() {
     }
 }
 
+/// A new unit can take the name that an old unit had. The old unit, which no
+/// hunk touches, still keeps the base unit with its text.
+#[test]
+fn old_debt_keeps_its_base_when_a_new_unit_takes_its_old_name() {
+    let old = closure(7);
+    // The base content and the content after the session's edit.
+    let cases = [
+        (
+            "class",
+            "class Legacy {\n  run(p0, p1, p2, p3, p4, p5, p6) {\n    return p0;\n  }\n}\n"
+                .to_owned(),
+            "class Adapter {\n  run(p0, p1, p2, p3, p4, p5, p6) {\n    return p0;\n  }\n}\n\n\
+             class Legacy {\n  run(options) {\n    return new Adapter().run(...options);\n  }\n}\n"
+                .to_owned(),
+        ),
+        (
+            "owner",
+            format!("function foo(list) {{\n  return list.map({old});\n}}\n"),
+            format!(
+                "function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return list.map((b) => b);\n}}\n"
+            ),
+        ),
+        // Another owner has a closure with the same text, which no hunk
+        // touches either.
+        (
+            "twin",
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return list.map({old});\n}}\n"
+            ),
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\n\
+                 function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return bar(list);\n}}\n"
+            ),
+        ),
+        // The session also edits the closure of the other owner, which has
+        // the same text.
+        (
+            "peer",
+            format!(
+                "function baz(list) {{\n  return list.map({old});\n}}\n\
+                 function foo(list) {{\n  return list.map({old});\n}}\n"
+            ),
+            format!(
+                "function baz(list) {{\n  return list.map({});\n}}\n\
+                 function bar(list) {{\n  return list.map({old});\n}}\n\n\
+                 function foo(list) {{\n  return bar(list);\n}}\n",
+                old.replace("return p0", "return p1")
+            ),
+        ),
+    ];
+    for (session, base, current) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let output = edit(&state, root, session, "a.js");
+        assert!(
+            output.stdout.is_empty(),
+            "{session}: {}",
+            text(&output.stdout)
+        );
+        assert!(stop(&state, root, session).stdout.is_empty(), "{session}");
+    }
+}
+
+/// A closure in lines that a hunk only adds is no edit of a base closure. It
+/// is new also when the owner loses another closure, so that the owner has
+/// as many closures as before, and also when it is a copy of a closure that
+/// the session edits. A closure that moves with its text is not new, unless
+/// the hunk that removes its old lines also adds lines.
+#[test]
+fn an_added_closure_blocks_also_when_another_closure_is_removed() {
+    let on = |event: &str, result: &str| {
+        format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g) => {result});\n")
+    };
+    let named = |name: &str, lines: &[String]| {
+        format!("function {name}(worker) {{\n{}}}\n", lines.concat())
+    };
+    let file = |lines: &[String]| named("bind", lines);
+    let base = file(&[on("data", "a"), on("close", "b")]);
+    let one = "  worker.on(\"data\", (a) => a);\n".to_owned();
+    let flush = "  worker.flush();\n".to_owned();
+    let open = "  worker.open();\n".to_owned();
+    let clean = |event: &str| format!("  worker.on(\"{event}\", (x) => x);\n");
+    // A closure with seven parameters on lines of their own, between marks.
+    let wide = |event: &str, before: &str, after: &str| {
+        format!(
+            "  worker.on(\"{event}\", (\n    a,\n{before}    b, c, d, e, f, g,\n{after}  ) => a);\n"
+        )
+    };
+    let eight = |event: &str| format!("  worker.on(\"{event}\", (a, b, c, d, e, f, g, h) => a);\n");
+    // The base content, the content after the session's edit, and the
+    // number of violations that block.
+    let cases = [
+        (
+            "swap",
+            base.clone(),
+            file(&[on("ready", "a"), on("data", "a")]),
+            1,
+        ),
+        (
+            "move",
+            base.clone(),
+            file(&[on("close", "b"), on("data", "a")]),
+            0,
+        ),
+        // The old closure is cut to one parameter, and a copy of it is
+        // added after the other closure.
+        (
+            "copy",
+            base.clone(),
+            file(&[one.clone(), on("close", "b"), on("data", "a")]),
+            1,
+        ),
+        // The old closure gains a parameter, a closure with its old text is
+        // added, and a closure with eight parameters is removed.
+        (
+            "gain",
+            file(&[
+                on("data", "a"),
+                flush.clone(),
+                eight("close"),
+                flush.clone(),
+            ]),
+            file(&[
+                eight("data"),
+                flush.clone(),
+                flush.clone(),
+                on("ready", "a"),
+            ]),
+            2,
+        ),
+        // The copy goes to another owner, which loses its own closure.
+        (
+            "owner",
+            named("input", &[on("data", "a")])
+                + &named("output", &[on("close", "b"), flush.clone()]),
+            named("input", std::slice::from_ref(&one))
+                + &named("output", &[flush.clone(), on("data", "a")]),
+            1,
+        ),
+        // A closure moves with its text, and the session edits the closure
+        // next to its old lines. Git shows both in one hunk that adds a
+        // line, so the moved closure is new and the edited one unmatched.
+        (
+            "beside",
+            file(&[on("data", "a"), on("close", "b"), on("end", "c")]),
+            file(&[on("close", "b + 1"), on("end", "c"), on("data", "a")]),
+            2,
+        ),
+        // A closure grows to seven parameters where it is, a closure with
+        // seven parameters is removed, and clean closures are added.
+        (
+            "grow",
+            file(&[on("data", "b"), flush.clone(), one, open.clone()]),
+            file(&[
+                flush.clone(),
+                on("data", "a"),
+                clean("ready"),
+                open.clone(),
+                clean("end"),
+            ]),
+            1,
+        ),
+        // Comment marks around a closure are removed, and so is a closure.
+        (
+            "bare",
+            file(&[
+                "  /*\n".to_owned(),
+                on("ready", "a"),
+                "  */\n".to_owned(),
+                flush.clone(),
+                on("close", "b"),
+            ]),
+            file(&[on("ready", "a"), flush.clone()]),
+            1,
+        ),
+        // Comment marks in a parameter list are removed, and so is a
+        // closure with the text that the first closure has then.
+        (
+            "marks",
+            file(&[
+                wide("data", "    /*\n", "    */\n"),
+                flush.clone(),
+                wide("close", "", ""),
+            ]),
+            file(&[wide("data", "", ""), flush.clone()]),
+            1,
+        ),
+        // A closure moves to another owner, and its old owner gets a clean
+        // closure in a line that the session edits.
+        (
+            "away",
+            named("input", &[on("data", "a"), flush.clone(), open.clone()])
+                + &named("output", std::slice::from_ref(&open)),
+            named("input", &[flush.clone(), clean("close")])
+                + &named("output", &[open.clone(), on("data", "a")]),
+            0,
+        ),
+        // A closure is removed, and the session edits the closure that
+        // stays, which keeps its seven parameters.
+        (
+            "left",
+            file(&[on("data", "a"), flush.clone(), on("close", "b")]),
+            file(&[flush.clone(), on("close", "b + 1")]),
+            0,
+        ),
+        // A closure moves with its text into a line that the session
+        // replaces. The hunk also removes a line, so the closure is no
+        // added unit and is unmatched.
+        (
+            "into",
+            file(&[on("data", "a"), flush.clone(), open]),
+            file(&[flush, on("data", "a")]),
+            1,
+        ),
+    ];
+    for (session, base, current, violations) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let outputs = [
+            edit(&state, root, session, "a.js"),
+            stop(&state, root, session),
+        ];
+        let plural = if violations == 1 { "" } else { "s" };
+        let fail =
+            format!("FAIL a.js  {violations} function{plural}, {violations} violation{plural}");
+        for output in outputs {
+            if violations > 0 {
+                let reason = block_reason(&output);
+                assert!(reason.contains(&fail), "{session}: {reason}");
+            } else {
+                assert!(
+                    output.stdout.is_empty(),
+                    "{session}: {}",
+                    text(&output.stdout)
+                );
+            }
+        }
+    }
+}
+
 /// Lines that the session only removes leave no changed line in the file.
 /// Two closures that become one too complex closure still block.
 #[test]
@@ -1397,17 +1644,34 @@ fn old_debt_in_a_crlf_checkout_keeps_its_base() {
 #[test]
 fn a_copy_of_old_debt_under_the_same_name_blocks() {
     let old = params("old", 7);
-    let (dir, state) = repo(&[("a.js", &format!("{old}{}", simple("a")))]);
-    let root = dir.path();
-    start(&state, root, "copy");
-    let content = fs::read_to_string(root.join("a.js")).unwrap();
-    fs::write(root.join("a.js"), format!("{old}{content}")).unwrap();
-    let reason = block_reason(&edit(&state, root, "copy", "a.js"));
-    assert!(
-        reason.contains("FAIL a.js  1 function, 1 violation"),
-        "{reason}"
-    );
-    block_reason(&stop(&state, root, "copy"));
+    let base = format!("{old}{}", simple("a"));
+    let inner = |count| params("old", count).replace('\n', "\n  ");
+    let outer = |name: &str, lines: &str| {
+        format!("function {name}() {{\n  {lines}return {name}.length;\n}}\n\n")
+    };
+    // The base content and the content after the session's edit.
+    let cases = [
+        ("copy", base.clone(), format!("{old}{base}")),
+        // The old function is cut to one parameter where it is, and the
+        // copy goes into the function before it.
+        (
+            "cut",
+            outer("first", "") + &outer("second", &inner(7)),
+            outer("first", &(inner(7) + "register(old);\n  ")) + &outer("second", &inner(1)),
+        ),
+    ];
+    for (session, base, current) in cases {
+        let (dir, state) = repo(&[("a.js", &base)]);
+        let root = dir.path();
+        start(&state, root, session);
+        fs::write(root.join("a.js"), current).unwrap();
+        let reason = block_reason(&edit(&state, root, session, "a.js"));
+        assert!(
+            reason.contains("FAIL a.js  1 function, 1 violation"),
+            "{session}: {reason}"
+        );
+        block_reason(&stop(&state, root, session));
+    }
 }
 
 /// Past 100 recorded files that no longer exist, the names diff of an edit
